@@ -525,6 +525,7 @@ func (f *File) objStmObjects(ctx context.Context, stm *Stream) (map[Ref]Object, 
 	type pair struct{ num, off int }
 	pairs := make([]pair, 0, n)
 	for i := 0; i < int(n); i++ {
+		hp.skipSpace()
 		a, _, err := hp.parseNumber()
 		if err != nil {
 			return nil, err
@@ -703,6 +704,7 @@ func (f *File) parseIndirectAt(ctx context.Context, offset int64, lenient bool) 
 		return Ref{}, nil, errs.Wrap(errs.ErrCorrupt, "SYN-OBJ-OFFSET", "parse indirect object", offset, 0, -1)
 	}
 	p := newParser(f.data, int(offset), lenient, f.tracker.Budget().MaxNestingDepth)
+	p.skipSpace()
 	a, _, err := p.parseNumber()
 	if err != nil {
 		return Ref{}, nil, err

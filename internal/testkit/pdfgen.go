@@ -219,3 +219,40 @@ func BuildXRefStream(objs []Obj, compressed map[int][2]int, trailerExtra string)
 	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xrefOffset)
 	return b.Bytes()
 }
+
+// ShiftXRefOffset rewrites the classic xref entry for num to point one byte
+// before the object, exercising readers that tolerate leading whitespace.
+func ShiftXRefOffset(data []byte, num int) []byte {
+	out := append([]byte(nil), data...)
+	idx := bytes.LastIndex(out, []byte("xref\n"))
+	if idx < 0 {
+		return out
+	}
+	rest := out[idx+len("xref\n"):]
+	nl := bytes.IndexByte(rest, '\n')
+	if nl < 0 {
+		return out
+	}
+	header := strings.TrimSpace(string(rest[:nl]))
+	parts := strings.Fields(header)
+	if len(parts) != 2 {
+		return out
+	}
+	start := idx + len("xref\n") + nl + 1
+	line := start + num*20
+	if line+10 > len(out) {
+		return out
+	}
+	off := 0
+	for i := 0; i < 10; i++ {
+		if out[line+i] < '0' || out[line+i] > '9' {
+			return out
+		}
+		off = off*10 + int(out[line+i]-'0')
+	}
+	if off == 0 {
+		return out
+	}
+	copy(out[line:line+10], []byte(fmt.Sprintf("%010d", off-1)))
+	return out
+}

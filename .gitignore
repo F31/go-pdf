@@ -12,3 +12,6 @@ coverage.*
 /perf-out/
 *.prof
 *.pprof
+
+# Local, non-public sample corpus (never commit)
+/docs/pdf/

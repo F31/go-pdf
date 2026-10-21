@@ -76,8 +76,11 @@ func TestXRefStream(t *testing.T) {
 		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
 		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
 	}
-	objs = append(objs, testkit.ObjectStream(4, map[int]string{3: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>"}))
-	data := testkit.BuildXRefStream(objs, map[int][2]int{3: {4, 0}}, "/Root 1 0 R")
+	objs = append(objs, testkit.ObjectStream(4, map[int]string{
+		2: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		3: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+	}))
+	data := testkit.BuildXRefStream(objs, map[int][2]int{2: {4, 0}, 3: {4, 1}}, "/Root 1 0 R")
 	f := openBytes(t, data, false)
 	defer f.Close()
 	o, err := f.ResolveRef(context.Background(), Ref{Num: 3})
@@ -86,6 +89,19 @@ func TestXRefStream(t *testing.T) {
 	}
 	if _, ok := o.(Dict); !ok {
 		t.Fatalf("compressed object type %T", o)
+	}
+}
+
+func TestObjectAtWhitespaceOffset(t *testing.T) {
+	data := testkit.ShiftXRefOffset(testkit.Basic("0 0 200 100"), 3)
+	f := openBytes(t, data, false)
+	defer f.Close()
+	o, err := f.ResolveRef(context.Background(), Ref{Num: 3})
+	if err != nil {
+		t.Fatalf("resolve whitespace-prefixed object: %v", err)
+	}
+	if _, ok := o.(Dict); !ok {
+		t.Fatalf("got %T", o)
 	}
 }
 

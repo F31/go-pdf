@@ -59,6 +59,14 @@ go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=30s
 ./scripts/check-deps.sh
 ```
 
+本地私有语料放在 `docs/pdf/`（已被 `.gitignore` 排除，不会提交）。存在时运行：
+
+```bash
+go test -run TestLocalCorpus -v -timeout 20m
+```
+
+该测试会打开目录内全部 PDF、遍历页面并汇总加密/损坏/预算等分类；CI 中目录不存在时自动跳过。
+
 ## 目录
 
 ```text
