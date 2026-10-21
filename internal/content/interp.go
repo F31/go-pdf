@@ -21,6 +21,7 @@ type PageData struct {
 	MediaBox  displaylist.Rect
 	CropBox   displaylist.Rect
 	File      *syntax.File
+	Fonts     *font.Cache
 	Tracker   *budget.Tracker
 	Diag      *diag.Collector
 }
@@ -113,13 +114,25 @@ type interp struct {
 	trBounds    displaylist.Rect
 	trHasBounds bool
 
-	ops      int
-	unknown  map[string]bool
-	suppress bool
-	result   Result
+	ops         int
+	type3Glyphs int
+	unknown     map[string]bool
+	suppress    bool
+	result      Result
 }
 
 func Interpret(ctx context.Context, pd PageData, emit func(displaylist.Item) error) (*Result, error) {
+	ip := newInterp(ctx, pd, emit)
+	if err := ip.run(); err != nil {
+		return nil, err
+	}
+	ip.result.Clips = ip.clips
+	ip.result.Items = ip.id
+	ip.result.Ops = ip.ops
+	return &ip.result, nil
+}
+
+func newInterp(ctx context.Context, pd PageData, emit func(displaylist.Item) error) *interp {
 	maxDepth := 64
 	if pd.Tracker != nil {
 		maxDepth = pd.Tracker.Budget().MaxNestingDepth
@@ -134,13 +147,7 @@ func Interpret(ctx context.Context, pd PageData, emit func(displaylist.Item) err
 		stroke: displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
 	}
 	ip.tm, ip.tlm = matrix{1, 0, 0, 1, 0, 0}, matrix{1, 0, 0, 1, 0, 0}
-	if err := ip.run(); err != nil {
-		return nil, err
-	}
-	ip.result.Clips = ip.clips
-	ip.result.Items = ip.id
-	ip.result.Ops = ip.ops
-	return &ip.result, nil
+	return ip
 }
 
 func (ip *interp) run() error {
@@ -833,11 +840,25 @@ func (ip *interp) loadFont(name string) *font.Font {
 	var f *font.Font
 	res := ip.pd.Resources
 	if res != nil {
-		if fonts, ok := res.DictValue("Font"); ok {
+		if fonts, ok := ip.resolveDict(res.Get("Font")); ok {
 			if v, ok := fonts[syntax.Name(name)]; ok {
-				if d, ok := ip.resolveDict(v); ok {
-					if ff, err := font.Load(ip.ctx, ip.pd.File, d, ip.pd.Diag); err == nil {
-						f = ff
+				var ref syntax.Ref
+				if r, ok := v.(syntax.Ref); ok {
+					ref = r
+				}
+				if ref.Num != 0 && ip.pd.Fonts != nil {
+					if cached, ok := ip.pd.Fonts.Get(ref); ok {
+						f = cached
+					}
+				}
+				if f == nil {
+					if d, ok := ip.resolveDict(v); ok {
+						if ff, err := font.Load(ip.ctx, ip.pd.File, d, ip.pd.Diag); err == nil {
+							f = ff
+							if ref.Num != 0 && ip.pd.Fonts != nil {
+								ip.pd.Fonts.Put(ref, ff)
+							}
+						}
 					}
 				}
 			}
@@ -930,8 +951,9 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 	}
 	var codes []font.Code
 	if ip.st.font != nil {
-		codes = ip.st.font.Codes([]byte(s))
-		if len(codes)*ip.st.font.CodeBytes() != len(s) {
+		var used int
+		codes, used = ip.st.font.Split([]byte(s))
+		if used != len(s) {
 			ip.diagOnce(diag.Warn, "CNT-CODE-TRUNCATED", "truncated character code at end of string")
 		}
 	} else {
@@ -963,6 +985,11 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 	}
 	for _, c := range codes {
 		trm := ip.textMatrix()
+		if ip.st.font != nil && ip.st.font.Type3() && ip.st.render != 3 {
+			if err := ip.expandType3(c, trm); err != nil {
+				return err
+			}
+		}
 		ox, oy := trm.apply(0, 0)
 		width := 500.0
 		text, ok := "\uFFFD", false
@@ -981,6 +1008,62 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 		ip.tr.Glyphs = append(ip.tr.Glyphs, g)
 		ip.growTextBounds(g)
 		ip.tm = mmul(translate(adv, 0), ip.tm)
+	}
+	return nil
+}
+
+const maxType3Glyphs = 100_000
+
+func (ip *interp) expandType3(c font.Code, trm matrix) error {
+	if ip.type3Glyphs >= maxType3Glyphs {
+		ip.diagOnce(diag.Degraded, "FNT-TYPE3-LIMIT", "Type3 glyph expansion limit reached")
+		return nil
+	}
+	glyph, ok, err := ip.st.font.Type3Proc(ip.ctx, ip.pd.File, byte(c.Value))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		ip.diagOnce(diag.Degraded, "FNT-TYPE3-PROC", "Type3 CharProc missing or unsupported")
+		return nil
+	}
+	ip.type3Glyphs++
+
+	pd := ip.pd
+	pd.Content = glyph.Data
+	if glyph.Resources != nil {
+		pd.Resources = glyph.Resources
+	}
+	pd.Matrix = [6]float64(mmul(trm, matrix(glyph.Matrix)))
+	nested := newInterp(ip.ctx, pd, func(item displaylist.Item) error {
+		switch v := item.(type) {
+		case *displaylist.Path:
+			v.Flags |= displaylist.FlagFromType3
+			v.Common.Clip = ip.curClip
+			return ip.emit(v)
+		case *displaylist.TextRun:
+			ip.diagOnce(diag.Warn, "FNT-TYPE3-TEXT", "text inside Type3 CharProc ignored")
+			return nil
+		}
+		return nil
+	})
+	nested.st.fill = ip.st.fill
+	nested.st.stroke = ip.st.stroke
+	nested.st.lineWidth = ip.st.lineWidth
+	nested.st.cap = ip.st.cap
+	nested.st.join = ip.st.join
+	nested.st.miter = ip.st.miter
+	nested.st.dash = append([]float64(nil), ip.st.dash...)
+	nested.st.dashPhase = ip.st.dashPhase
+	if err := nested.run(); err != nil {
+		return err
+	}
+	ip.ops += nested.ops
+	if ip.pd.Tracker != nil && int64(ip.ops) > ip.pd.Tracker.Budget().MaxOperators {
+		return errs.Wrap(errs.ErrBudget, "BUD-OPERATORS", "interpret page", -1, 0, ip.pd.Index)
+	}
+	if len(nested.clips) > 0 {
+		ip.diagOnce(diag.Degraded, "FNT-TYPE3-CLIP", "Type3 glyph clipping is approximated")
 	}
 	return nil
 }

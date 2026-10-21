@@ -70,11 +70,12 @@ func TestWinAnsiAndDifferences(t *testing.T) {
 	}
 }
 
-func TestType0Deferred(t *testing.T) {
+func TestType0MissingEncoding(t *testing.T) {
 	dc := diag.New(100)
 	f, err := Load(context.Background(), nil, syntax.Dict{
-		"Subtype":  syntax.Name("Type0"),
-		"BaseFont": syntax.Name("SimSun"),
+		"Subtype":         syntax.Name("Type0"),
+		"BaseFont":        syntax.Name("SimSun"),
+		"DescendantFonts": syntax.Array{syntax.Dict{"Subtype": syntax.Name("CIDFontType2")}},
 	}, dc)
 	if err != nil {
 		t.Fatal(err)
@@ -82,14 +83,14 @@ func TestType0Deferred(t *testing.T) {
 	if _, ok := f.Decode('A'); ok {
 		t.Fatal("Type0 should not claim trusted Unicode")
 	}
-	found := false
+	codes := map[string]bool{}
 	for _, d := range dc.All() {
-		if d.Code == "FNT-TYPE0-DEFERRED" {
-			found = true
-		}
+		codes[d.Code] = true
 	}
-	if !found {
-		t.Fatal("missing deferred diagnostic")
+	for _, want := range []string{"FNT-CMAP-MISSING", "FNT-NO-TOUNICODE"} {
+		if !codes[want] {
+			t.Fatalf("missing %s in %v", want, codes)
+		}
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/F31/go-pdf/internal/budget"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/errs"
+	"github.com/F31/go-pdf/internal/font"
 	"github.com/F31/go-pdf/internal/syntax"
 )
 
@@ -47,6 +48,7 @@ type Document struct {
 	pages   []*Page
 	version string
 	opts    Options
+	fonts   *font.Cache
 
 	mu     sync.RWMutex
 	closed bool
@@ -67,7 +69,7 @@ type Page struct {
 }
 
 func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, error) {
-	d := &Document{file: file, opts: opts}
+	d := &Document{file: file, opts: opts, fonts: font.NewCache()}
 	if enc, ok, err := file.EncryptDict(ctx); err != nil {
 		return nil, err
 	} else if ok {
@@ -92,6 +94,7 @@ func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, erro
 					d.catalog = c2
 					d.info = Info{}
 					d.pages = nil
+					d.fonts = font.NewCache()
 					if e3 := d.initialize(ctx); e3 == nil {
 						return d, nil
 					} else {

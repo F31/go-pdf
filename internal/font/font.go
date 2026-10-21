@@ -1,12 +1,14 @@
-// Package font implements the simple-font subset needed for G1 text
-// positioning. CID/CMap/ToUnicode handling belongs to G2.
+// Package font implements simple fonts, Type0/CID predefined CMaps,
+// ToUnicode, and Type3 CharProcs for text decoding and positioning.
 package font
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/diag"
@@ -26,12 +28,27 @@ type Font struct {
 	Type string
 
 	isCID        bool
+	identity     bool
 	codeLen      int
+	predefined   *predefinedCMap
 	toUnicode    *ToUnicode
 	cidWidths    map[uint32]float64
 	defaultWidth float64
 	dw2          [2]float64
 	vertical     bool
+
+	type3      bool
+	fontMatrix [6]float64
+	widthScale float64
+	glyphNames [256]string
+	charProcs  syntax.Dict
+	type3Res   syntax.Dict
+	type3Cache map[string][]byte
+	type3Mu    sync.Mutex
+
+	program          *fontProgram
+	cidToGID         []byte
+	cidToGIDIdentity bool
 }
 
 type Code struct {
@@ -73,13 +90,6 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 		info.Serif = true
 	}
 
-	if subtype == "Type0" {
-		dc.Addf(diag.Degraded, "FNT-TYPE0-DEFERRED", "Type0 text uses fallback metrics", -1, 0, -1)
-		info.Kind = "Type0"
-	} else if subtype == "Type3" {
-		dc.Addf(diag.Degraded, "FNT-TYPE3-DEFERRED", "Type3 text uses fallback metrics", -1, 0, -1)
-	}
-
 	if table, ok := base14Widths[base]; ok {
 		f.base14 = table
 	} else if isBase14Name(base) {
@@ -101,6 +111,7 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 		if err := f.loadType0(ctx, file, dict, info, dc); err != nil {
 			return nil, err
 		}
+		f.fillMetrics(info, dc)
 		f.Info = info
 		return f, nil
 	}
@@ -125,6 +136,11 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 	if mw, ok := dict.IntValue("MissingWidth"); ok {
 		f.missingWidth = float64(mw)
 	}
+	if subtype == "Type3" {
+		f.loadType3(ctx, file, dict, dc)
+	}
+	f.toUnicode = f.loadToUnicode(ctx, file, dict, dc)
+	f.fillMetrics(info, dc)
 	f.Info = info
 	return f, nil
 }
@@ -146,9 +162,7 @@ func (f *Font) loadDescriptor(ctx context.Context, file *syntax.File, fd syntax.
 	}
 	info.Ascent = numeric(fd.Get("Ascent"))
 	info.Descent = numeric(fd.Get("Descent"))
-	_ = ctx
-	_ = file
-	_ = dc
+	f.loadFontProgram(ctx, file, fd, info, dc)
 }
 
 func (f *Font) readWidths(o syntax.Object) {
@@ -181,6 +195,9 @@ func (f *Font) Width(code byte) float64 {
 	if f.hasWidths {
 		idx := int(code) - f.firstChar
 		if idx >= 0 && idx < len(f.widths) {
+			if f.type3 {
+				return f.widths[idx] * f.widthScale
+			}
 			if w := f.widths[idx]; w != 0 {
 				return w
 			}
@@ -188,6 +205,9 @@ func (f *Font) Width(code byte) float64 {
 		if f.missingWidth > 0 {
 			return f.missingWidth
 		}
+	}
+	if f.type3 {
+		return 0
 	}
 	if f.base14 != nil {
 		if w := f.base14[code]; w != 0 {
@@ -199,10 +219,18 @@ func (f *Font) Width(code byte) float64 {
 
 // Decode maps a simple-font code to Unicode.
 func (f *Font) Decode(code byte) (string, bool) {
-	if f == nil || f.encoding == nil {
+	if f == nil {
 		return "\uFFFD", false
 	}
-	if f.Type == "Type0" || f.Type == "Type3" {
+	if f.Type == "Type0" {
+		return "\uFFFD", false
+	}
+	if f.toUnicode != nil {
+		if s, ok := f.toUnicode.Map[uint32(code)]; ok {
+			return s, true
+		}
+	}
+	if f.encoding == nil {
 		return "\uFFFD", false
 	}
 	r := f.encoding[code]
@@ -489,6 +517,7 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 		f.defaultWidth = float64(dw)
 	}
 	f.loadCIDWidths(ctx, file, cid, dc)
+	f.loadCIDToGID(ctx, file, cid, info, dc)
 	if fdObj := cid.Get("FontDescriptor"); fdObj != nil {
 		if r, ok := fdObj.(syntax.Ref); ok && file != nil {
 			if v, err := file.Resolve(ctx, r); err == nil {
@@ -501,29 +530,65 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 	}
 	enc := dict.Get("Encoding")
 	encName := ""
-	if n, ok := enc.(syntax.Name); ok {
-		encName = string(n)
-	} else if r, ok := enc.(syntax.Ref); ok && file != nil {
+	var encStream *syntax.Stream
+	if r, ok := enc.(syntax.Ref); ok && file != nil {
 		if v, err := file.Resolve(ctx, r); err == nil {
-			if n, ok := v.(syntax.Name); ok {
-				encName = string(n)
-			} else {
-				dc.Addf(diag.Degraded, "FNT-CMAP-EMBEDDED-DEFERRED", "embedded CMap deferred", -1, 0, -1)
-			}
+			enc = v
 		}
 	}
-	switch encName {
-	case "Identity-H":
-	case "Identity-V":
+	switch v := enc.(type) {
+	case syntax.Name:
+		encName = string(v)
+	case *syntax.Stream:
+		encStream = v
+	}
+	switch {
+	case encStream != nil:
+		if file == nil {
+			dc.Addf(diag.Degraded, "FNT-CMAP-EMBEDDED", "embedded CMap stream unavailable", -1, 0, -1)
+			break
+		}
+		data, err := file.DecodeStream(ctx, encStream)
+		if err != nil {
+			dc.Addf(diag.Degraded, "FNT-CMAP-EMBEDDED", "embedded CMap stream cannot be decoded", -1, 0, -1)
+			break
+		}
+		cm, err := parseEmbeddedCMap(data)
+		if err != nil {
+			dc.Addf(diag.Degraded, "FNT-CMAP-EMBEDDED", "embedded CMap stream is invalid", -1, 0, -1)
+			break
+		}
+		f.predefined = cm
+		f.codeLen = cm.maxBytes
+		if cm.wmode == 1 {
+			f.vertical = true
+		}
+	case encName == "Identity-H":
+		f.identity = true
+	case encName == "Identity-V":
+		f.identity = true
 		f.vertical = true
-		dc.Addf(diag.Degraded, "FNT-VERTICAL-DEFERRED", "vertical text positioning deferred", -1, 0, -1)
-	case "":
+	case encName == "":
 		dc.Addf(diag.Warn, "FNT-CMAP-MISSING", "Type0 font has no usable Encoding", -1, 0, -1)
 	default:
-		dc.Addf(diag.Degraded, "FNT-CMAP-DEFERRED", "predefined CMap deferred: "+encName, -1, 0, -1)
+		if cm := predefinedCMapByName(encName); cm != nil {
+			f.predefined = cm
+			f.codeLen = cm.maxBytes
+			if cm.wmode == 1 {
+				f.vertical = true
+			}
+		} else {
+			if err := predefinedDataError(); err != nil {
+				dc.Addf(diag.Degraded, "FNT-CMAP-DATA", "embedded CMap data unavailable", -1, 0, -1)
+			}
+			dc.Addf(diag.Degraded, "FNT-CMAP-DEFERRED", "predefined CMap deferred: "+encName, -1, 0, -1)
+		}
 	}
 	if wmode, ok := dict.IntValue("WMode"); ok && wmode == 1 {
 		f.vertical = true
+	}
+	if f.vertical {
+		dc.Addf(diag.Degraded, "FNT-VERTICAL-DEFERRED", "vertical text positioning deferred", -1, 0, -1)
 	}
 	if dw2, ok := cid.ArrayValue("DW2"); ok && len(dw2) >= 2 {
 		f.dw2 = [2]float64{numeric(dw2[0]), numeric(dw2[1])}
@@ -531,6 +596,14 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 	if cid.Has("W2") {
 		dc.Addf(diag.Degraded, "FNT-W2-DEFERRED", "vertical CID widths deferred", -1, 0, -1)
 	}
+	f.toUnicode = f.loadToUnicode(ctx, file, dict, dc)
+	if f.toUnicode == nil && !f.predefined.hasUnicode() {
+		dc.Addf(diag.Degraded, "FNT-NO-TOUNICODE", "Type0 font has no ToUnicode", -1, 0, -1)
+	}
+	return nil
+}
+
+func (f *Font) loadToUnicode(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Collector) *ToUnicode {
 	tu := dict.Get("ToUnicode")
 	if r, ok := tu.(syntax.Ref); ok && file != nil {
 		v, err := file.Resolve(ctx, r)
@@ -538,20 +611,169 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 			tu = v
 		}
 	}
-	if stm, ok := tu.(*syntax.Stream); ok && file != nil {
-		data, err := file.DecodeStream(ctx, stm)
-		if err == nil {
-			cm, perr := ParseToUnicode(data)
-			if perr != nil {
-				dc.Addf(diag.Warn, "FNT-TOUNICODE-PARSE", "partial ToUnicode CMap", -1, 0, -1)
-			}
-			f.toUnicode = cm
+	stm, ok := tu.(*syntax.Stream)
+	if !ok || file == nil {
+		return nil
+	}
+	data, err := file.DecodeStream(ctx, stm)
+	if err != nil {
+		return nil
+	}
+	cm, perr := ParseToUnicode(data)
+	if perr != nil {
+		dc.Addf(diag.Warn, "FNT-TOUNICODE-PARSE", "partial ToUnicode CMap", -1, 0, -1)
+	}
+	return cm
+}
+
+type Type3Glyph struct {
+	Data      []byte
+	Resources syntax.Dict
+	Matrix    [6]float64
+}
+
+func (f *Font) Type3() bool { return f != nil && f.type3 }
+
+func (f *Font) GlyphName(code byte) string {
+	if f == nil {
+		return ""
+	}
+	return f.glyphNames[code]
+}
+
+// Type3Proc returns the decoded CharProc for a Type3 character code.
+func (f *Font) Type3Proc(ctx context.Context, file *syntax.File, code byte) (Type3Glyph, bool, error) {
+	if f == nil || !f.type3 || file == nil {
+		return Type3Glyph{}, false, nil
+	}
+	name := f.glyphNames[code]
+	if name == "" {
+		return Type3Glyph{}, false, nil
+	}
+	f.type3Mu.Lock()
+	data, cached := f.type3Cache[name]
+	f.type3Mu.Unlock()
+	if cached {
+		return Type3Glyph{Data: data, Resources: f.type3Res, Matrix: f.fontMatrix}, true, nil
+	}
+	if f.charProcs == nil || !f.charProcs.Has(name) {
+		return Type3Glyph{}, false, nil
+	}
+	obj, err := file.Resolve(ctx, f.charProcs.Get(name))
+	if err != nil {
+		return Type3Glyph{}, false, err
+	}
+	stm, ok := obj.(*syntax.Stream)
+	if !ok {
+		return Type3Glyph{}, false, nil
+	}
+	data, err = file.DecodeStream(ctx, stm)
+	if err != nil {
+		return Type3Glyph{}, false, err
+	}
+	f.type3Mu.Lock()
+	if f.type3Cache == nil {
+		f.type3Cache = map[string][]byte{}
+	}
+	f.type3Cache[name] = data
+	f.type3Mu.Unlock()
+	return Type3Glyph{Data: data, Resources: f.type3Res, Matrix: f.fontMatrix}, true, nil
+}
+
+func (f *Font) loadType3(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Collector) {
+	f.type3 = true
+	f.fontMatrix = [6]float64{0.001, 0, 0, 0.001, 0, 0}
+	fmObj := dict.Get("FontMatrix")
+	if r, ok := fmObj.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			fmObj = v
 		}
 	}
-	if f.toUnicode == nil {
-		dc.Addf(diag.Degraded, "FNT-NO-TOUNICODE", "Type0 font has no ToUnicode", -1, 0, -1)
+	if arr, ok := fmObj.(syntax.Array); ok && len(arr) >= 6 {
+		var fm [6]float64
+		valid := true
+		for i := range fm {
+			v, ok := syntax.AsNumber(arr[i])
+			if !ok {
+				valid = false
+				break
+			}
+			fm[i] = v
+		}
+		if valid {
+			f.fontMatrix = fm
+		} else {
+			dc.Addf(diag.Warn, "FNT-TYPE3-MATRIX", "invalid Type3 FontMatrix, using default", -1, 0, -1)
+		}
+	} else {
+		dc.Addf(diag.Warn, "FNT-TYPE3-MATRIX", "Type3 FontMatrix missing, using default", -1, 0, -1)
 	}
-	return nil
+	f.widthScale = math.Hypot(f.fontMatrix[0], f.fontMatrix[1]) * 1000
+
+	if cpObj := dict.Get("CharProcs"); cpObj != nil {
+		if r, ok := cpObj.(syntax.Ref); ok && file != nil {
+			if v, err := file.Resolve(ctx, r); err == nil {
+				cpObj = v
+			}
+		}
+		if cp, ok := cpObj.(syntax.Dict); ok {
+			f.charProcs = cp
+		}
+	}
+	if f.charProcs == nil {
+		dc.Addf(diag.Degraded, "FNT-TYPE3-CHARPROCS", "Type3 font has no CharProcs", -1, 0, -1)
+	}
+	if resObj := dict.Get("Resources"); resObj != nil {
+		if r, ok := resObj.(syntax.Ref); ok && file != nil {
+			if v, err := file.Resolve(ctx, r); err == nil {
+				resObj = v
+			}
+		}
+		if res, ok := resObj.(syntax.Dict); ok {
+			f.type3Res = res
+		}
+	}
+	if !f.loadType3Encoding(ctx, file, dict) {
+		dc.Addf(diag.Degraded, "FNT-TYPE3-ENCODING", "Type3 encoding has no glyph names", -1, 0, -1)
+	}
+}
+
+func (f *Font) loadType3Encoding(ctx context.Context, file *syntax.File, dict syntax.Dict) bool {
+	enc := dict.Get("Encoding")
+	if r, ok := enc.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			enc = v
+		}
+	}
+	ed, ok := enc.(syntax.Dict)
+	if !ok {
+		return false
+	}
+	diffs := ed.Get("Differences")
+	if r, ok := diffs.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			diffs = v
+		}
+	}
+	arr, ok := diffs.(syntax.Array)
+	if !ok {
+		return false
+	}
+	found := false
+	code := -1
+	for _, item := range arr {
+		switch v := item.(type) {
+		case syntax.Int:
+			code = int(v)
+		case syntax.Name:
+			if code >= 0 && code < 256 {
+				f.glyphNames[code] = string(v)
+				found = true
+				code++
+			}
+		}
+	}
+	return found
 }
 
 func (f *Font) loadCIDWidths(ctx context.Context, file *syntax.File, cid syntax.Dict, dc *diag.Collector) {
@@ -627,27 +849,79 @@ func (f *Font) CodeBytes() int {
 	return 1
 }
 
-func (f *Font) Codes(data []byte) []Code {
+// Split converts a PDF string into character codes. The second return value is
+// the number of bytes consumed; a value less than len(data) means the trailing
+// bytes do not form a complete code in the font's CMap.
+func (f *Font) Split(data []byte) ([]Code, int) {
 	if f == nil || !f.isCID {
 		out := make([]Code, len(data))
 		for i, b := range data {
-			out[i] = Code{Value: uint32(b), Bytes: 1, CID: 0}
+			out[i] = Code{Value: uint32(b), Bytes: 1}
 		}
-		return out
+		return out, len(data)
+	}
+	if f.predefined != nil {
+		return f.predefined.split(data)
+	}
+	if f.toUnicode != nil && !f.identity && len(f.toUnicode.Spaces) > 0 {
+		return splitWithSpaces(data, f.toUnicode.Spaces)
 	}
 	n := f.codeLen
 	if n <= 0 {
 		n = 2
 	}
 	out := make([]Code, 0, len(data)/n)
-	for i := 0; i+n <= len(data); i += n {
+	i := 0
+	for ; i+n <= len(data); i += n {
 		var v uint32
 		for j := 0; j < n; j++ {
 			v = v<<8 | uint32(data[i+j])
 		}
 		out = append(out, Code{Value: v, Bytes: n, CID: v})
 	}
-	return out
+	return out, i
+}
+
+// Codes converts a PDF string into character codes, discarding an incomplete
+// trailing code. Use Split when the caller needs to report truncation.
+func (f *Font) Codes(data []byte) []Code {
+	codes, _ := f.Split(data)
+	return codes
+}
+
+func splitWithSpaces(data []byte, spaces []codeSpace) ([]Code, int) {
+	maxBytes := 0
+	for _, s := range spaces {
+		if s.Bytes > maxBytes {
+			maxBytes = s.Bytes
+		}
+	}
+	out := make([]Code, 0, len(data))
+	pos := 0
+	for pos < len(data) {
+		matched := false
+		for n := maxBytes; n >= 1; n-- {
+			if pos+n > len(data) {
+				continue
+			}
+			v := codeOf(data[pos : pos+n])
+			for _, s := range spaces {
+				if s.Bytes == n && v >= s.Lo && v <= s.Hi {
+					out = append(out, Code{Value: v, Bytes: n, CID: v})
+					pos += n
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			break
+		}
+	}
+	return out, pos
 }
 
 func (f *Font) WidthCode(c Code) float64 {
@@ -673,11 +947,13 @@ func (f *Font) DecodeCode(c Code) (string, bool) {
 	if !f.isCID {
 		return f.Decode(byte(c.Value))
 	}
-	if f.toUnicode == nil {
-		return "\uFFFD", false
+	if f.toUnicode != nil {
+		if s, ok := f.toUnicode.Map[c.Value]; ok {
+			return s, true
+		}
 	}
-	if s, ok := f.toUnicode.Map[c.Value]; ok {
-		return s, true
+	if f.predefined != nil {
+		return f.predefined.decode(c)
 	}
 	return "\uFFFD", false
 }

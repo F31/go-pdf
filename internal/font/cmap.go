@@ -135,9 +135,16 @@ func isDelim(c byte) bool {
 	return false
 }
 
+type codeSpace struct {
+	Bytes int
+	Lo    uint32
+	Hi    uint32
+}
+
 type ToUnicode struct {
 	Map     map[uint32]string
 	CodeLen int
+	Spaces  []codeSpace
 }
 
 func ParseToUnicode(data []byte) (*ToUnicode, error) {
@@ -202,10 +209,20 @@ func (cm *ToUnicode) parseCodespace(l *cmapLexer) error {
 			continue
 		}
 		src := t
-		if _, ok, err := l.next(); err != nil || !ok {
+		dst, ok, err := l.next()
+		if err != nil || !ok || dst.kind != 'h' {
 			return errs.Wrap(errs.ErrCorrupt, "FNT-CMAP-CODESPACE", "parse codespace", -1, 0, -1)
 		}
-		if n := len(src.hex); n > 0 && n <= 4 {
+		n := len(src.hex)
+		if n == 0 || n > 4 || len(dst.hex) != n {
+			return errs.Wrap(errs.ErrCorrupt, "FNT-CMAP-CODESPACE", "parse codespace", -1, 0, -1)
+		}
+		lo, hi := codeOf(src.hex), codeOf(dst.hex)
+		if hi < lo {
+			continue
+		}
+		cm.Spaces = append(cm.Spaces, codeSpace{Bytes: n, Lo: lo, Hi: hi})
+		if n > cm.CodeLen {
 			cm.CodeLen = n
 		}
 	}

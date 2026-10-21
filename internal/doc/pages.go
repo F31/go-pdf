@@ -359,6 +359,6 @@ func (p *Page) Interpret(ctx context.Context, emit func(displaylist.Item) error)
 		Matrix:   info.Matrix,
 		MediaBox: displaylist.Rect{X0: info.MediaBox.X0, Y0: info.MediaBox.Y0, X1: info.MediaBox.X1, Y1: info.MediaBox.Y1},
 		CropBox:  displaylist.Rect{X0: info.CropBox.X0, Y0: info.CropBox.Y0, X1: info.CropBox.X1, Y1: info.CropBox.Y1},
-		File:     p.doc.file, Tracker: tracker, Diag: dc,
+		File:     p.doc.file, Fonts: p.doc.fonts, Tracker: tracker, Diag: dc,
 	}, emit)
 }

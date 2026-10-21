@@ -1,6 +1,6 @@
 # ADR-0001: Module path and toolchain
 
-- Status: accepted
+- Status: superseded by ADR-0004 (minimum Go version raised to 1.25)
 - Date: 2026-10-21
 - Resolves: design appendix B Q5
 

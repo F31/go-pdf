@@ -266,3 +266,230 @@ endcmap
 		t.Fatalf("origin %v,%v", tr.Glyphs[0].Origin.X, tr.Glyphs[0].Origin.Y)
 	}
 }
+
+func TestType0PredefinedCMapIntegration(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 10 Tf 10 80 Td <D6D0CEC4> Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /GBK-EUC-H /DescendantFonts [6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimSun /DW 1000 /W [4559 [900] 3795 [800]] >>"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := dl.Items[0].(*displaylist.TextRun)
+	if len(tr.Glyphs) != 2 {
+		t.Fatalf("glyphs %d", len(tr.Glyphs))
+	}
+	if tr.Glyphs[0].Text != "中" || !tr.Glyphs[0].UnicodeOK || tr.Glyphs[0].CID != 4559 {
+		t.Fatalf("glyph0 %#v", tr.Glyphs[0])
+	}
+	if tr.Glyphs[1].Text != "文" || !tr.Glyphs[1].UnicodeOK || tr.Glyphs[1].CID != 3795 {
+		t.Fatalf("glyph1 %#v", tr.Glyphs[1])
+	}
+	if math.Abs(tr.Glyphs[0].Advance-9) > 0.001 || math.Abs(tr.Glyphs[1].Advance-8) > 0.001 {
+		t.Fatalf("advances %v %v", tr.Glyphs[0].Advance, tr.Glyphs[1].Advance)
+	}
+}
+
+func TestIndirectFontResources(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font 6 0 R >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 12 Tf 10 80 Td (Hi) Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+		testkit.Raw(6, "<< /F1 5 0 R >>"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := dl.Items[0].(*displaylist.TextRun)
+	if len(tr.Glyphs) != 2 || tr.Glyphs[0].Text != "H" || !tr.Glyphs[0].UnicodeOK {
+		t.Fatalf("glyphs %#v", tr.Glyphs)
+	}
+}
+
+func TestType3GlyphExpansion(t *testing.T) {
+	cmap := `
+begincmap
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+<41> <4E2D>
+endbfchar
+endcmap
+`
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 10 Tf 10 20 Td (A) Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /gA 7 0 R >> /Encoding << /Type /Encoding /Differences [65 /gA] >> /FirstChar 65 /LastChar 65 /Widths [1000] /ToUnicode 8 0 R >>"),
+		testkit.Stream(7, "", []byte("1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f")),
+		testkit.Stream(8, "", []byte(cmap)),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.Items) != 2 {
+		t.Fatalf("items %d", len(dl.Items))
+	}
+	path, ok := dl.Items[0].(*displaylist.Path)
+	if !ok {
+		t.Fatalf("item0 %T", dl.Items[0])
+	}
+	if path.Flags&displaylist.FlagFromType3 == 0 {
+		t.Fatalf("missing FromType3 flag: %#v", path.Flags)
+	}
+	if math.Abs(path.Bounds.X0-10) > 0.01 || math.Abs(path.Bounds.Y0-70) > 0.01 ||
+		math.Abs(path.Bounds.X1-20) > 0.01 || math.Abs(path.Bounds.Y1-80) > 0.01 {
+		t.Fatalf("path bounds %#v", path.Bounds)
+	}
+	tr, ok := dl.Items[1].(*displaylist.TextRun)
+	if !ok {
+		t.Fatalf("item1 %T", dl.Items[1])
+	}
+	if tr.Font.Kind != "Type3" || len(tr.Glyphs) != 1 {
+		t.Fatalf("font=%#v glyphs=%d", tr.Font, len(tr.Glyphs))
+	}
+	if tr.Glyphs[0].Text != "中" || !tr.Glyphs[0].UnicodeOK || math.Abs(tr.Glyphs[0].Advance-10) > 0.001 {
+		t.Fatalf("glyph %#v", tr.Glyphs[0])
+	}
+}
+
+func TestEmbeddedCMapIntegration(t *testing.T) {
+	encoding := `
+begincmap
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 begincidrange
+<0001> <0002> 500
+endcidrange
+endcmap
+`
+	cmap := `
+begincmap
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfchar
+<0001> <4E2D>
+<0002> <6587>
+endbfchar
+endcmap
+`
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 10 Tf 10 80 Td <00010002> Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding 7 0 R /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>"),
+		testkit.Raw(6, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimSun /DW 1000 /W [500 [700 800]] >>"),
+		testkit.Stream(7, "", []byte(encoding)),
+		testkit.Stream(8, "", []byte(cmap)),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := dl.Items[0].(*displaylist.TextRun)
+	if len(tr.Glyphs) != 2 {
+		t.Fatalf("glyphs %d", len(tr.Glyphs))
+	}
+	if tr.Glyphs[0].Text != "中" || tr.Glyphs[0].CID != 500 || math.Abs(tr.Glyphs[0].Advance-7) > 0.001 {
+		t.Fatalf("glyph0 %#v", tr.Glyphs[0])
+	}
+	if tr.Glyphs[1].Text != "文" || tr.Glyphs[1].CID != 501 || math.Abs(tr.Glyphs[1].Advance-8) > 0.001 {
+		t.Fatalf("glyph1 %#v", tr.Glyphs[1])
+	}
+}
+
+func TestType0Big5Integration(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 10 Tf 10 80 Td <A4A4> Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /MingLiU /Encoding /B5-H /DescendantFonts [6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /MingLiU /DW 1000 /W [661 [700]] >>"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := dl.Items[0].(*displaylist.TextRun)
+	if len(tr.Glyphs) != 1 {
+		t.Fatalf("glyphs %d", len(tr.Glyphs))
+	}
+	if tr.Glyphs[0].Text != "中" || !tr.Glyphs[0].UnicodeOK || tr.Glyphs[0].CID != 661 {
+		t.Fatalf("glyph %#v", tr.Glyphs[0])
+	}
+	if math.Abs(tr.Glyphs[0].Advance-7) > 0.001 {
+		t.Fatalf("advance %v", tr.Glyphs[0].Advance)
+	}
+}
+
+func TestType0ShiftJISAndKorean(t *testing.T) {
+	tests := []struct {
+		name string
+		enc  string
+		hex  string
+		cid  uint32
+		text string
+	}{
+		{"shift-jis", "90ms-RKSJ-H", "82A0", 843, "あ"},
+		{"korean", "KSCms-UHC-H", "B0A1", 1086, "가"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := []testkit.Obj{
+				testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+				testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+				testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+				testkit.Stream(4, "", []byte("BT /F1 10 Tf 10 80 Td <"+tt.hex+"> Tj ET")),
+				testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /Test /Encoding /"+tt.enc+" /DescendantFonts [6 0 R] >>"),
+				testkit.Raw(6, fmt.Sprintf("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Test /DW 1000 /W [%d [700]] >>", tt.cid)),
+			}
+			d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+			defer d.Close()
+			p, _ := d.Page(0)
+			dl, err := p.DisplayList(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := dl.Items[0].(*displaylist.TextRun)
+			if len(tr.Glyphs) != 1 {
+				t.Fatalf("glyphs %d", len(tr.Glyphs))
+			}
+			if tr.Glyphs[0].Text != tt.text || !tr.Glyphs[0].UnicodeOK || tr.Glyphs[0].CID != tt.cid {
+				t.Fatalf("glyph %#v", tr.Glyphs[0])
+			}
+			if math.Abs(tr.Glyphs[0].Advance-7) > 0.001 {
+				t.Fatalf("advance %v", tr.Glyphs[0].Advance)
+			}
+		})
+	}
+}

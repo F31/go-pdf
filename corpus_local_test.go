@@ -36,6 +36,8 @@ func TestLocalCorpus(t *testing.T) {
 	}
 	var ok, encrypted, corrupt, unsupported, budget, other int
 	var totalPages, textRuns, glyphs, glyphsOK, paths, dlErrors int
+	var fonts, fontsMetrics, fontsAdvances int
+	fontSeen := map[*displaylist.FontInfo]bool{}
 	extract := os.Getenv("CORPUS_DL") == "1"
 	start := time.Now()
 	for _, path := range files {
@@ -85,6 +87,16 @@ func TestLocalCorpus(t *testing.T) {
 					switch v := it.(type) {
 					case *displaylist.TextRun:
 						textRuns++
+						if v.Font != nil && !fontSeen[v.Font] {
+							fontSeen[v.Font] = true
+							fonts++
+							if v.Font.Metrics.UnitsPerEm > 0 {
+								fontsMetrics++
+							}
+							if len(v.Font.Metrics.Advances) > 0 {
+								fontsAdvances++
+							}
+						}
 						for _, g := range v.Glyphs {
 							glyphs++
 							if g.UnicodeOK {
@@ -100,6 +112,6 @@ func TestLocalCorpus(t *testing.T) {
 		cancel()
 		_ = doc.Close()
 	}
-	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d dlerrors=%d elapsed=%s",
-		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, dlErrors, time.Since(start).Round(time.Millisecond))
+	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d fonts=%d fontsmetrics=%d fontsadvances=%d dlerrors=%d elapsed=%s",
+		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, fonts, fontsMetrics, fontsAdvances, dlErrors, time.Since(start).Round(time.Millisecond))
 }
