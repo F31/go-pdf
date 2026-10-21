@@ -4,17 +4,17 @@
 
 ## 状态
 
-当前为 **G0 基础阶段**：
+当前为 **G1 内容解释阶段**（G0 已完成）：
 
-- 经典 xref、xref 流、对象流、增量更新、混合引用
-- 严格模式与 `WithRepair(true)` 重建
-- Flate、LZW、ASCII85、ASCIIHex、RunLength 与 Predictor
-- 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit` 页面空间换算
-- Info 元数据与原始 XMP 透传
-- 统一预算、诊断与 `*pdf.Error`
-- `displaylist` 类型骨架与 `Version 1.0` 冻结
+- 经典 xref、xref 流、对象流、增量更新、混合引用、重建
+- Flate、LZW、ASCII85、ASCIIHex、RunLength、Predictor
+- 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit` 页面空间
+- 内容流解释：图形状态、路径、裁剪、基础颜色、文本状态
+- 简单字体与标准 14 字体宽度、WinAnsi/StandardEncoding
+- `Page.Walk` / `Page.DisplayList` 输出文字、路径与裁剪
+- 统一预算、诊断、`*pdf.Error` 与 `displaylist.Version 1.0`
 
-尚未实现：内容流解释、字体/CMap、颜色空间、图像解码、加密解密、区域渲染、写入与 CLI。未实现 API 会返回 `ErrUnsupported` 并写诊断，不会伪造空结果。
+尚未实现：Type0/CID/CMap/ToUnicode、嵌入字体轮廓、Type3、Form XObject、图像解码、渐变/图案、透明合成、加密解密、区域渲染、CLI。未实现内容会写诊断或返回 `ErrUnsupported`，不会伪造结果。
 
 ## 使用
 

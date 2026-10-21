@@ -90,6 +90,7 @@ jobs:
           go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s
           go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s
           go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s
+          go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime=20s
       - name: Upload fuzz corpus on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -111,7 +112,7 @@ jobs:
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
       - name: Compare with G0 baseline
-        run: benchstat docs/perf/g0-bench.txt bench.txt | tee benchstat.txt
+        run: benchstat docs/perf/g1-bench.txt bench.txt | tee benchstat.txt
       - uses: actions/upload-artifact@v4
         with:
           name: benchmarks

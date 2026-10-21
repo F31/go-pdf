@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/F31/go-pdf/displaylist"
 )
 
 // TestLocalCorpus exercises a private corpus when docs/pdf is present. The
@@ -33,13 +35,14 @@ func TestLocalCorpus(t *testing.T) {
 		t.Skip("no PDFs in local corpus")
 	}
 	var ok, encrypted, corrupt, unsupported, budget, other int
-	var totalPages int
+	var totalPages, textRuns, glyphs, paths, dlErrors int
+	extract := os.Getenv("CORPUS_DL") == "1"
 	start := time.Now()
 	for _, path := range files {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		doc, err := OpenFile(ctx, path)
-		cancel()
 		if err != nil {
+			cancel()
 			switch {
 			case errors.Is(err, ErrPassword):
 				encrypted++
@@ -71,9 +74,27 @@ func TestLocalCorpus(t *testing.T) {
 			}
 			_, _ = p.Size()
 			_ = p.Info()
+			if extract {
+				dl, err := p.DisplayList(ctx)
+				if err != nil {
+					dlErrors++
+					t.Logf("DISPLAY %s #%d: %v", filepath.Base(path), i, err)
+					continue
+				}
+				for _, it := range dl.Items {
+					switch v := it.(type) {
+					case *displaylist.TextRun:
+						textRuns++
+						glyphs += len(v.Glyphs)
+					case *displaylist.Path:
+						paths++
+					}
+				}
+			}
 		}
+		cancel()
 		_ = doc.Close()
 	}
-	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d elapsed=%s",
-		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, time.Since(start).Round(time.Millisecond))
+	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d paths=%d dlerrors=%d elapsed=%s",
+		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, paths, dlErrors, time.Since(start).Round(time.Millisecond))
 }

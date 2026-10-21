@@ -27,6 +27,7 @@ go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime="$FUZZTIME"
 go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime="$FUZZTIME"
 go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime="$FUZZTIME"
 go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime="$FUZZTIME"
+go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime="$FUZZTIME"
 
 if command -v staticcheck >/dev/null 2>&1; then
   echo "== staticcheck =="

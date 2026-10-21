@@ -37,7 +37,7 @@
 - Info 的 PDFDocEncoding 仅覆盖常用子集；XMP 仅透传原始字节，字段解析与优先级回退属 DOC-03。
 - 加密文件仅识别并返回 `ErrPassword`/`ErrUnsupported`，解密在 G4/G2 末实现。
 - DCT/CCITT/JBIG2/JPX 仅保留原始码流，解码属 G3。
-- 显示列表解释、字体、颜色、图像与区域渲染尚未实现，相关 API 返回 `ErrUnsupported`。
+- 显示列表解释、字体、颜色、图像与区域渲染在 G0 时未实现；G1 已补齐基础内容解释，见 `docs/g1-status.md`。
 - 预算默认值与性能 SLO 尚未用语料固化；CI 的 benchstat 目前生成对比报告，5% 硬门禁待基线稳定后启用。
 - 公共语料未入库，CI 只运行合成样本；本地语料回归通过 `TestLocalCorpus` 手动执行。
 

@@ -3,7 +3,9 @@ package doc
 import (
 	"context"
 
+	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/budget"
+	"github.com/F31/go-pdf/internal/content"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/syntax"
@@ -287,3 +289,76 @@ func (p *Page) Info() PageInfo {
 func (p *Page) Dict() syntax.Dict      { return p.dict }
 func (p *Page) Resources() syntax.Dict { return p.resources }
 func (p *Page) Document() *Document    { return p.doc }
+
+// Content returns the concatenated, decoded page content stream(s).
+func (p *Page) Content(ctx context.Context) ([]byte, error) {
+	v, ok := p.dict["Contents"]
+	if !ok {
+		return nil, nil
+	}
+	var out []byte
+	if err := p.appendContent(ctx, v, &out); err != nil {
+		return nil, err
+	}
+	limit := int64(64 << 20)
+	if p.doc.opts.Tracker != nil {
+		limit = p.doc.opts.Tracker.Budget().MaxStreamBytes
+	}
+	if int64(len(out)) > limit {
+		return nil, errs.Wrap(errs.ErrBudget, "BUD-STREAM-BYTES", "read page contents", -1, 0, p.index)
+	}
+	return out, nil
+}
+
+func (p *Page) appendContent(ctx context.Context, o syntax.Object, out *[]byte) error {
+	o, err := p.doc.file.Resolve(ctx, o)
+	if err != nil {
+		return err
+	}
+	switch v := o.(type) {
+	case *syntax.Stream:
+		data, err := p.doc.file.DecodeStream(ctx, v)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, data...)
+		*out = append(*out, '\n')
+	case syntax.Array:
+		for _, item := range v {
+			if err := p.appendContent(ctx, item, out); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Interpret runs the G1 content interpreter and streams display items.
+func (p *Page) Interpret(ctx context.Context, emit func(displaylist.Item) error) (*content.Result, error) {
+	p.doc.mu.RLock()
+	closed := p.doc.closed
+	p.doc.mu.RUnlock()
+	if closed {
+		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "interpret page", -1, 0, p.index)
+	}
+	data, err := p.Content(ctx)
+	if err != nil {
+		return nil, err
+	}
+	info := p.Info()
+	tracker := p.doc.opts.Tracker
+	if tracker == nil {
+		tracker = budget.NewTracker(&budget.DefaultBudget)
+	}
+	dc := p.doc.opts.Diag
+	if dc == nil {
+		dc = p.doc.file.Diag()
+	}
+	return content.Interpret(ctx, content.PageData{
+		Index: p.index, Content: data, Resources: p.resources,
+		Matrix:   info.Matrix,
+		MediaBox: displaylist.Rect{X0: info.MediaBox.X0, Y0: info.MediaBox.Y0, X1: info.MediaBox.X1, Y1: info.MediaBox.Y1},
+		CropBox:  displaylist.Rect{X0: info.CropBox.X0, Y0: info.CropBox.Y0, X1: info.CropBox.X1, Y1: info.CropBox.Y1},
+		File:     p.doc.file, Tracker: tracker, Diag: dc,
+	}, emit)
+}

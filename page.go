@@ -57,21 +57,53 @@ func (p *Page) Info() PageInfo {
 	}
 }
 
-// Walk streams display items to fn. G0 does not implement content
-// interpretation and returns ErrUnsupported with a diagnostic.
+// Walk streams display items to fn in paint order.
 func (p *Page) Walk(ctx context.Context, fn func(displaylist.Item) error) error {
 	if err := ctx.Err(); err != nil {
 		return errs.Wrap(errs.ErrCanceled, "CNT-CANCELED", "walk page", -1, 0, p.Index())
 	}
-	return p.unsupported("walk display list")
+	if p == nil || p.inner == nil {
+		return errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "walk page", -1, 0, -1)
+	}
+	_, err := p.inner.Interpret(ctx, fn)
+	return err
 }
 
-// DisplayList materializes the display list. G0 returns ErrUnsupported.
+// DisplayList materializes the page display list.
 func (p *Page) DisplayList(ctx context.Context) (*displaylist.Page, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "CNT-CANCELED", "display list", -1, 0, p.Index())
 	}
-	return nil, p.unsupported("display list")
+	if p == nil || p.inner == nil {
+		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "display list", -1, 0, -1)
+	}
+	items := make([]displaylist.Item, 0, 16)
+	res, err := p.inner.Interpret(ctx, func(it displaylist.Item) error {
+		items = append(items, it)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	info := p.Info()
+	diags := make([]displaylist.Diagnostic, 0)
+	for _, d := range p.doc.Diagnostics() {
+		if d.Page == p.Index() {
+			diags = append(diags, displaylist.Diagnostic{
+				Level: d.Level.String(), Code: d.Code, Msg: d.Msg,
+				Page: d.Page, Obj: d.Obj, Offset: d.Offset,
+			})
+		}
+	}
+	return &displaylist.Page{
+		Index: info.Index, Width: info.Width, Height: info.Height, Rotate: info.Rotate,
+		MediaBox: rect(info.MediaBox), CropBox: rect(info.CropBox),
+		Clips: res.Clips, Items: items, Diag: diags,
+	}, nil
+}
+
+func rect(b Box) displaylist.Rect {
+	return displaylist.Rect{X0: b.X0, Y0: b.Y0, X1: b.X1, Y1: b.Y1}
 }
 
 func (p *Page) Images(ctx context.Context) ([]displaylist.ImageInfo, error) {

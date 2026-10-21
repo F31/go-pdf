@@ -1,0 +1,7 @@
+BenchmarkInterpretText-24     	  303147	      3718 ns/op	    9864 B/op	      41 allocs/op
+BenchmarkInterpretPaths-24    	  779160	      1348 ns/op	    3408 B/op	      29 allocs/op
+BenchmarkFlateDecode-24       	  103351	     10854 ns/op	   6.54 MB/s	   40713 B/op	       7 allocs/op
+BenchmarkASCIIHexDecode-24    	 1310007	       944.2 ns/op	  34.95 MB/s	    4278 B/op	       4 allocs/op
+BenchmarkParseObject-24        	 1393207	       842.8 ns/op	    1408 B/op	      34 allocs/op
+BenchmarkResolveObject-24      	  443311	      2624 ns/op	    5648 B/op	      57 allocs/op
+BenchmarkOpenClassicXref-24    	  640879	      1880 ns/op	    4704 B/op	      31 allocs/op

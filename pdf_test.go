@@ -37,17 +37,18 @@ func TestPublicOpenAndPage(t *testing.T) {
 	if p.Index() != 0 {
 		t.Fatalf("index %d", p.Index())
 	}
-	if _, err := p.DisplayList(context.Background()); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("display list err = %v", err)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatalf("display list: %v", err)
 	}
-	found := false
-	for _, dg := range d.Diagnostics() {
-		if dg.Code == "CNT-NOT-IMPLEMENTED" {
-			found = true
-		}
+	if dl.Width != 200 || dl.Height != 100 {
+		t.Fatalf("display list size %v x %v", dl.Width, dl.Height)
 	}
-	if !found {
-		t.Fatal("expected unsupported diagnostic")
+	if len(dl.Items) != 0 {
+		t.Fatalf("expected no items for empty page, got %d", len(dl.Items))
+	}
+	if err := p.Walk(context.Background(), func(displaylist.Item) error { return nil }); err != nil {
+		t.Fatalf("walk: %v", err)
 	}
 }
 
