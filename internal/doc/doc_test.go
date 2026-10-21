@@ -152,3 +152,48 @@ func TestClosedDocument(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+func TestPageTreeCycleStrict(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [2 0 R] /Count 0 >>"),
+	}
+	b := budget.DefaultBudget
+	tr := budget.NewTracker(&b)
+	dc := diag.New(100)
+	f, err := syntax.Open(context.Background(), testkit.Build(objs, "/Root 1 0 R"), syntax.Options{Tracker: tr, Diag: dc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := Open(context.Background(), f, Options{Tracker: tr}); !errors.Is(err, errs.ErrCorrupt) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRepairRecoversPageTree(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+	}
+	data := testkit.SetXRefOffset(testkit.Build(objs, "/Root 1 0 R"), 3, 5)
+	b := budget.DefaultBudget
+	tr := budget.NewTracker(&b)
+	dc := diag.New(100)
+	f, err := syntax.Open(context.Background(), data, syntax.Options{Repair: true, Tracker: tr, Diag: dc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(context.Background(), f, Options{Repair: true, Tracker: tr, Diag: dc})
+	if err != nil {
+		t.Fatalf("repair open: %v", err)
+	}
+	defer d.Close()
+	if !d.Repaired() {
+		t.Fatal("expected repaired document")
+	}
+	if d.NumPages() != 1 {
+		t.Fatalf("pages %d", d.NumPages())
+	}
+}

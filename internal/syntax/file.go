@@ -908,6 +908,20 @@ func (f *File) mergeTrailerFromRepair(d Dict) {
 	}
 }
 
+// Rebuild discards the current xref view and reconstructs it by scanning the
+// file. It is used by the document layer when a later stage fails in repair
+// mode.
+func (f *File) Rebuild(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return errs.Wrap(errs.ErrClosed, "SYN-CLOSED", "rebuild xref", -1, 0, -1)
+	}
+	f.resetForRepair()
+	f.repairedFlag = false
+	return f.repair(ctx)
+}
+
 // DecodeStream exposes stream decoding to the document layer.
 func (f *File) DecodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
 	f.mu.Lock()

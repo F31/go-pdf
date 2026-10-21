@@ -224,7 +224,12 @@ func BuildXRefStream(objs []Obj, compressed map[int][2]int, trailerExtra string)
 // before the object, exercising readers that tolerate leading whitespace.
 func ShiftXRefOffset(data []byte, num int) []byte {
 	out := append([]byte(nil), data...)
-	idx := bytes.LastIndex(out, []byte("xref\n"))
+	idx := bytes.LastIndex(out, []byte("\nxref\n"))
+	if idx >= 0 {
+		idx++
+	} else {
+		idx = bytes.Index(out, []byte("xref\n"))
+	}
 	if idx < 0 {
 		return out
 	}
@@ -255,4 +260,73 @@ func ShiftXRefOffset(data []byte, num int) []byte {
 	}
 	copy(out[line:line+10], []byte(fmt.Sprintf("%010d", off-1)))
 	return out
+}
+
+// SetXRefOffset rewrites a classic xref entry to an arbitrary offset.
+func SetXRefOffset(data []byte, num int, offset int) []byte {
+	return rewriteXRefOffset(data, num, offset)
+}
+
+func rewriteXRefOffset(data []byte, num, off int) []byte {
+	out := append([]byte(nil), data...)
+	idx := bytes.LastIndex(out, []byte("\nxref\n"))
+	if idx >= 0 {
+		idx++
+	} else {
+		idx = bytes.Index(out, []byte("xref\n"))
+	}
+	if idx < 0 {
+		return out
+	}
+	rest := out[idx+len("xref\n"):]
+	nl := bytes.IndexByte(rest, '\n')
+	if nl < 0 {
+		return out
+	}
+	start := idx + len("xref\n") + nl + 1
+	line := start + num*20
+	if line+10 > len(out) {
+		return out
+	}
+	copy(out[line:line+10], []byte(fmt.Sprintf("%010d", off)))
+	return out
+}
+
+// CorruptStreamLength replaces the first /Length value in the given object.
+func CorruptStreamLength(data []byte, objNum, newLen int) []byte {
+	out := append([]byte(nil), data...)
+	marker := []byte(fmt.Sprintf("%d 0 obj", objNum))
+	i := bytes.Index(out, marker)
+	if i < 0 {
+		return out
+	}
+	j := bytes.Index(out[i:], []byte("/Length "))
+	if j < 0 {
+		return out
+	}
+	j += i + len("/Length ")
+	k := j
+	for k < len(out) && out[k] >= '0' && out[k] <= '9' {
+		k++
+	}
+	repl := []byte(fmt.Sprintf("%d", newLen))
+	copy(out[j:], append(repl, out[k:]...))
+	return out
+}
+
+// TruncateObject removes the endobj marker for objNum.
+func TruncateObject(data []byte, objNum int) []byte {
+	out := append([]byte(nil), data...)
+	marker := []byte(fmt.Sprintf("%d 0 obj", objNum))
+	i := bytes.Index(out, marker)
+	if i < 0 {
+		return out
+	}
+	j := bytes.Index(out[i:], []byte("endobj"))
+	if j < 0 {
+		return out
+	}
+	j += i
+	copy(out[j:], out[j+len("endobj"):])
+	return out[:len(out)-len("endobj")]
 }

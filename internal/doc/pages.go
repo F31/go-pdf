@@ -54,6 +54,9 @@ func (d *Document) loadPages(ctx context.Context) error {
 		}
 		if ref.Num != 0 {
 			if visited[ref] {
+				if !d.opts.Repair {
+					return errs.Wrap(errs.ErrCorrupt, "DOC-PAGE-TREE-CYCLE", "load page tree", -1, ref.Num, -1)
+				}
 				d.file.Diag().Add(diag.Diagnostic{Level: diag.Warn, Code: "DOC-PAGE-TREE-CYCLE", Msg: "skipped repeated page tree node", Page: -1, Obj: ref.Num, Offset: -1})
 				continue
 			}

@@ -26,9 +26,14 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
       - name: Test (no cgo)
         run: CGO_ENABLED=0 go test ./...
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-go${{ matrix.go }}
+          path: coverage.out
 
   staticcheck:
     name: Staticcheck
@@ -84,6 +89,14 @@ jobs:
           go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s
           go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s
           go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s
+          go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s
+      - name: Upload fuzz corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
 
   benchmark:
     name: Benchmarks
@@ -95,10 +108,16 @@ jobs:
           go-version: "1.24.x"
       - name: Run benchmarks
         run: go test ./... -run=^$ -bench=. -benchmem -count=1 | tee bench.txt
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: Compare with G0 baseline
+        run: benchstat docs/perf/g0-bench.txt bench.txt | tee benchstat.txt
       - uses: actions/upload-artifact@v4
         with:
           name: benchmarks
-          path: bench.txt
+          path: |
+            bench.txt
+            benchstat.txt
 
   deps:
     name: Dependency whitelist

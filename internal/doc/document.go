@@ -4,6 +4,7 @@ package doc
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,23 +85,42 @@ func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, erro
 		return nil, err
 	}
 	d.catalog = catalog
-	if t, _ := catalog.NameValue("Type"); t != "" && t != "Catalog" {
+	if err := d.initialize(ctx); err != nil {
+		if opts.Repair && !file.Repaired() && errors.Is(err, errs.ErrCorrupt) {
+			if rerr := file.Rebuild(ctx); rerr == nil {
+				if c2, e2 := file.ResolveRoot(ctx); e2 == nil {
+					d.catalog = c2
+					d.info = Info{}
+					d.pages = nil
+					if e3 := d.initialize(ctx); e3 == nil {
+						return d, nil
+					} else {
+						err = e3
+					}
+				}
+			}
+		}
+		return nil, err
+	}
+	return d, nil
+}
+
+func (d *Document) initialize(ctx context.Context) error {
+	file := d.file
+	if t, _ := d.catalog.NameValue("Type"); t != "" && t != "Catalog" {
 		file.Diag().Add(diag.Diagnostic{Level: diag.Warn, Code: "DOC-CATALOG-TYPE", Msg: "catalog Type is not Catalog", Page: -1, Offset: -1})
 	}
 	d.version = file.HeaderVersion()
-	if v, ok := catalog.NameValue("Version"); ok {
+	if v, ok := d.catalog.NameValue("Version"); ok {
 		if compareVersion(v, d.version) > 0 {
 			file.Diag().Add(diag.Diagnostic{Level: diag.Info, Code: "DOC-VERSION-MISMATCH", Msg: "catalog version is newer than header", Page: -1, Offset: -1})
 			d.version = v
 		}
 	}
 	if err := d.loadInfo(ctx); err != nil {
-		return nil, err
+		return err
 	}
-	if err := d.loadPages(ctx); err != nil {
-		return nil, err
-	}
-	return d, nil
+	return d.loadPages(ctx)
 }
 
 func compareVersion(a, b string) int {

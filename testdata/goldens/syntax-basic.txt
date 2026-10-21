@@ -1,0 +1,10 @@
+version=1.7
+repaired=false
+xref=4
+obj=0 type=0 off=0 gen=65535 stm=0 index=0
+obj=1 type=1 off=15 gen=0 stm=0 index=0
+obj=2 type=1 off=64 gen=0 stm=0 index=0
+obj=3 type=1 off=121 gen=0 stm=0 index=0
+trailer.Root=syntax.Ref
+trailer.Size=syntax.Int
+root.type=Catalog
