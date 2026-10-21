@@ -24,6 +24,20 @@ type Font struct {
 	unicodeOK    *[256]bool
 
 	Type string
+
+	isCID        bool
+	codeLen      int
+	toUnicode    *ToUnicode
+	cidWidths    map[uint32]float64
+	defaultWidth float64
+	dw2          [2]float64
+	vertical     bool
+}
+
+type Code struct {
+	Value uint32
+	Bytes int
+	CID   uint32
 }
 
 func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Collector) (*Font, error) {
@@ -83,6 +97,13 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 		}
 	}
 
+	if subtype == "Type0" {
+		if err := f.loadType0(ctx, file, dict, info, dc); err != nil {
+			return nil, err
+		}
+		f.Info = info
+		return f, nil
+	}
 	f.encoding = defaultEncoding(subtype, base)
 	if v := dict.Get("Encoding"); v != nil {
 		if err := f.loadEncoding(ctx, file, v, dc); err != nil {
@@ -424,3 +445,241 @@ func (f *Font) Describe() string {
 	}
 	return fmt.Sprintf("%s/%s", f.Info.BaseFont, f.Type)
 }
+
+func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dict, info *displaylist.FontInfo, dc *diag.Collector) error {
+	f.isCID = true
+	f.codeLen = 2
+	f.defaultWidth = 1000
+	f.cidWidths = map[uint32]float64{}
+	df := dict.Get("DescendantFonts")
+	if r, ok := df.(syntax.Ref); ok && file != nil {
+		v, err := file.Resolve(ctx, r)
+		if err == nil {
+			df = v
+		}
+	}
+	arr, ok := df.(syntax.Array)
+	if !ok || len(arr) == 0 {
+		dc.Addf(diag.Warn, "FNT-CID-NO-DESCENDANT", "Type0 font has no DescendantFonts", -1, 0, -1)
+		return nil
+	}
+	desc := arr[0]
+	if r, ok := desc.(syntax.Ref); ok && file != nil {
+		v, err := file.Resolve(ctx, r)
+		if err == nil {
+			desc = v
+		}
+	}
+	cid, ok := desc.(syntax.Dict)
+	if !ok {
+		dc.Addf(diag.Warn, "FNT-CID-DESCENDANT", "invalid CIDFont dictionary", -1, 0, -1)
+		return nil
+	}
+	if sub, ok := cid.NameValue("Subtype"); ok {
+		info.Kind = sub
+	}
+	if base, ok := cid.NameValue("BaseFont"); ok {
+		info.BaseFont = NormalizeBaseFont(base)
+		info.Family = info.BaseFont
+		if i := strings.IndexByte(info.Family, '-'); i > 0 {
+			info.Family = info.Family[:i]
+		}
+	}
+	if dw, ok := cid.IntValue("DW"); ok {
+		f.defaultWidth = float64(dw)
+	}
+	f.loadCIDWidths(ctx, file, cid, dc)
+	if fdObj := cid.Get("FontDescriptor"); fdObj != nil {
+		if r, ok := fdObj.(syntax.Ref); ok && file != nil {
+			if v, err := file.Resolve(ctx, r); err == nil {
+				fdObj = v
+			}
+		}
+		if fd, ok := fdObj.(syntax.Dict); ok {
+			f.loadDescriptor(ctx, file, fd, info, dc)
+		}
+	}
+	enc := dict.Get("Encoding")
+	encName := ""
+	if n, ok := enc.(syntax.Name); ok {
+		encName = string(n)
+	} else if r, ok := enc.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			if n, ok := v.(syntax.Name); ok {
+				encName = string(n)
+			} else {
+				dc.Addf(diag.Degraded, "FNT-CMAP-EMBEDDED-DEFERRED", "embedded CMap deferred", -1, 0, -1)
+			}
+		}
+	}
+	switch encName {
+	case "Identity-H":
+	case "Identity-V":
+		f.vertical = true
+		dc.Addf(diag.Degraded, "FNT-VERTICAL-DEFERRED", "vertical text positioning deferred", -1, 0, -1)
+	case "":
+		dc.Addf(diag.Warn, "FNT-CMAP-MISSING", "Type0 font has no usable Encoding", -1, 0, -1)
+	default:
+		dc.Addf(diag.Degraded, "FNT-CMAP-DEFERRED", "predefined CMap deferred: "+encName, -1, 0, -1)
+	}
+	if wmode, ok := dict.IntValue("WMode"); ok && wmode == 1 {
+		f.vertical = true
+	}
+	if dw2, ok := cid.ArrayValue("DW2"); ok && len(dw2) >= 2 {
+		f.dw2 = [2]float64{numeric(dw2[0]), numeric(dw2[1])}
+	}
+	if cid.Has("W2") {
+		dc.Addf(diag.Degraded, "FNT-W2-DEFERRED", "vertical CID widths deferred", -1, 0, -1)
+	}
+	tu := dict.Get("ToUnicode")
+	if r, ok := tu.(syntax.Ref); ok && file != nil {
+		v, err := file.Resolve(ctx, r)
+		if err == nil {
+			tu = v
+		}
+	}
+	if stm, ok := tu.(*syntax.Stream); ok && file != nil {
+		data, err := file.DecodeStream(ctx, stm)
+		if err == nil {
+			cm, perr := ParseToUnicode(data)
+			if perr != nil {
+				dc.Addf(diag.Warn, "FNT-TOUNICODE-PARSE", "partial ToUnicode CMap", -1, 0, -1)
+			}
+			f.toUnicode = cm
+		}
+	}
+	if f.toUnicode == nil {
+		dc.Addf(diag.Degraded, "FNT-NO-TOUNICODE", "Type0 font has no ToUnicode", -1, 0, -1)
+	}
+	return nil
+}
+
+func (f *Font) loadCIDWidths(ctx context.Context, file *syntax.File, cid syntax.Dict, dc *diag.Collector) {
+	wObj := cid.Get("W")
+	if r, ok := wObj.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			wObj = v
+		}
+	}
+	arr, ok := wObj.(syntax.Array)
+	if !ok {
+		return
+	}
+	resolve := func(o syntax.Object) syntax.Object {
+		if r, ok := o.(syntax.Ref); ok && file != nil {
+			if v, err := file.Resolve(ctx, r); err == nil {
+				return v
+			}
+		}
+		return o
+	}
+	for i := 0; i < len(arr); {
+		cObj := resolve(arr[i])
+		c, ok := syntax.AsInt(cObj)
+		if !ok {
+			i++
+			continue
+		}
+		i++
+		if i >= len(arr) {
+			break
+		}
+		next := resolve(arr[i])
+		if sub, ok := next.(syntax.Array); ok {
+			for j, vo := range sub {
+				if w, ok := syntax.AsNumber(resolve(vo)); ok {
+					f.cidWidths[uint32(c)+uint32(j)] = w
+				}
+			}
+			i++
+			continue
+		}
+		if i+1 >= len(arr) {
+			break
+		}
+		last, ok := syntax.AsInt(next)
+		if !ok {
+			i++
+			continue
+		}
+		w, ok := syntax.AsNumber(resolve(arr[i+1]))
+		if !ok {
+			i += 2
+			continue
+		}
+		i += 2
+		if last < c || last-c > 1<<20 {
+			continue
+		}
+		for x := c; x <= last; x++ {
+			f.cidWidths[uint32(x)] = w
+		}
+	}
+}
+
+func (f *Font) CodeBytes() int {
+	if f == nil {
+		return 1
+	}
+	if f.isCID {
+		return f.codeLen
+	}
+	return 1
+}
+
+func (f *Font) Codes(data []byte) []Code {
+	if f == nil || !f.isCID {
+		out := make([]Code, len(data))
+		for i, b := range data {
+			out[i] = Code{Value: uint32(b), Bytes: 1, CID: 0}
+		}
+		return out
+	}
+	n := f.codeLen
+	if n <= 0 {
+		n = 2
+	}
+	out := make([]Code, 0, len(data)/n)
+	for i := 0; i+n <= len(data); i += n {
+		var v uint32
+		for j := 0; j < n; j++ {
+			v = v<<8 | uint32(data[i+j])
+		}
+		out = append(out, Code{Value: v, Bytes: n, CID: v})
+	}
+	return out
+}
+
+func (f *Font) WidthCode(c Code) float64 {
+	if f == nil {
+		return 500
+	}
+	if !f.isCID {
+		return f.Width(byte(c.Value))
+	}
+	if w, ok := f.cidWidths[c.CID]; ok {
+		return w
+	}
+	if f.defaultWidth > 0 {
+		return f.defaultWidth
+	}
+	return 1000
+}
+
+func (f *Font) DecodeCode(c Code) (string, bool) {
+	if f == nil {
+		return "\uFFFD", false
+	}
+	if !f.isCID {
+		return f.Decode(byte(c.Value))
+	}
+	if f.toUnicode == nil {
+		return "\uFFFD", false
+	}
+	if s, ok := f.toUnicode.Map[c.Value]; ok {
+		return s, true
+	}
+	return "\uFFFD", false
+}
+
+func (f *Font) Vertical() bool { return f != nil && f.vertical }

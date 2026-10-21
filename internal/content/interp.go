@@ -919,7 +919,7 @@ func (ip *interp) nextLine() error {
 	return nil
 }
 
-func (ip *interp) show(s syntax.String, tj float64) error {
+func (ip *interp) show(s syntax.String, _ float64) error {
 	if len(s) == 0 {
 		return nil
 	}
@@ -928,13 +928,27 @@ func (ip *interp) show(s syntax.String, tj float64) error {
 			return err
 		}
 	}
-	trm := ip.textMatrix()
-	ox, oy := trm.apply(0, 0)
+	var codes []font.Code
+	if ip.st.font != nil {
+		codes = ip.st.font.Codes([]byte(s))
+		if len(codes)*ip.st.font.CodeBytes() != len(s) {
+			ip.diagOnce(diag.Warn, "CNT-CODE-TRUNCATED", "truncated character code at end of string")
+		}
+	} else {
+		codes = make([]font.Code, len(s))
+		for i, b := range s {
+			codes[i] = font.Code{Value: uint32(b), Bytes: 1}
+		}
+	}
+	if len(codes) == 0 {
+		return nil
+	}
 	if ip.tr == nil {
 		ip.tr = &displaylist.TextRun{
 			Font: fontInfo(ip.st.font), Size: ip.st.fontSize, Fill: ip.st.fill,
 			RenderMode: ip.st.render, CharSpace: ip.st.charSpace,
 			WordSpace: ip.st.wordSpace, HScale: ip.st.hscale, Rise: ip.st.rise,
+			Vertical: ip.st.font != nil && ip.st.font.Vertical(),
 		}
 		ip.tr.Common = ip.common()
 		ip.trClip = ip.curClip
@@ -947,37 +961,23 @@ func (ip *interp) show(s syntax.String, tj float64) error {
 			ip.tr.Stroke = &p
 		}
 	}
-	width := 500.0
-	text, ok := "\uFFFD", false
-	if ip.st.font != nil {
-		width = ip.st.font.Width(byte(s[0]))
-		text, ok = ip.st.font.Decode(byte(s[0]))
-	}
-	adv := (width/1000*ip.st.fontSize + ip.st.charSpace) * ip.st.hscale
-	if s[0] == 32 {
-		adv = (width/1000*ip.st.fontSize + ip.st.charSpace + ip.st.wordSpace) * ip.st.hscale
-	}
-	_ = tj
-	g := displaylist.Glyph{
-		Text: text, UnicodeOK: ok, Code: uint32(s[0]), Origin: displaylist.Point{X: ox, Y: oy},
-		Advance: adv, Matrix: displaylist.Matrix(trm),
-	}
-	ip.tr.Glyphs = append(ip.tr.Glyphs, g)
-	ip.growTextBounds(g)
-	ip.tm = mmul(translate(adv, 0), ip.tm)
-	for i := 1; i < len(s); i++ {
-		trm = ip.textMatrix()
-		ox, oy = trm.apply(0, 0)
-		width, text, ok = 500, "\uFFFD", false
+	for _, c := range codes {
+		trm := ip.textMatrix()
+		ox, oy := trm.apply(0, 0)
+		width := 500.0
+		text, ok := "\uFFFD", false
 		if ip.st.font != nil {
-			width = ip.st.font.Width(s[i])
-			text, ok = ip.st.font.Decode(s[i])
+			width = ip.st.font.WidthCode(c)
+			text, ok = ip.st.font.DecodeCode(c)
 		}
-		adv = (width/1000*ip.st.fontSize + ip.st.charSpace) * ip.st.hscale
-		if s[i] == 32 {
+		adv := (width/1000*ip.st.fontSize + ip.st.charSpace) * ip.st.hscale
+		if c.Bytes == 1 && c.Value == 32 {
 			adv = (width/1000*ip.st.fontSize + ip.st.charSpace + ip.st.wordSpace) * ip.st.hscale
 		}
-		g = displaylist.Glyph{Text: text, UnicodeOK: ok, Code: uint32(s[i]), Origin: displaylist.Point{X: ox, Y: oy}, Advance: adv, Matrix: displaylist.Matrix(trm)}
+		g := displaylist.Glyph{
+			Text: text, UnicodeOK: ok, Code: c.Value, CID: c.CID,
+			Origin: displaylist.Point{X: ox, Y: oy}, Advance: adv, Matrix: displaylist.Matrix(trm),
+		}
 		ip.tr.Glyphs = append(ip.tr.Glyphs, g)
 		ip.growTextBounds(g)
 		ip.tm = mmul(translate(adv, 0), ip.tm)
@@ -990,7 +990,7 @@ func (ip *interp) runMatches() bool {
 		return true
 	}
 	f := fontInfo(ip.st.font)
-	return ip.tr.Font == f && ip.tr.Size == ip.st.fontSize &&
+	return ip.tr.Font == f && ip.tr.Size == ip.st.fontSize && ip.tr.Vertical == (ip.st.font != nil && ip.st.font.Vertical()) &&
 		ip.tr.RenderMode == ip.st.render && paintEqual(ip.tr.Fill, ip.st.fill) &&
 		ip.tr.CharSpace == ip.st.charSpace && ip.tr.WordSpace == ip.st.wordSpace &&
 		ip.tr.HScale == ip.st.hscale && ip.tr.Rise == ip.st.rise

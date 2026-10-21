@@ -91,6 +91,7 @@ jobs:
           go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s
           go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s
           go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime=20s
+          go test ./internal/font -run=^$ -fuzz=FuzzParseToUnicode -fuzztime=20s
       - name: Upload fuzz corpus on failure
         if: failure()
         uses: actions/upload-artifact@v4

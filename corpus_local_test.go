@@ -35,7 +35,7 @@ func TestLocalCorpus(t *testing.T) {
 		t.Skip("no PDFs in local corpus")
 	}
 	var ok, encrypted, corrupt, unsupported, budget, other int
-	var totalPages, textRuns, glyphs, paths, dlErrors int
+	var totalPages, textRuns, glyphs, glyphsOK, paths, dlErrors int
 	extract := os.Getenv("CORPUS_DL") == "1"
 	start := time.Now()
 	for _, path := range files {
@@ -85,7 +85,12 @@ func TestLocalCorpus(t *testing.T) {
 					switch v := it.(type) {
 					case *displaylist.TextRun:
 						textRuns++
-						glyphs += len(v.Glyphs)
+						for _, g := range v.Glyphs {
+							glyphs++
+							if g.UnicodeOK {
+								glyphsOK++
+							}
+						}
 					case *displaylist.Path:
 						paths++
 					}
@@ -95,6 +100,6 @@ func TestLocalCorpus(t *testing.T) {
 		cancel()
 		_ = doc.Close()
 	}
-	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d paths=%d dlerrors=%d elapsed=%s",
-		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, paths, dlErrors, time.Since(start).Round(time.Millisecond))
+	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d dlerrors=%d elapsed=%s",
+		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, dlErrors, time.Since(start).Round(time.Millisecond))
 }

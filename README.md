@@ -11,10 +11,11 @@
 - 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit` 页面空间
 - 内容流解释：图形状态、路径、裁剪、基础颜色、文本状态
 - 简单字体与标准 14 字体宽度、WinAnsi/StandardEncoding
+- Type0/CIDFont + Identity-H/V、ToUnicode CMap、CID `/W`/`/DW` 宽度
 - `Page.Walk` / `Page.DisplayList` 输出文字、路径与裁剪
 - 统一预算、诊断、`*pdf.Error` 与 `displaylist.Version 1.0`
 
-尚未实现：Type0/CID/CMap/ToUnicode、嵌入字体轮廓、Type3、Form XObject、图像解码、渐变/图案、透明合成、加密解密、区域渲染、CLI。未实现内容会写诊断或返回 `ErrUnsupported`，不会伪造结果。
+尚未实现：预定义 CJK CMap（GBK/UniGB 等）、嵌入 CMap 流、嵌入字体轮廓、Type3、ActualText、竖排精确定位、Form XObject、图像解码、渐变/图案、透明合成、加密解密、区域渲染、CLI。未实现内容会写诊断或返回 `ErrUnsupported`，不会伪造结果。
 
 ## 使用
 

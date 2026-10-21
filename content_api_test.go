@@ -216,3 +216,53 @@ func TestPathGolden(t *testing.T) {
 	}
 	testkit.Golden(t, "testdata/goldens/path-rect-line.txt", []byte(b.String()))
 }
+
+func TestType0ToUnicodeIntegration(t *testing.T) {
+	cmap := `
+begincmap
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<0001> <4E2D>
+<0002> <6587>
+<0010> <4E00>
+endbfchar
+endcmap
+`
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("BT /F1 12 Tf 10 80 Td <00010002> Tj ET")),
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>"),
+		testkit.Raw(6, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimSun /DW 1000 /W [1 [500 600]] >>"),
+		testkit.Stream(7, "", []byte(cmap)),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.Items) != 1 {
+		t.Fatalf("items %d", len(dl.Items))
+	}
+	tr := dl.Items[0].(*displaylist.TextRun)
+	if len(tr.Glyphs) != 2 {
+		t.Fatalf("glyphs %d", len(tr.Glyphs))
+	}
+	if tr.Glyphs[0].Text != "中" || !tr.Glyphs[0].UnicodeOK || tr.Glyphs[0].Code != 1 || tr.Glyphs[0].CID != 1 {
+		t.Fatalf("glyph0 %#v", tr.Glyphs[0])
+	}
+	if tr.Glyphs[1].Text != "文" || !tr.Glyphs[1].UnicodeOK || tr.Glyphs[1].Code != 2 {
+		t.Fatalf("glyph1 %#v", tr.Glyphs[1])
+	}
+	if math.Abs(tr.Glyphs[0].Advance-6) > 0.001 || math.Abs(tr.Glyphs[1].Advance-7.2) > 0.001 {
+		t.Fatalf("advances %v %v", tr.Glyphs[0].Advance, tr.Glyphs[1].Advance)
+	}
+	if math.Abs(tr.Glyphs[0].Origin.X-10) > 0.001 || math.Abs(tr.Glyphs[0].Origin.Y-20) > 0.001 {
+		t.Fatalf("origin %v,%v", tr.Glyphs[0].Origin.X, tr.Glyphs[0].Origin.Y)
+	}
+}

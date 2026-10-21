@@ -31,7 +31,7 @@
 ## 已知限制
 
 - 标准 14 宽度表来自 Liberation 临时度量，非 Adobe AFM 原表；文本位置尚无参考引擎 P95 统计。
-- Type0/CID、CMap、ToUnicode、Type3、嵌入字体轮廓未实现；只做回退宽度与诊断。
+- G1 未实现 Type0/CID、CMap、ToUnicode、Type3、嵌入字体轮廓；G2 增量已覆盖 Identity-H + ToUnicode，仍缺预定义 CMap 与嵌入 CMap，见 `docs/g2-status.md`。
 - Form XObject、内联图像、图像 XObject、渐变、图案、软蒙版、透明组未实现，写诊断并跳过。
 - 路径控制点包围盒可能略大于真实曲线包围盒；线宽按 CTM 平均缩放近似。
 - 裁剪交集未精确表达，当前用新裁剪切替换旧裁剪并写诊断。
