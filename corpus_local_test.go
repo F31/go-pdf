@@ -35,7 +35,7 @@ func TestLocalCorpus(t *testing.T) {
 		t.Skip("no PDFs in local corpus")
 	}
 	var ok, encrypted, corrupt, unsupported, budget, other int
-	var totalPages, textRuns, glyphs, glyphsOK, paths, dlErrors int
+	var totalPages, textRuns, glyphs, glyphsOK, paths, patterns, images, shadings, scanned, dlErrors int
 	var fonts, fontsMetrics, fontsAdvances int
 	fontSeen := map[*displaylist.FontInfo]bool{}
 	extract := os.Getenv("CORPUS_DL") == "1"
@@ -83,6 +83,9 @@ func TestLocalCorpus(t *testing.T) {
 					t.Logf("DISPLAY %s #%d: %v", filepath.Base(path), i, err)
 					continue
 				}
+				if dl.Scanned {
+					scanned++
+				}
 				for _, it := range dl.Items {
 					switch v := it.(type) {
 					case *displaylist.TextRun:
@@ -105,6 +108,13 @@ func TestLocalCorpus(t *testing.T) {
 						}
 					case *displaylist.Path:
 						paths++
+						if v.Fill != nil && v.Fill.Pattern != nil {
+							patterns++
+						}
+					case *displaylist.Image:
+						images++
+					case *displaylist.Shading:
+						shadings++
 					}
 				}
 			}
@@ -112,6 +122,6 @@ func TestLocalCorpus(t *testing.T) {
 		cancel()
 		_ = doc.Close()
 	}
-	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d fonts=%d fontsmetrics=%d fontsadvances=%d dlerrors=%d elapsed=%s",
-		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, fonts, fontsMetrics, fontsAdvances, dlErrors, time.Since(start).Round(time.Millisecond))
+	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d patterns=%d images=%d shadings=%d scanned=%d fonts=%d fontsmetrics=%d fontsadvances=%d dlerrors=%d elapsed=%s",
+		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, patterns, images, shadings, scanned, fonts, fontsMetrics, fontsAdvances, dlErrors, time.Since(start).Round(time.Millisecond))
 }

@@ -32,10 +32,10 @@
 
 - 标准 14 宽度表来自 Liberation 临时度量，非 Adobe AFM 原表；文本位置尚无参考引擎 P95 统计。
 - G1 未实现 Type0/CID、CMap、ToUnicode、Type3、嵌入字体轮廓；G2 增量已覆盖 Identity-H、简单字体与 Type3 ToUnicode、预定义与嵌入 CMap、多字节 codespace、Type3 CharProcs 路径、sfnt `FontMetrics` 与字形轮廓，见 `docs/g2-status.md`。
-- Form XObject、内联图像、图像 XObject、渐变、图案、软蒙版、透明组未实现，写诊断并跳过。
+- Form XObject 已在 G3 展开；基础 Image XObject/内联图像、DCT 与 Device 色彩空间已在 G3 支持，见 `docs/g3-status.md`。渐变、图案、透明组与高级图像编码仍未实现。
 - 路径控制点包围盒可能略大于真实曲线包围盒；线宽按 CTM 平均缩放近似。
 - 裁剪交集未精确表达，当前用新裁剪切替换旧裁剪并写诊断。
-- 标记内容 `ActualText`、结构树关联未实现。
+- 标记内容 `ActualText` 已在 G3 写入 `TextRun.ActualText`；结构树关联未实现。
 - `Walk` 已按项流式输出，但文本运行在 flush 前会短暂缓存。
 
 ## G2 输入

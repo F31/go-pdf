@@ -112,6 +112,7 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 			return nil, err
 		}
 		f.fillMetrics(info, dc)
+		info.GlyphSource = glyphSource{f}
 		f.Info = info
 		return f, nil
 	}
@@ -141,6 +142,7 @@ func Load(ctx context.Context, file *syntax.File, dict syntax.Dict, dc *diag.Col
 	}
 	f.toUnicode = f.loadToUnicode(ctx, file, dict, dc)
 	f.fillMetrics(info, dc)
+	info.GlyphSource = glyphSource{f}
 	f.Info = info
 	return f, nil
 }
@@ -959,3 +961,9 @@ func (f *Font) DecodeCode(c Code) (string, bool) {
 }
 
 func (f *Font) Vertical() bool { return f != nil && f.vertical }
+
+type glyphSource struct{ f *Font }
+
+func (g glyphSource) GlyphOutline(code, cid uint32) ([]displaylist.Segment, bool) {
+	return g.f.GlyphOutline(Code{Value: code, CID: cid, Bytes: 1})
+}

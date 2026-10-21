@@ -4,7 +4,7 @@
 
 ## 状态
 
-当前为 **G1/G2 字体增量阶段**（G0 已完成）：
+当前为 **G3 内容对象与 G3b 区域渲染阶段**（G0/G1/G2 已完成）：
 
 - 经典 xref、xref 流、对象流、增量更新、混合引用、重建
 - Flate、LZW、ASCII85、ASCIIHex、RunLength、Predictor
@@ -18,12 +18,24 @@
 - Type3 `CharProcs` 字形路径、`FlagFromType3`、`FontMatrix` 字宽与 ToUnicode
 - `x/image/font/sfnt` 字体度量、`FontMetrics.Advances`、`CIDToGIDMap` 与文档级字体缓存
 - 嵌入 TrueType/OpenType 字形轮廓读取（1/1000 文本空间，Y 向上，二次曲线转三次），覆盖 CIDToGID 映射
-- `Page.Walk` / `Page.DisplayList` 输出文字、路径与裁剪
-- 统一预算、诊断、`*pdf.Error` 与 `displaylist.Version 1.0`
+- Form XObject 展开：`Matrix`、`BBox` 裁剪、资源继承、递归/循环与深度预算
+- Image XObject 与内联图像：`ImageRef.Raw/Decode`、DeviceGray/RGB/CMYK、1/2/4/8/16 bpc、Decode 数组、ImageMask、DCT/JPEG、CCITT G3 1-D/G4
+- JBIG2/JPX 通过 `pdf.RegisterExternalDecoder` 注册外部解码器
+- ExtGState 常量透明度 `ca`/`CA`、混合模式记录、线宽/端点/连接/虚线状态
+- 颜色空间：CalGray/CalRGB/Lab、ICCBased 回退、Indexed、Separation/DeviceN；PDF Function 类型 0/2/3/4
+- 轴向/径向渐变：`ShadingType 2/3`、64 色标采样、`Extend`、CTM 变换与裁剪
+- 可选内容可见性：`/OCProperties` 的 `BaseState`/`ON`/`OFF`、`BDC /OC` 与 `WithHiddenLayers`
+- Tiling 图案与 type 4/5 mesh 内容；type 6/7 mesh 原始码流透传
+- `render.RenderRegion` 区域渲染：路径填充/EvenOdd、虚线、butt/round/projecting 端点与 miter/bevel/round 连接、ImageMask 模板、彩色/未着色 Tiling 图案基础平铺、type 4–7 mesh、function shading、Alpha/Luminosity 软蒙版、透明组离屏合成、图像与色键遮罩、裁剪、常量 alpha、16 种混合模式、轴向/径向渐变、嵌入字体轮廓文字；DPI 默认 220、上限 300
+- 图像解码失败（如未注册 JBIG2/JPX）在区域渲染中显式返回 `ErrUnsupported`，禁止静默缺图
+- ImageMask、色键 Mask、SMask 关联输出；`Page.Images` 与 `Page.Fonts` 清单
+- 显示列表 `Version 1.11`；路径形状提示（矩形/圆角矩形/椭圆/直线/折线）、`Source` 操作符追溯、相对几何 `Sig`、`ActualText` 与 `Page.Scanned`
+- `Page.Walk` / `Page.DisplayList` 输出文字、路径、图像与裁剪
+- 统一预算、诊断、`*pdf.Error` 与 `displaylist.Version 1.11`
 
 预定义 CMap 中少数多字符 Unicode 目标（当前 1,878 条兼容序列）未展开；变体选择符归并到首字符。
 
-尚未实现：区域渲染、Type3 嵌套裁剪的精确合成、ActualText、竖排精确定位、Form XObject、图像解码、渐变/图案、透明合成、加密解密、CLI。未实现内容会写诊断或返回 `ErrUnsupported`，不会伪造结果。
+尚未实现：CCITT G3 2-D/无 EOL 变体、JBIG2/JPX 核心解码（仅外部解码器）、knockout 透明组的精确合成、加密解密、CLI。未实现内容会写诊断或返回 `ErrUnsupported`，不会伪造结果。
 
 ## 使用
 
@@ -50,7 +62,15 @@ _ = h
 doc, err := pdf.Open(ctx, readerAt, size)
 ```
 
-可用选项：`WithRepair`、`WithBudget`、`WithPassword`（G0 仅识别加密并返回 `ErrPassword`）、`WithHiddenLayers`、`WithPreserveForms`。
+区域渲染：
+
+```go
+img, err := render.RenderRegion(ctx, pg, displaylist.Rect{X1: 300, Y1: 200}, render.PageOptions{
+    DPI: 220, Background: "white", IncludeText: true,
+})
+```
+
+可用选项：`WithRepair`、`WithBudget`、`WithPassword`（G0 仅识别加密并返回 `ErrPassword`）、`WithHiddenLayers`（是否包含隐藏图层）、`WithPreserveForms`（保留 Form XObject 透明组）。
 
 ## 构建与测试
 
@@ -83,6 +103,7 @@ go test -run TestLocalCorpus -v -timeout 20m
 ```text
 pdf.go document/page/options/errors   公共 API
 displaylist/                          显示列表契约
+render/                               区域渲染公共 API
 internal/syntax/                      词法、对象、xref、重建
 internal/filter/                      过滤器与 Predictor
 internal/doc/                         页面树、页面空间、元数据
@@ -100,7 +121,7 @@ testdata/                             语料与金样
 - 普通错误以 `error` 返回，不向调用方传播 panic。
 - 默认严格模式；重建必须显式开启并记录诊断。
 - 诊断与错误信息不包含文档正文。
-- 公共入口只暴露根包与 `displaylist` 的稳定类型。
+- 公共入口暴露根包、`displaylist` 与 `render` 的稳定类型。
 
 ## 许可
 

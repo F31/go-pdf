@@ -9,7 +9,7 @@
 - Flate、LZW（EarlyChange 1/0）、ASCII85、ASCIIHex、RunLength、TIFF/PNG Predictor
 - 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit` 页面空间、Info 元数据与原始 XMP
 - 统一预算、诊断、`*pdf.Error`、关闭与取消语义
-- `displaylist` 类型骨架与 `Version 1.0`、规范化 JSON 与金样哈希
+- `displaylist` 类型骨架（G0 时为 `Version 1.0`）、规范化 JSON 与金样哈希
 - 金样运行器（`UPDATE_GOLDEN=1`）、故障注入工具、fuzz 目标与 benchmark 基线
 
 ## 本地语料结果
@@ -36,7 +36,7 @@
 - 页面树 `Count` 仅作提示，尚未产生与实际页数不一致的诊断。
 - Info 的 PDFDocEncoding 仅覆盖常用子集；XMP 仅透传原始字节，字段解析与优先级回退属 DOC-03。
 - 加密文件仅识别并返回 `ErrPassword`/`ErrUnsupported`，解密在 G4/G2 末实现。
-- DCT/CCITT/JBIG2/JPX 仅保留原始码流，解码属 G3。
+- DCT/CCITT 已在 G3 解码；JBIG2/JPX 通过外部解码器注册，核心不做解码。
 - 显示列表解释、字体、颜色、图像与区域渲染在 G0 时未实现；G1 已补齐基础内容解释，见 `docs/g1-status.md`。
 - 预算默认值与性能 SLO 尚未用语料固化；CI 的 benchstat 目前生成对比报告，5% 硬门禁待基线稳定后启用。
 - 公共语料未入库，CI 只运行合成样本；本地语料回归通过 `TestLocalCorpus` 手动执行。

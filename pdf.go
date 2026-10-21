@@ -99,7 +99,7 @@ func openData(ctx context.Context, data []byte, o options) (*Document, error) {
 		return nil, err
 	}
 	inner, err := doc.Open(ctx, file, doc.Options{
-		Repair: o.repair, Tracker: tracker, Diag: collector,
+		Repair: o.repair, IncludeHidden: o.hidden, PreserveForms: o.forms, Tracker: tracker, Diag: collector,
 	})
 	if err != nil {
 		_ = file.Close()

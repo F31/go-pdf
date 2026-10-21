@@ -86,10 +86,14 @@ func WithPassword(p string) Option {
 	return func(o *options) error { o.password = p; return nil }
 }
 
+// WithHiddenLayers includes optional-content groups configured as hidden when
+// v is true. The default is to honor /OCProperties visibility.
 func WithHiddenLayers(v bool) Option {
 	return func(o *options) error { o.hidden = v; return nil }
 }
 
+// WithPreserveForms keeps Form XObjects with transparency groups as
+// displaylist.Group items instead of flattening their content.
 func WithPreserveForms(v bool) Option {
 	return func(o *options) error { o.forms = v; return nil }
 }

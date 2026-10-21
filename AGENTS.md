@@ -13,7 +13,7 @@
 
 - Only the Go standard library and `golang.org/x/*` are allowed. A new
   dependency requires an ADR and a `THIRD_PARTY.md` entry.
-- Public packages are the module root (`pdf`) and `displaylist`. Internal PDF
+- Public packages are the module root (`pdf`), `displaylist`, and `render`. Internal PDF
   objects must not appear in public signatures.
 - Do not silently degrade. Every approximation or unsupported feature must
   return an appropriate error or record a diagnostic.

@@ -211,7 +211,7 @@ func FuzzSFNTRepair(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		normalized, _ := normalizeSFNTTables(data)
 		if repaired, changed := repairMetricTables(normalized); changed {
-			_, _ = sfnt.Parse(repaired)
+			_, _ = safeSFNTParse(repaired)
 		}
 	})
 }

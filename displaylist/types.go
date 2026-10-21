@@ -1,6 +1,6 @@
 // Package displaylist defines the stable contract between go-pdf and its
-// consumers. G0 freezes the type skeleton and Version 1.0; content
-// interpretation is implemented in later phases.
+// consumers. G0 froze the type skeleton at Version 1.0; field additions since
+// then increment the minor version (currently 1.11).
 package displaylist
 
 import (
@@ -43,11 +43,29 @@ const (
 )
 
 type Paint struct {
-	Kind   PaintKind
-	RGBA   [4]float64
-	Space  string
-	Raw    []float64
-	Approx bool
+	Kind    PaintKind
+	RGBA    [4]float64
+	Space   string
+	Raw     []float64
+	Pattern *Pattern
+	Approx  bool
+}
+
+// Pattern records a tiling or shading pattern. Content is the decoded pattern
+// content stream for tiling patterns; Matrix maps pattern space to page space.
+type Pattern struct {
+	Name       string
+	Type       int
+	PaintType  int
+	TilingType int
+	BBox       Rect
+	XStep      float64
+	YStep      float64
+	Matrix     Matrix
+	Base       []float64
+	Content    []byte
+	Items      []Item
+	Clips      []Clip
 }
 
 type FillRule int
@@ -157,6 +175,10 @@ type FontMetrics struct {
 	Substituted bool
 }
 
+type GlyphSource interface {
+	GlyphOutline(code, cid uint32) ([]Segment, bool)
+}
+
 type FontInfo struct {
 	BaseFont    string
 	Family      string
@@ -171,6 +193,7 @@ type FontInfo struct {
 	Descent     float64
 	ItalicAngle float64
 	Metrics     FontMetrics
+	GlyphSource GlyphSource `json:"-"`
 }
 
 type Glyph struct {
@@ -183,6 +206,13 @@ type Glyph struct {
 	Matrix    Matrix
 }
 
+type SoftMask struct {
+	Subtype string
+	BBox    Rect
+	Items   []Item
+	Clips   []Clip
+}
+
 type Common struct {
 	Z         int
 	Clip      int
@@ -191,6 +221,7 @@ type Common struct {
 	Layer     string
 	MCID      int
 	StructRef int
+	SoftMask  *SoftMask
 	Flags     Flags
 	Bounds    Rect
 	ID        int
@@ -206,6 +237,7 @@ type TextRun struct {
 	Common
 	Font       *FontInfo
 	Size       float64
+	ActualText string
 	Fill       Paint
 	Stroke     *Paint
 	RenderMode int
@@ -235,24 +267,46 @@ type Image struct {
 	Info        ImageInfo
 	Data        ImageRef
 	Mask        *MaskRef
+	Fill        *Paint
 	Interpolate bool
 	Decode      []float64
 	Role        ImageRole
 }
 
+type ShadingGrid struct {
+	Width  int
+	Height int
+	Domain [4]float64
+	Colors [][4]float64
+}
+
 type Shading struct {
 	Common
-	Kind      ShadingKind
-	Geometry  any
-	Stops     []ColorStop
-	Extend    [2]bool
-	MaxDeltaE float64
+	Kind              ShadingKind
+	Geometry          any
+	Stops             []ColorStop
+	Extend            [2]bool
+	MaxDeltaE         float64
+	Raw               []byte
+	BitsPerCoordinate int
+	BitsPerComponent  int
+	BitsPerFlag       int
+	Decode            []float64
+	ColorSpace        string
+	MeshType          int
+	VerticesPerRow    int
+	Matrix            Matrix
+	Grid              *ShadingGrid
 }
 
 type Group struct {
 	Common
-	Name  string
-	Items []Item
+	Name       string
+	Items      []Item
+	Clips      []Clip
+	Isolated   bool
+	Knockout   bool
+	ColorSpace string
 }
 
 type Clip struct {

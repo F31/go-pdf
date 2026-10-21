@@ -12,6 +12,7 @@ import (
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/diag"
+	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/syntax"
 )
 
@@ -54,10 +55,10 @@ func (f *Font) loadFontProgram(ctx context.Context, file *syntax.File, fd syntax
 			dc.Addf(diag.Warn, "FNT-SFNT-PARSE", "cannot decode font program", -1, 0, -1)
 			continue
 		}
-		face, err := sfnt.Parse(data)
+		face, err := safeSFNTParse(data)
 		if err != nil {
 			if repaired, changed := normalizeSFNTTables(data); changed {
-				if face, err = sfnt.Parse(repaired); err == nil {
+				if face, err = safeSFNTParse(repaired); err == nil {
 					dc.Addf(diag.Info, "FNT-SFNT-REPAIR", "normalized font tables for sfnt parsing", -1, 0, -1)
 				}
 				data = repaired
@@ -65,7 +66,7 @@ func (f *Font) loadFontProgram(ctx context.Context, file *syntax.File, fd syntax
 		}
 		if err != nil {
 			if repaired, changed := repairMetricTables(data); changed {
-				if face, err = sfnt.Parse(repaired); err == nil {
+				if face, err = safeSFNTParse(repaired); err == nil {
 					dc.Addf(diag.Degraded, "FNT-SFNT-TABLES", "synthesized cmap/post tables for sfnt metrics", -1, 0, -1)
 				}
 				data = repaired
@@ -450,4 +451,14 @@ func firstRune(s string) rune {
 		return r
 	}
 	return 0
+}
+
+func safeSFNTParse(data []byte) (face *sfnt.Font, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			face = nil
+			err = errs.Wrap(errs.ErrCorrupt, "FNT-SFNT-PANIC", "sfnt parser panic", -1, 0, -1)
+		}
+	}()
+	return sfnt.Parse(data)
 }

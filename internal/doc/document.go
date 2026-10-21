@@ -36,9 +36,11 @@ type Info struct {
 }
 
 type Options struct {
-	Repair  bool
-	Tracker *budget.Tracker
-	Diag    *diag.Collector
+	Repair        bool
+	IncludeHidden bool
+	PreserveForms bool
+	Tracker       *budget.Tracker
+	Diag          *diag.Collector
 }
 
 type Document struct {
@@ -49,6 +51,7 @@ type Document struct {
 	version string
 	opts    Options
 	fonts   *font.Cache
+	oc      map[syntax.Ref]bool
 
 	mu     sync.RWMutex
 	closed bool
@@ -110,6 +113,7 @@ func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, erro
 
 func (d *Document) initialize(ctx context.Context) error {
 	file := d.file
+	d.loadOC(ctx)
 	if t, _ := d.catalog.NameValue("Type"); t != "" && t != "Catalog" {
 		file.Diag().Add(diag.Diagnostic{Level: diag.Warn, Code: "DOC-CATALOG-TYPE", Msg: "catalog Type is not Catalog", Page: -1, Offset: -1})
 	}
@@ -191,6 +195,55 @@ func (d *Document) Close() error {
 	d.closed = true
 	d.mu.Unlock()
 	return d.file.Close()
+}
+
+func (d *Document) loadOC(ctx context.Context) {
+	d.oc = nil
+	if d.opts.IncludeHidden {
+		return
+	}
+	obj, err := d.file.Resolve(ctx, d.catalog.Get("OCProperties"))
+	if err != nil {
+		return
+	}
+	ocp, ok := obj.(syntax.Dict)
+	if !ok {
+		return
+	}
+	visible := map[syntax.Ref]bool{}
+	if arr, ok := ocp.Get("OCGs").(syntax.Array); ok {
+		for _, item := range arr {
+			if ref, ok := item.(syntax.Ref); ok {
+				visible[ref] = true
+			}
+		}
+	}
+	dconf, _ := d.file.Resolve(ctx, ocp.Get("D"))
+	conf, _ := dconf.(syntax.Dict)
+	base := "ON"
+	if n, ok := conf.NameValue("BaseState"); ok {
+		base = n
+	}
+	if base == "OFF" {
+		for ref := range visible {
+			visible[ref] = false
+		}
+	}
+	if arr, ok := conf.Get("ON").(syntax.Array); ok {
+		for _, item := range arr {
+			if ref, ok := item.(syntax.Ref); ok {
+				visible[ref] = true
+			}
+		}
+	}
+	if arr, ok := conf.Get("OFF").(syntax.Array); ok {
+		for _, item := range arr {
+			if ref, ok := item.(syntax.Ref); ok {
+				visible[ref] = false
+			}
+		}
+	}
+	d.oc = visible
 }
 
 func (d *Document) loadInfo(ctx context.Context) error {

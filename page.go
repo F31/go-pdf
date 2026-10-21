@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"context"
+	"math"
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/doc"
@@ -95,11 +96,13 @@ func (p *Page) DisplayList(ctx context.Context) (*displaylist.Page, error) {
 			})
 		}
 	}
-	return &displaylist.Page{
+	page := &displaylist.Page{
 		Index: info.Index, Width: info.Width, Height: info.Height, Rotate: info.Rotate,
 		MediaBox: rect(info.MediaBox), CropBox: rect(info.CropBox),
 		Clips: res.Clips, Items: items, Diag: diags,
-	}, nil
+	}
+	page.Scanned = scannedPage(items, page.CropBox)
+	return page, nil
 }
 
 func rect(b Box) displaylist.Rect {
@@ -110,19 +113,77 @@ func (p *Page) Images(ctx context.Context) ([]displaylist.ImageInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "IMG-CANCELED", "list images", -1, 0, p.Index())
 	}
-	return nil, p.unsupported("list images")
+	dl, err := p.DisplayList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]displaylist.ImageInfo, 0, 4)
+	seen := map[displaylist.ImageRef]bool{}
+	walkItems(dl.Items, func(it displaylist.Item) {
+		im, ok := it.(*displaylist.Image)
+		if !ok || im.Data == nil || seen[im.Data] {
+			return
+		}
+		seen[im.Data] = true
+		out = append(out, im.Info)
+	})
+	return out, nil
 }
 
 func (p *Page) Fonts(ctx context.Context) ([]*displaylist.FontInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "FNT-CANCELED", "list fonts", -1, 0, p.Index())
 	}
-	return nil, p.unsupported("list fonts")
+	dl, err := p.DisplayList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*displaylist.FontInfo, 0, 4)
+	seen := map[*displaylist.FontInfo]bool{}
+	walkItems(dl.Items, func(it displaylist.Item) {
+		tr, ok := it.(*displaylist.TextRun)
+		if !ok || tr.Font == nil || seen[tr.Font] {
+			return
+		}
+		seen[tr.Font] = true
+		out = append(out, tr.Font)
+	})
+	return out, nil
 }
 
-func (p *Page) unsupported(op string) error {
-	if p == nil || p.doc == nil || p.doc.inner == nil {
-		return errs.Wrap(errs.ErrClosed, "DOC-CLOSED", op, -1, 0, -1)
+func scannedPage(items []displaylist.Item, crop displaylist.Rect) bool {
+	cropArea := (crop.X1 - crop.X0) * (crop.Y1 - crop.Y0)
+	if cropArea <= 0 {
+		return false
 	}
-	return p.doc.inner.Unsupported("CNT-NOT-IMPLEMENTED", op, p.Index())
+	hasText := false
+	hasImage := false
+	walkItems(items, func(it displaylist.Item) {
+		switch v := it.(type) {
+		case *displaylist.TextRun:
+			for _, g := range v.Glyphs {
+				if g.UnicodeOK {
+					hasText = true
+					break
+				}
+			}
+		case *displaylist.Image:
+			b := v.Bounds
+			x0, y0 := math.Max(b.X0, crop.X0), math.Max(b.Y0, crop.Y0)
+			x1, y1 := math.Min(b.X1, crop.X1), math.Min(b.Y1, crop.Y1)
+			if x1 > x0 && y1 > y0 && (x1-x0)*(y1-y0) >= cropArea*0.9 {
+				hasImage = true
+			}
+		}
+	})
+	return hasImage && !hasText
+}
+
+func walkItems(items []displaylist.Item, fn func(displaylist.Item)) {
+	for _, it := range items {
+		fn(it)
+		if g, ok := it.(*displaylist.Group); ok {
+			walkItems(g.Items, fn)
+		}
+	}
 }

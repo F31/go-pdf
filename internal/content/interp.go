@@ -4,26 +4,32 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/budget"
+	pdfcolor "github.com/F31/go-pdf/internal/color"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/font"
+	pdfunction "github.com/F31/go-pdf/internal/function"
+	pdfimage "github.com/F31/go-pdf/internal/image"
 	"github.com/F31/go-pdf/internal/syntax"
 )
 
 type PageData struct {
-	Index     int
-	Content   []byte
-	Resources syntax.Dict
-	Matrix    [6]float64
-	MediaBox  displaylist.Rect
-	CropBox   displaylist.Rect
-	File      *syntax.File
-	Fonts     *font.Cache
-	Tracker   *budget.Tracker
-	Diag      *diag.Collector
+	Index         int
+	Content       []byte
+	Resources     syntax.Dict
+	Matrix        [6]float64
+	MediaBox      displaylist.Rect
+	CropBox       displaylist.Rect
+	File          *syntax.File
+	Fonts         *font.Cache
+	Tracker       *budget.Tracker
+	Diag          *diag.Collector
+	OC            map[syntax.Ref]bool
+	PreserveForms bool
 }
 
 type Result struct {
@@ -60,17 +66,20 @@ func mmul(a, b matrix) matrix {
 func translate(x, y float64) matrix { return matrix{1, 0, 0, 1, x, y} }
 
 type state struct {
-	ctm         matrix
-	lineWidth   float64
-	cap         int
-	join        int
-	miter       float64
-	dash        []float64
-	dashPhase   float64
-	fill        displaylist.Paint
-	stroke      displaylist.Paint
-	fillSpace   string
-	strokeSpace string
+	ctm           matrix
+	lineWidth     float64
+	cap           int
+	join          int
+	miter         float64
+	dash          []float64
+	dashPhase     float64
+	fill          displaylist.Paint
+	stroke        displaylist.Paint
+	fillSpace     pdfcolor.Space
+	strokeSpace   pdfcolor.Space
+	fillPattern   bool
+	strokePattern bool
+	softMask      *displaylist.SoftMask
 
 	font      *font.Font
 	fontSize  float64
@@ -80,6 +89,10 @@ type state struct {
 	leading   float64
 	rise      float64
 	render    int
+
+	fillAlpha   float64
+	strokeAlpha float64
+	blend       string
 }
 
 func (s state) clone() state {
@@ -118,6 +131,11 @@ type interp struct {
 	type3Glyphs int
 	unknown     map[string]bool
 	suppress    bool
+	forms       map[*syntax.Stream]bool
+	patterns    map[*syntax.Stream]bool
+	masks       map[*syntax.Stream]bool
+	skipDepth   int
+	marked      []markedEntry
 	result      Result
 }
 
@@ -140,11 +158,16 @@ func newInterp(ctx context.Context, pd PageData, emit func(displaylist.Item) err
 	ip := &interp{
 		ctx: ctx, pd: pd, sink: emit, lx: newLexer(pd.Content, maxDepth),
 		curClip: -1, trClip: -1, unknown: map[string]bool{}, clips: make([]displaylist.Clip, 0),
+		forms: map[*syntax.Stream]bool{}, patterns: map[*syntax.Stream]bool{}, masks: map[*syntax.Stream]bool{},
 	}
 	ip.st = state{
 		ctm: matrix(pd.Matrix), lineWidth: 1, cap: 0, join: 0, miter: 10, hscale: 1,
-		fill:   displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
-		stroke: displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
+		fill:        displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
+		stroke:      displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
+		fillAlpha:   1,
+		strokeAlpha: 1,
+		fillSpace:   deviceGray(),
+		strokeSpace: deviceGray(),
 	}
 	ip.tm, ip.tlm = matrix{1, 0, 0, 1, 0, 0}, matrix{1, 0, 0, 1, 0, 0}
 	return ip
@@ -191,6 +214,9 @@ func (ip *interp) run() error {
 	if len(ip.gstack) > 0 {
 		ip.diag(diag.Warn, "CNT-GSTACK", "unbalanced q/Q at end of page")
 	}
+	if ip.skipDepth > 0 {
+		ip.diag(diag.Warn, "CNT-OC-UNBALANCED", "unbalanced optional-content marked content")
+	}
 	return nil
 }
 
@@ -230,6 +256,18 @@ func num(o syntax.Object) (float64, bool) { return syntax.AsNumber(o) }
 func name(o syntax.Object) (string, bool) { return syntax.AsName(o) }
 
 func (ip *interp) dispatch(t token) error {
+	if ip.skipDepth > 0 {
+		switch t.op {
+		case "BDC", "BMC":
+			ip.skipDepth++
+		case "EMC":
+			ip.skipDepth--
+		case "BI":
+			ip.lx.skipInlineImage()
+		}
+		ip.stack = nil
+		return nil
+	}
 	switch t.op {
 	case "q":
 		ip.stack = nil
@@ -262,7 +300,7 @@ func (ip *interp) dispatch(t token) error {
 			}
 			m[i] = v
 		}
-		ip.st.ctm = mmul(m, ip.st.ctm)
+		ip.st.ctm = mmul(ip.st.ctm, m)
 	case "w":
 		if ops, ok := ip.take(1); ok {
 			if v, ok := num(ops[0]); ok {
@@ -319,18 +357,24 @@ func (ip *interp) dispatch(t token) error {
 	case "CS":
 		if ops, ok := ip.take(1); ok {
 			if n, ok := name(ops[0]); ok {
-				ip.st.strokeSpace = n
+				ip.setColorSpace(true, n)
 			}
 		}
 	case "cs":
 		if ops, ok := ip.take(1); ok {
 			if n, ok := name(ops[0]); ok {
-				ip.st.fillSpace = n
+				ip.setColorSpace(false, n)
 			}
 		}
 	case "SC", "SCN":
+		if ip.st.strokePattern {
+			return ip.setPattern(true)
+		}
 		ip.setComponents(true)
 	case "sc", "scn":
+		if ip.st.fillPattern {
+			return ip.setPattern(false)
+		}
 		ip.setComponents(false)
 	case "m":
 		ip.move()
@@ -417,25 +461,26 @@ func (ip *interp) dispatch(t token) error {
 			return ip.show(s, 0)
 		}
 	case "Do":
-		ip.stack = nil
-		ip.diagOnce(diag.Degraded, "CNT-FORM-DEFERRED", "Form/Image XObject is deferred")
+		return ip.doXObject()
 	case "BI":
-		ip.stack = nil
-		ip.lx.skipInlineImage()
-		ip.diagOnce(diag.Degraded, "CNT-INLINE-IMAGE", "inline image skipped")
+		return ip.doInlineImage()
 	case "sh":
-		ip.stack = nil
-		ip.diagOnce(diag.Degraded, "CNT-SHADING-DEFERRED", "shading deferred")
+		return ip.doShading()
 	case "gs":
-		ip.stack = nil
-		ip.diagOnce(diag.Degraded, "CNT-GSTATE", "ExtGState deferred")
+		return ip.applyGState()
 	case "BX":
 		ip.stack = nil
 		ip.suppress = true
 	case "EX":
 		ip.stack = nil
 		ip.suppress = false
-	case "ri", "i", "MP", "DP", "BMC", "BDC", "EMC", "d0", "d1":
+	case "BMC":
+		ip.beginMarkedContent(false)
+	case "BDC":
+		ip.beginMarkedContent(true)
+	case "EMC":
+		return ip.endMarkedContent()
+	case "ri", "i", "MP", "DP", "d0", "d1":
 		ip.stack = nil
 	default:
 		ip.stack = nil
@@ -471,6 +516,8 @@ func (ip *interp) setGray(stroke bool) {
 	if !ok {
 		return
 	}
+	ip.setSpace(stroke, deviceGray())
+	ip.setPatternFlag(stroke, false)
 	ip.setPaint(stroke, "DeviceGray", []float64{v}, [4]float64{v, v, v, 1}, false)
 }
 
@@ -487,6 +534,8 @@ func (ip *interp) setRGB(stroke bool) {
 		}
 		c[i] = v
 	}
+	ip.setSpace(stroke, deviceRGB())
+	ip.setPatternFlag(stroke, false)
 	ip.setPaint(stroke, "DeviceRGB", c[:], [4]float64{c[0], c[1], c[2], 1}, false)
 }
 
@@ -506,6 +555,8 @@ func (ip *interp) setCMYK(stroke bool) {
 	k := c[3]
 	rgba := [4]float64{(1 - c[0]) * (1 - k), (1 - c[1]) * (1 - k), (1 - c[2]) * (1 - k), 1}
 	ip.diagOnce(diag.Info, "CLR-CMYK-APPROX", "CMYK converted with fixed approximation")
+	ip.setSpace(stroke, deviceCMYK())
+	ip.setPatternFlag(stroke, false)
 	ip.setPaint(stroke, "DeviceCMYK", c[:], rgba, true)
 }
 
@@ -521,24 +572,205 @@ func (ip *interp) setComponents(stroke bool) {
 			vals = append(vals, v)
 		}
 	}
-	switch {
-	case space == "DeviceGray" || (space == "" && len(vals) == 1):
-		if len(vals) >= 1 {
-			ip.setPaint(stroke, "DeviceGray", vals[:1], [4]float64{vals[0], vals[0], vals[0], 1}, false)
+	if space == nil {
+		switch len(vals) {
+		case 1:
+			space = deviceGray()
+		case 3:
+			space = deviceRGB()
+		case 4:
+			space = deviceCMYK()
+		default:
+			ip.diagOnce(diag.Degraded, "CLR-SPACE-DEFERRED", "unsupported color space")
+			return
 		}
-	case space == "DeviceRGB" || (space == "" && len(vals) == 3):
-		if len(vals) >= 3 {
-			ip.setPaint(stroke, "DeviceRGB", vals[:3], [4]float64{vals[0], vals[1], vals[2], 1}, false)
+	}
+	if len(vals) < space.Components() {
+		ip.diagOnce(diag.Degraded, "CLR-COMPONENTS", "not enough color components")
+		return
+	}
+	rgba, approx, err := space.RGBA(vals[:space.Components()])
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "CLR-CONVERT", "cannot convert color")
+		return
+	}
+	ip.setPaint(stroke, space.Name(), vals[:space.Components()], rgba, approx || space.Approx())
+}
+
+func (ip *interp) setSpace(stroke bool, space pdfcolor.Space) {
+	if stroke {
+		ip.st.strokeSpace = space
+	} else {
+		ip.st.fillSpace = space
+	}
+}
+
+func (ip *interp) setColorSpace(stroke bool, name string) {
+	if name == "Pattern" {
+		ip.setPatternFlag(stroke, true)
+		ip.setSpace(stroke, nil)
+		return
+	}
+	obj := syntax.Object(syntax.Name(name))
+	if res, ok := ip.resolveDict(ip.pd.Resources.Get("ColorSpace")); ok {
+		if v, ok := res[syntax.Name(name)]; ok {
+			obj = v
 		}
-	case space == "DeviceCMYK" || (space == "" && len(vals) == 4):
-		if len(vals) >= 4 {
-			k := vals[3]
-			rgba := [4]float64{(1 - vals[0]) * (1 - k), (1 - vals[1]) * (1 - k), (1 - vals[2]) * (1 - k), 1}
-			ip.diagOnce(diag.Info, "CLR-CMYK-APPROX", "CMYK converted with fixed approximation")
-			ip.setPaint(stroke, "DeviceCMYK", vals[:4], rgba, true)
+	}
+	if arr, ok := obj.(syntax.Array); ok && len(arr) > 0 {
+		if family, ok := arr[0].(syntax.Name); ok && family == "Pattern" {
+			ip.setPatternFlag(stroke, true)
+			ip.setSpace(stroke, nil)
+			return
 		}
+	}
+	sp, err := pdfcolor.Load(ip.ctx, ip.pd.File, obj, ip.pd.Tracker)
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "CLR-SPACE", "cannot load color space")
+		return
+	}
+	ip.setPatternFlag(stroke, false)
+	ip.setSpace(stroke, sp)
+}
+
+func (ip *interp) setPatternFlag(stroke, v bool) {
+	if stroke {
+		ip.st.strokePattern = v
+	} else {
+		ip.st.fillPattern = v
+	}
+}
+
+func (ip *interp) setPattern(stroke bool) error {
+	all := ip.all()
+	var pname string
+	base := make([]float64, 0, len(all))
+	for _, o := range all {
+		if n, ok := name(o); ok {
+			pname = n
+			continue
+		}
+		if v, ok := num(o); ok {
+			base = append(base, v)
+		}
+	}
+	if pname == "" {
+		ip.diagOnce(diag.Degraded, "CLR-PATTERN", "pattern name missing")
+		return nil
+	}
+	res, ok := ip.resolveDict(ip.pd.Resources.Get("Pattern"))
+	if !ok {
+		ip.diagOnce(diag.Degraded, "CLR-PATTERN", "pattern resources missing")
+		return nil
+	}
+	obj, ok := res[syntax.Name(pname)]
+	if !ok {
+		ip.diagOnce(diag.Degraded, "CLR-PATTERN", "pattern resource missing")
+		return nil
+	}
+	pat, err := ip.patternFrom(pname, obj, base)
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "CLR-PATTERN", "cannot read pattern")
+		return nil
+	}
+	ip.setPaintPattern(stroke, pat, base)
+	return nil
+}
+
+func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*displaylist.Pattern, error) {
+	obj, ok := ip.resolveObject(obj)
+	if !ok {
+		return nil, errs.Wrap(errs.ErrCorrupt, "CLR-PATTERN", "resolve pattern", -1, 0, -1)
+	}
+	var dict syntax.Dict
+	var stm *syntax.Stream
+	switch v := obj.(type) {
+	case *syntax.Stream:
+		dict, stm = v.Dict, v
+	case syntax.Dict:
+		dict = v
 	default:
-		ip.diagOnce(diag.Degraded, "CLR-SPACE-DEFERRED", "unsupported color space")
+		return nil, errs.Wrap(errs.ErrCorrupt, "CLR-PATTERN", "pattern is not a dictionary", -1, 0, -1)
+	}
+	typ, _ := dict.IntValue("PatternType")
+	if typ != 1 {
+		return &displaylist.Pattern{Name: name, Type: int(typ), Base: append([]float64(nil), base...)}, nil
+	}
+	paintType, _ := dict.IntValue("PaintType")
+	tilingType, _ := dict.IntValue("TilingType")
+	bbox := displaylist.Rect{}
+	if r, ok := ip.rectValue(dict.Get("BBox")); ok {
+		bbox = r
+	} else {
+		ip.diagOnce(diag.Warn, "CLR-PATTERN-BBOX", "pattern BBox missing")
+	}
+	xstep, _ := num(dict.Get("XStep"))
+	ystep, _ := num(dict.Get("YStep"))
+	pm := matrix{1, 0, 0, 1, 0, 0}
+	if v := dict.Get("Matrix"); v != nil {
+		if m, ok := ip.matrixValue(v); ok {
+			pm = m
+		}
+	}
+	var content []byte
+	var items []displaylist.Item
+	var clips []displaylist.Clip
+	if stm != nil && ip.pd.File != nil {
+		var err error
+		content, err = ip.pd.File.DecodeStream(ip.ctx, stm)
+		if err != nil {
+			return nil, err
+		}
+		if len(content) > 0 {
+			if ip.patterns[stm] {
+				ip.diagOnce(diag.Warn, "CLR-PATTERN-CYCLE", "tiling pattern cycle skipped")
+			} else {
+				res := ip.pd.Resources
+				if v := dict.Get("Resources"); v != nil {
+					if d, ok := ip.resolveDict(v); ok {
+						res = d
+					}
+				}
+				ctm := mmul(ip.st.ctm, pm)
+				nestedPD := ip.pd
+				nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = content, res, [6]float64(ctm)
+				nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
+					items = append(items, item)
+					return nil
+				})
+				nested.forms, nested.patterns = ip.forms, ip.patterns
+				if paintType == 2 && len(base) > 0 {
+					if sp, paint, ok := basePaint(base); ok {
+						nested.st.fill, nested.st.stroke = paint, paint
+						nested.st.fillSpace, nested.st.strokeSpace = sp, sp
+					}
+				}
+				ip.patterns[stm] = true
+				err = nested.run()
+				delete(ip.patterns, stm)
+				if err != nil {
+					return nil, err
+				}
+				clips = append(clips, nested.clips...)
+			}
+		}
+	}
+	return &displaylist.Pattern{
+		Name: name, Type: 1, PaintType: int(paintType), TilingType: int(tilingType),
+		BBox: bbox, XStep: xstep, YStep: ystep, Matrix: [6]float64(mmul(ip.st.ctm, pm)),
+		Base: append([]float64(nil), base...), Content: content, Items: items, Clips: clips,
+	}, nil
+}
+
+func (ip *interp) setPaintPattern(stroke bool, p *displaylist.Pattern, base []float64) {
+	paint := displaylist.Paint{
+		Kind: displaylist.PaintPattern, Space: "Pattern", Raw: append([]float64(nil), base...),
+		Pattern: p, Approx: true,
+	}
+	if stroke {
+		ip.st.stroke = paint
+	} else {
+		ip.st.fill = paint
 	}
 }
 
@@ -744,7 +976,16 @@ func (ip *interp) paint(op string) error {
 	seg := append([]displaylist.Segment(nil), ip.path...)
 	bounds := segmentBounds(seg)
 	c := ip.common()
-	item := &displaylist.Path{Common: c, Segments: seg, FillRule: rule, Hint: displaylist.PathGeneric}
+	if stroke && !fill {
+		c.Alpha = ip.st.strokeAlpha
+	} else if fill && stroke {
+		if ip.st.fillAlpha != ip.st.strokeAlpha {
+			ip.diagOnce(diag.Degraded, "CNT-GSTATE-ALPHA", "fill and stroke alpha differ; using the lower value")
+		}
+		c.Alpha = math.Min(ip.st.fillAlpha, ip.st.strokeAlpha)
+	}
+	closed := op != "S"
+	item := &displaylist.Path{Common: c, Segments: seg, FillRule: rule, Hint: pathHint(seg, closed), Closed: closed}
 	if fill {
 		p := ip.st.fill
 		item.Fill = &p
@@ -765,7 +1006,6 @@ func (ip *interp) paint(op string) error {
 		item.Flags |= displaylist.FlagApprox
 	}
 	item.Bounds = bounds
-	item.Closed = op == "s" || op == "b" || op == "b*" || op == "f*" || op == "B*"
 	if err := ip.emit(item); err != nil {
 		return err
 	}
@@ -781,13 +1021,15 @@ func (ip *interp) closeCurrent() {
 }
 
 func (ip *interp) common() displaylist.Common {
-	return displaylist.Common{Z: ip.z, Clip: ip.curClip, Alpha: 1, MCID: -1, StructRef: -1}
+	return displaylist.Common{Z: ip.z, Clip: ip.curClip, Alpha: ip.st.fillAlpha, Blend: ip.st.blend, MCID: -1, StructRef: -1,
+		SoftMask: ip.st.softMask, Source: displaylist.SrcRef{OpIndex: ip.ops}}
 }
 
 func (ip *interp) emit(item displaylist.Item) error {
 	c := item.Base()
 	c.Z = ip.z
 	c.ID = ip.id
+	c.Sig = displaylist.Signature(item)
 	ip.z++
 	ip.id++
 	return ip.sink(item)
@@ -801,7 +1043,16 @@ func (ip *interp) flushText() error {
 	if ip.trBounds.X1 < ip.pd.CropBox.X0 || ip.trBounds.X0 > ip.pd.CropBox.X1 || ip.trBounds.Y1 < ip.pd.CropBox.Y0 || ip.trBounds.Y0 > ip.pd.CropBox.Y1 {
 		ip.tr.Flags |= displaylist.FlagOutOfBounds
 	}
-	if err := ip.sink(ip.tr); err != nil {
+	if ip.tr.ActualText != "" {
+		var b strings.Builder
+		for _, g := range ip.tr.Glyphs {
+			b.WriteString(g.Text)
+		}
+		if b.String() != ip.tr.ActualText {
+			ip.diagOnce(diag.Info, "CNT-ACTUALTEXT-CONFLICT", "ActualText differs from glyph mapping")
+		}
+	}
+	if err := ip.emit(ip.tr); err != nil {
 		return err
 	}
 	ip.tr = nil
@@ -973,6 +1224,7 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 			Vertical: ip.st.font != nil && ip.st.font.Vertical(),
 		}
 		ip.tr.Common = ip.common()
+		ip.tr.ActualText = ip.takeActualText()
 		ip.trClip = ip.curClip
 		if ip.st.render == 3 {
 			ip.tr.TextFlags |= displaylist.TextInvisible
@@ -981,6 +1233,10 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 			ip.tr.TextFlags |= displaylist.TextStroked
 			p := ip.st.stroke
 			ip.tr.Stroke = &p
+			if ip.st.fillAlpha != ip.st.strokeAlpha {
+				ip.diagOnce(diag.Degraded, "CNT-GSTATE-ALPHA", "fill and stroke alpha differ; using the lower value")
+			}
+			ip.tr.Common.Alpha = math.Min(ip.st.fillAlpha, ip.st.strokeAlpha)
 		}
 	}
 	for _, c := range codes {
@@ -1055,6 +1311,9 @@ func (ip *interp) expandType3(c font.Code, trm matrix) error {
 	nested.st.miter = ip.st.miter
 	nested.st.dash = append([]float64(nil), ip.st.dash...)
 	nested.st.dashPhase = ip.st.dashPhase
+	nested.st.fillAlpha = ip.st.fillAlpha
+	nested.st.strokeAlpha = ip.st.strokeAlpha
+	nested.st.blend = ip.st.blend
 	if err := nested.run(); err != nil {
 		return err
 	}
@@ -1182,4 +1441,1047 @@ func fontInfo(f *font.Font) *displaylist.FontInfo {
 		return nil
 	}
 	return f.Info
+}
+
+func (ip *interp) doXObject() error {
+	ops, ok := ip.take(1)
+	if !ok {
+		return nil
+	}
+	nam, ok := name(ops[0])
+	if !ok {
+		return nil
+	}
+	if err := ip.flushText(); err != nil {
+		return err
+	}
+	xobjects, ok := ip.resolveDict(ip.pd.Resources.Get("XObject"))
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-XOBJECT-MISSING", "XObject resources missing")
+		return nil
+	}
+	raw, exists := xobjects[syntax.Name(nam)]
+	if !exists {
+		ip.diagOnce(diag.Warn, "CNT-XOBJECT-MISSING", "XObject resource missing: "+nam)
+		return nil
+	}
+	obj, ok := ip.resolveObject(raw)
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-XOBJECT-MISSING", "XObject resource missing: "+nam)
+		return nil
+	}
+	stm, ok := obj.(*syntax.Stream)
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-XOBJECT-TYPE", "XObject is not a stream")
+		return nil
+	}
+	sub, _ := stm.Dict.NameValue("Subtype")
+	switch sub {
+	case "Form":
+		return ip.runForm(stm, nam)
+	case "Image":
+		return ip.emitImage(stm)
+	default:
+		ip.diagOnce(diag.Warn, "CNT-XOBJECT-SUBTYPE", "unsupported XObject subtype")
+	}
+	return nil
+}
+
+func (ip *interp) resolveObject(o syntax.Object) (syntax.Object, bool) {
+	if ip.pd.File == nil {
+		_, ok := o.(syntax.Ref)
+		return o, !ok
+	}
+	v, err := ip.pd.File.Resolve(ip.ctx, o)
+	if err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
+	if ip.pd.File == nil {
+		ip.diagOnce(diag.Degraded, "CNT-FORM-NOFILE", "form XObject unavailable")
+		return nil
+	}
+	if ip.forms[stm] {
+		ip.diagOnce(diag.Warn, "CNT-FORM-CYCLE", "form XObject cycle skipped")
+		return nil
+	}
+	maxDepth := 16
+	if ip.pd.Tracker != nil {
+		maxDepth = ip.pd.Tracker.Budget().MaxFormDepth
+	}
+	if len(ip.forms) >= maxDepth {
+		return errs.Wrap(errs.ErrBudget, "BUD-FORM-DEPTH", "interpret form XObject", -1, 0, ip.pd.Index)
+	}
+	data, err := ip.pd.File.DecodeStream(ip.ctx, stm)
+	if err != nil {
+		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
+			return err
+		}
+		ip.diagOnce(diag.Degraded, "CNT-FORM-READ", "cannot decode form XObject")
+		return nil
+	}
+	res := ip.pd.Resources
+	if stm.Dict.Has("Resources") {
+		if d, ok := ip.resolveDict(stm.Dict.Get("Resources")); ok {
+			res = d
+		} else {
+			ip.diagOnce(diag.Warn, "CNT-FORM-RESOURCES", "invalid form resources")
+		}
+	}
+	formMatrix := matrix{1, 0, 0, 1, 0, 0}
+	if stm.Dict.Has("Matrix") {
+		if m, ok := ip.matrixValue(stm.Dict.Get("Matrix")); ok {
+			formMatrix = m
+		} else {
+			ip.diagOnce(diag.Warn, "CNT-FORM-MATRIX", "invalid form matrix")
+		}
+	}
+	ctm := mmul(ip.st.ctm, formMatrix)
+	clipBase := len(ip.clips)
+	groupDict, hasGroup := stm.Dict.DictValue("Group")
+	preserveGroup := hasGroup && ip.pd.PreserveForms
+	var groupItems []displaylist.Item
+	nestedPD := ip.pd
+	nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = data, res, [6]float64(ctm)
+	nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
+		c := item.Base()
+		if preserveGroup {
+			c.Source.OpIndex += ip.ops
+			c.Z = ip.z
+			c.ID = ip.id
+			c.Sig = displaylist.Signature(item)
+			ip.z++
+			ip.id++
+			groupItems = append(groupItems, item)
+			return nil
+		}
+		if c.Clip >= 0 {
+			c.Clip += clipBase
+		}
+		if ip.curClip >= 0 {
+			if c.Clip >= 0 {
+				ip.diagOnce(diag.Degraded, "CNT-FORM-CLIP-INTERSECT", "form clip intersection is approximate")
+			} else {
+				c.Clip = ip.curClip
+			}
+		}
+		c.Source.OpIndex += ip.ops
+		return ip.emit(item)
+	})
+	nested.forms = ip.forms
+	nested.st = ip.st.clone()
+	nested.st.ctm = ctm
+	nested.suppress = ip.suppress
+	if stm.Dict.Has("BBox") {
+		if r, ok := ip.rectValue(stm.Dict.Get("BBox")); ok {
+			if r.X0 > r.X1 {
+				r.X0, r.X1 = r.X1, r.X0
+			}
+			if r.Y0 > r.Y1 {
+				r.Y0, r.Y1 = r.Y1, r.Y0
+			}
+			nested.clips = append(nested.clips, rectClip(ctm, r))
+			nested.curClip = 0
+		} else {
+			ip.diagOnce(diag.Warn, "CNT-FORM-BBOX", "invalid form BBox")
+		}
+	} else {
+		ip.diagOnce(diag.Warn, "CNT-FORM-BBOX", "form BBox missing")
+	}
+	if hasGroup && !preserveGroup {
+		ip.diagOnce(diag.Degraded, "CNT-FORM-GROUP", "form transparency group is flattened")
+	}
+	ip.forms[stm] = true
+	err = nested.run()
+	delete(ip.forms, stm)
+	if err != nil {
+		return err
+	}
+	if preserveGroup {
+		c := ip.common()
+		c.Clip = ip.curClip
+		c.Alpha = 1
+		c.Blend = ""
+		c.SoftMask = nil
+		if stm.Dict.Has("BBox") {
+			if r, ok := ip.rectValue(stm.Dict.Get("BBox")); ok {
+				p0 := pointAt(ctm, r.X0, r.Y0)
+				p1 := pointAt(ctm, r.X1, r.Y1)
+				c.Bounds = displaylist.Rect{X0: math.Min(p0.X, p1.X), Y0: math.Min(p0.Y, p1.Y), X1: math.Max(p0.X, p1.X), Y1: math.Max(p0.Y, p1.Y)}
+			}
+		}
+		g := &displaylist.Group{
+			Common: c, Name: formName, Items: groupItems, Clips: nested.clips,
+			Isolated: boolValue(groupDict, "I"), Knockout: boolValue(groupDict, "K"),
+		}
+		if n, ok := groupDict.NameValue("CS"); ok {
+			g.ColorSpace = n
+		}
+		err = ip.emit(g)
+	} else {
+		ip.clips = append(ip.clips, nested.clips...)
+	}
+	ip.ops += nested.ops
+	ip.type3Glyphs += nested.type3Glyphs
+	if ip.pd.Tracker != nil && int64(ip.ops) > ip.pd.Tracker.Budget().MaxOperators {
+		return errs.Wrap(errs.ErrBudget, "BUD-OPERATORS", "interpret page", -1, 0, ip.pd.Index)
+	}
+	return err
+}
+
+func boolValue(d syntax.Dict, name string) bool {
+	if v, ok := d.Get(name).(syntax.Bool); ok {
+		return bool(v)
+	}
+	return false
+}
+
+func colorSpaceName(o syntax.Object) string {
+	if n, ok := o.(syntax.Name); ok {
+		return string(n)
+	}
+	if arr, ok := o.(syntax.Array); ok && len(arr) > 0 {
+		if n, ok := arr[0].(syntax.Name); ok {
+			return string(n)
+		}
+	}
+	return ""
+}
+
+func (ip *interp) numberArray(o syntax.Object, want int) ([]float64, bool) {
+	if v, ok := ip.resolveObject(o); ok {
+		o = v
+	} else {
+		return nil, false
+	}
+	arr, ok := o.(syntax.Array)
+	if !ok || (want >= 0 && len(arr) != want) {
+		return nil, false
+	}
+	out := make([]float64, 0, len(arr))
+	for _, item := range arr {
+		n, ok := num(item)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, n)
+	}
+	return out, true
+}
+
+func (ip *interp) matrixValue(o syntax.Object) (matrix, bool) {
+	if v, ok := ip.resolveObject(o); ok {
+		o = v
+	} else {
+		return matrix{}, false
+	}
+	arr, ok := o.(syntax.Array)
+	if !ok || len(arr) < 6 {
+		return matrix{}, false
+	}
+	var m matrix
+	for i := range m {
+		v, ok := num(arr[i])
+		if !ok {
+			return matrix{}, false
+		}
+		m[i] = v
+	}
+	return m, true
+}
+
+func (ip *interp) rectValue(o syntax.Object) (displaylist.Rect, bool) {
+	if v, ok := ip.resolveObject(o); ok {
+		o = v
+	} else {
+		return displaylist.Rect{}, false
+	}
+	arr, ok := o.(syntax.Array)
+	if !ok || len(arr) < 4 {
+		return displaylist.Rect{}, false
+	}
+	var v [4]float64
+	for i := range v {
+		n, ok := num(arr[i])
+		if !ok {
+			return displaylist.Rect{}, false
+		}
+		v[i] = n
+	}
+	return displaylist.Rect{X0: v[0], Y0: v[1], X1: v[2], Y1: v[3]}, true
+}
+
+func rectClip(m matrix, r displaylist.Rect) displaylist.Clip {
+	p1 := pointAt(m, r.X0, r.Y0)
+	p2 := pointAt(m, r.X1, r.Y0)
+	p3 := pointAt(m, r.X1, r.Y1)
+	p4 := pointAt(m, r.X0, r.Y1)
+	seg := []displaylist.Segment{
+		{Kind: displaylist.SegmentMove, P0: p1},
+		{Kind: displaylist.SegmentLine, P0: p1, P3: p2},
+		{Kind: displaylist.SegmentLine, P0: p2, P3: p3},
+		{Kind: displaylist.SegmentLine, P0: p3, P3: p4},
+		{Kind: displaylist.SegmentClose, P0: p4, P3: p1},
+	}
+	return displaylist.Clip{Path: seg, Rule: displaylist.NonZero, Bounds: segmentBounds(seg)}
+}
+
+func pointAt(m matrix, x, y float64) displaylist.Point {
+	px, py := m.apply(x, y)
+	return displaylist.Point{X: px, Y: py}
+}
+
+func (ip *interp) emitImage(stm *syntax.Stream) error {
+	ref, mask, err := pdfimage.NewXObject(ip.ctx, ip.pd.File, stm, ip.pd.Tracker, ip.pd.Diag)
+	if err != nil {
+		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
+			return err
+		}
+		ip.diagOnce(diag.Degraded, "IMG-INFO", "cannot read image XObject")
+		return nil
+	}
+	return ip.emitImageRef(ref, mask)
+}
+
+func (ip *interp) doInlineImage() error {
+	if err := ip.flushText(); err != nil {
+		return err
+	}
+	dict, data, ok := ip.lx.inlineImage()
+	if !ok {
+		ip.diagOnce(diag.Degraded, "CNT-INLINE-IMAGE", "malformed inline image")
+		return nil
+	}
+	ref, err := pdfimage.NewInline(dict, data, ip.pd.Tracker, ip.pd.Diag)
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "IMG-INFO", "cannot read inline image")
+		return nil
+	}
+	return ip.emitImageRef(ref, nil)
+}
+
+func (ip *interp) emitImageRef(ref *pdfimage.Ref, mask *displaylist.MaskRef) error {
+	info := ref.Info()
+	bounds := imageBounds(ip.st.ctm)
+	c := ip.common()
+	fill := ip.st.fill
+	item := &displaylist.Image{
+		Common: c, Matrix: [6]float64(ip.st.ctm), Info: info, Data: ref,
+		Mask: mask, Fill: &fill, Interpolate: info.Interpolate, Decode: append([]float64(nil), info.Decode...),
+		Role: displaylist.ImagePhoto,
+	}
+	if info.ColorSpace == "ImageMask" {
+		item.Role = displaylist.ImageMaskRole
+	}
+	if bounds.X1 < ip.pd.CropBox.X0 || bounds.X0 > ip.pd.CropBox.X1 || bounds.Y1 < ip.pd.CropBox.Y0 || bounds.Y0 > ip.pd.CropBox.Y1 {
+		item.Flags |= displaylist.FlagOutOfBounds
+	}
+	item.Bounds = bounds
+	return ip.emit(item)
+}
+
+func imageBounds(m matrix) displaylist.Rect {
+	p0 := pointAt(m, 0, 0)
+	p1 := pointAt(m, 1, 0)
+	p2 := pointAt(m, 1, 1)
+	p3 := pointAt(m, 0, 1)
+	return displaylist.Rect{
+		X0: math.Min(math.Min(p0.X, p1.X), math.Min(p2.X, p3.X)),
+		Y0: math.Min(math.Min(p0.Y, p1.Y), math.Min(p2.Y, p3.Y)),
+		X1: math.Max(math.Max(p0.X, p1.X), math.Max(p2.X, p3.X)),
+		Y1: math.Max(math.Max(p0.Y, p1.Y), math.Max(p2.Y, p3.Y)),
+	}
+}
+
+func (ip *interp) applyGState() error {
+	ops, ok := ip.take(1)
+	if !ok {
+		return nil
+	}
+	nam, ok := name(ops[0])
+	if !ok {
+		return nil
+	}
+	if err := ip.flushText(); err != nil {
+		return err
+	}
+	states, ok := ip.resolveDict(ip.pd.Resources.Get("ExtGState"))
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-GSTATE-MISSING", "ExtGState resources missing")
+		return nil
+	}
+	obj, ok := ip.resolveObject(states[syntax.Name(nam)])
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-GSTATE-MISSING", "ExtGState resource missing: "+nam)
+		return nil
+	}
+	gs, ok := obj.(syntax.Dict)
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-GSTATE-TYPE", "ExtGState is not a dictionary")
+		return nil
+	}
+	ip.applyGStateDict(gs)
+	if v := gs.Get("SMask"); v != nil {
+		if n, ok := v.(syntax.Name); ok && n == "None" {
+			ip.st.softMask = nil
+		} else if sm, err := ip.buildSoftMask(v); err != nil {
+			ip.diagOnce(diag.Degraded, "CNT-GSTATE-SMASK", "cannot read soft mask")
+			ip.st.softMask = nil
+		} else {
+			ip.st.softMask = sm
+		}
+	}
+	return nil
+}
+
+func (ip *interp) applyGStateDict(gs syntax.Dict) {
+	if v, ok := gs.Get("ca").(syntax.Real); ok {
+		ip.st.fillAlpha = clamp01(float64(v))
+	} else if v, ok := gs.Get("ca").(syntax.Int); ok {
+		ip.st.fillAlpha = clamp01(float64(v))
+	}
+	if v, ok := gs.Get("CA").(syntax.Real); ok {
+		ip.st.strokeAlpha = clamp01(float64(v))
+	} else if v, ok := gs.Get("CA").(syntax.Int); ok {
+		ip.st.strokeAlpha = clamp01(float64(v))
+	}
+	if v := gs.Get("BM"); v != nil {
+		switch bm := v.(type) {
+		case syntax.Name:
+			ip.st.blend = string(bm)
+		case syntax.Array:
+			if len(bm) > 0 {
+				if n, ok := bm[0].(syntax.Name); ok {
+					ip.st.blend = string(n)
+				}
+			}
+		}
+	}
+	if gs.Has("Font") {
+		ip.diagOnce(diag.Degraded, "CNT-GSTATE-FONT", "ExtGState font changes are not applied")
+	}
+	for _, key := range []string{"AIS", "TK", "RI", "OP", "op", "OPM", "SA", "TR", "TR2", "HT", "BG", "BG2", "UCR"} {
+		if gs.Has(key) {
+			ip.diagOnce(diag.Degraded, "CNT-GSTATE-UNSUPPORTED", "unsupported ExtGState key: "+key)
+		}
+	}
+	if v, ok := gs.Get("LW").(syntax.Real); ok {
+		ip.st.lineWidth = float64(v)
+	} else if v, ok := gs.Get("LW").(syntax.Int); ok {
+		ip.st.lineWidth = float64(v)
+	}
+	if v, ok := gs.Get("LC").(syntax.Int); ok {
+		ip.st.cap = int(v)
+	}
+	if v, ok := gs.Get("LJ").(syntax.Int); ok {
+		ip.st.join = int(v)
+	}
+	if v, ok := gs.Get("ML").(syntax.Real); ok {
+		ip.st.miter = float64(v)
+	} else if v, ok := gs.Get("ML").(syntax.Int); ok {
+		ip.st.miter = float64(v)
+	}
+	if v := gs.Get("D"); v != nil {
+		if arr, ok := v.(syntax.Array); ok && len(arr) > 0 {
+			if dash, ok := arr[0].(syntax.Array); ok {
+				ip.st.dash = ip.st.dash[:0]
+				for _, item := range dash {
+					if n, ok := num(item); ok {
+						ip.st.dash = append(ip.st.dash, n)
+					}
+				}
+				if len(arr) > 1 {
+					if n, ok := num(arr[1]); ok {
+						ip.st.dashPhase = n
+					}
+				}
+			}
+		}
+	}
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func deviceGray() pdfcolor.Space { return mustSpace("DeviceGray") }
+func deviceRGB() pdfcolor.Space  { return mustSpace("DeviceRGB") }
+func deviceCMYK() pdfcolor.Space { return mustSpace("DeviceCMYK") }
+
+func mustSpace(name string) pdfcolor.Space {
+	s, _ := pdfcolor.Load(context.Background(), nil, syntax.Name(name), nil)
+	return s
+}
+
+func (ip *interp) doShading() error {
+	ops, ok := ip.take(1)
+	if !ok {
+		return nil
+	}
+	nam, ok := name(ops[0])
+	if !ok {
+		return nil
+	}
+	if err := ip.flushText(); err != nil {
+		return err
+	}
+	res, ok := ip.resolveDict(ip.pd.Resources.Get("Shading"))
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-SHADING-MISSING", "shading resources missing")
+		return nil
+	}
+	obj, ok := ip.resolveObject(res[syntax.Name(nam)])
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-SHADING-MISSING", "shading resource missing: "+nam)
+		return nil
+	}
+	var dict syntax.Dict
+	var raw []byte
+	switch v := obj.(type) {
+	case syntax.Dict:
+		dict = v
+	case *syntax.Stream:
+		dict, raw = v.Dict, v.Raw
+	default:
+		ip.diagOnce(diag.Warn, "CNT-SHADING-TYPE", "shading is not a dictionary")
+		return nil
+	}
+	kind, ok := dict.IntValue("ShadingType")
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-SHADING-TYPE", "shading type missing")
+		return nil
+	}
+	if kind == 1 {
+		return ip.functionShading(dict)
+	}
+	if kind >= 4 && kind <= 7 {
+		c := ip.common()
+		c.Bounds = ip.pd.CropBox
+		if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
+			c.Bounds = ip.clips[ip.curClip].Bounds
+		}
+		item := &displaylist.Shading{Common: c, Raw: raw, Matrix: [6]float64(ip.st.ctm)}
+		item.Kind = displaylist.ShadingMesh
+		if v, ok := dict.IntValue("BitsPerCoordinate"); ok {
+			item.BitsPerCoordinate = int(v)
+		}
+		if v, ok := dict.IntValue("BitsPerComponent"); ok {
+			item.BitsPerComponent = int(v)
+		}
+		if v, ok := dict.IntValue("BitsPerFlag"); ok {
+			item.BitsPerFlag = int(v)
+		}
+		item.MeshType = int(kind)
+		if v, ok := dict.IntValue("VerticesPerRow"); ok {
+			item.VerticesPerRow = int(v)
+		}
+		item.Decode, _ = ip.numberArray(dict.Get("Decode"), -1)
+		if v := dict.Get("ColorSpace"); v != nil {
+			item.ColorSpace = colorSpaceName(v)
+		}
+		ip.diagOnce(diag.Info, "CNT-SHADING-MESH", "mesh shading passed through raw stream")
+		return ip.emit(item)
+	}
+	if kind != 2 && kind != 3 {
+		ip.diagOnce(diag.Degraded, "CNT-SHADING-UNSUPPORTED", "unsupported shading type")
+		return nil
+	}
+	coords, ok := ip.numberArray(dict.Get("Coords"), 4)
+	if kind == 3 {
+		coords, ok = ip.numberArray(dict.Get("Coords"), 6)
+	}
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-SHADING-COORDS", "invalid shading coordinates")
+		return nil
+	}
+	fn, err := pdfunction.Load(ip.ctx, ip.pd.File, dict.Get("Function"), ip.pd.Tracker)
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot load shading function")
+		return nil
+	}
+	if fn.Inputs() != 1 {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "shading function must have one input")
+		return nil
+	}
+	spaceObj := dict.Get("ColorSpace")
+	if _, null := spaceObj.(syntax.Null); null {
+		switch fn.Outputs() {
+		case 1:
+			spaceObj = syntax.Name("DeviceGray")
+		case 3:
+			spaceObj = syntax.Name("DeviceRGB")
+		case 4:
+			spaceObj = syntax.Name("DeviceCMYK")
+		}
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "shading color space missing; inferred from function")
+	}
+	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker)
+	if err != nil || space.Components() != fn.Outputs() {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "invalid shading color space")
+		return nil
+	}
+	stops, delta, ok := ip.shadingStops(fn, space)
+	if !ok {
+		return nil
+	}
+	extend := [2]bool{}
+	if arr, ok := dict.Get("Extend").(syntax.Array); ok && len(arr) >= 2 {
+		for i := 0; i < 2; i++ {
+			if b, ok := arr[i].(syntax.Bool); ok {
+				extend[i] = bool(b)
+			}
+		}
+	}
+	c := ip.common()
+	bounds := ip.pd.CropBox
+	if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
+		bounds = ip.clips[ip.curClip].Bounds
+	}
+	c.Bounds = bounds
+	item := &displaylist.Shading{
+		Common: c, Kind: displaylist.ShadingAxial, Stops: stops, Extend: extend, MaxDeltaE: delta,
+	}
+	if kind == 3 {
+		item.Kind = displaylist.ShadingRadial
+	}
+	if kind == 2 {
+		p0 := pointAt(ip.st.ctm, coords[0], coords[1])
+		p1 := pointAt(ip.st.ctm, coords[2], coords[3])
+		item.Geometry = displaylist.ShadingGeometry{X0: p0.X, Y0: p0.Y, X1: p1.X, Y1: p1.Y}
+	} else {
+		sx := math.Hypot(ip.st.ctm[0], ip.st.ctm[1])
+		sy := math.Hypot(ip.st.ctm[2], ip.st.ctm[3])
+		if math.Abs(sx-sy) > 1e-6 {
+			ip.diagOnce(diag.Degraded, "CLR-SHADING-CTM", "non-uniform radial shading is approximated by a circle")
+		}
+		p0 := pointAt(ip.st.ctm, coords[0], coords[1])
+		p1 := pointAt(ip.st.ctm, coords[3], coords[4])
+		r0 := coords[2] * ip.st.ctm.scale()
+		r1 := coords[5] * ip.st.ctm.scale()
+		item.Geometry = displaylist.ShadingGeometry{X0: p0.X, Y0: p0.Y, R0: r0, X1: p1.X, Y1: p1.Y, R1: r1}
+	}
+	return ip.emit(item)
+}
+
+func (ip *interp) functionShading(dict syntax.Dict) error {
+	fn, err := pdfunction.Load(ip.ctx, ip.pd.File, dict.Get("Function"), ip.pd.Tracker)
+	if err != nil || fn.Inputs() != 2 {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot load function shading")
+		return nil
+	}
+	spaceObj := dict.Get("ColorSpace")
+	if _, null := spaceObj.(syntax.Null); null {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "function shading color space missing")
+		return nil
+	}
+	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker)
+	if err != nil || space.Components() != fn.Outputs() {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "invalid function shading color space")
+		return nil
+	}
+	domain := []float64{0, 1, 0, 1}
+	if v, ok := ip.numberArray(dict.Get("Domain"), 4); ok {
+		domain = v
+	}
+	sm := matrix{1, 0, 0, 1, 0, 0}
+	if v := dict.Get("Matrix"); v != nil {
+		if m, ok := ip.matrixValue(v); ok {
+			sm = m
+		}
+	}
+	const n = 33
+	grid := &displaylist.ShadingGrid{Width: n, Height: n, Domain: [4]float64{domain[0], domain[1], domain[2], domain[3]}}
+	grid.Colors = make([][4]float64, n*n)
+	for j := 0; j < n; j++ {
+		for i := 0; i < n; i++ {
+			x := domain[0] + (domain[1]-domain[0])*float64(i)/float64(n-1)
+			y := domain[2] + (domain[3]-domain[2])*float64(j)/float64(n-1)
+			out, err := fn.Eval([]float64{x, y})
+			if err != nil || len(out) != space.Components() {
+				ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot evaluate function shading")
+				return nil
+			}
+			rgba, _, err := space.RGBA(out)
+			if err != nil {
+				ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "cannot convert function shading color")
+				return nil
+			}
+			grid.Colors[j*n+i] = rgba
+		}
+	}
+	c := ip.common()
+	c.Bounds = ip.pd.CropBox
+	if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
+		c.Bounds = ip.clips[ip.curClip].Bounds
+	}
+	item := &displaylist.Shading{
+		Common: c, Kind: displaylist.ShadingFunction, Grid: grid,
+		Matrix: [6]float64(mmul(ip.st.ctm, sm)),
+	}
+	return ip.emit(item)
+}
+
+func (ip *interp) shadingStops(fn pdfunction.Function, space pdfcolor.Space) ([]displaylist.ColorStop, float64, bool) {
+	const n = 64
+	stops := make([]displaylist.ColorStop, 0, n)
+	for i := 0; i < n; i++ {
+		t := float64(i) / float64(n-1)
+		out, err := fn.Eval([]float64{t})
+		if err != nil || len(out) != space.Components() {
+			ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot evaluate shading function")
+			return nil, 0, false
+		}
+		rgba, _, err := space.RGBA(out)
+		if err != nil {
+			ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "cannot convert shading color")
+			return nil, 0, false
+		}
+		if len(stops) > 0 && colorClose(stops[len(stops)-1].Color, rgba) {
+			continue
+		}
+		stops = append(stops, displaylist.ColorStop{Offset: t, Color: rgba})
+	}
+	if len(stops) < 2 {
+		stops = append(stops, displaylist.ColorStop{Offset: 1, Color: stops[0].Color})
+	}
+	return stops, 0, true
+}
+
+func colorClose(a, b [4]float64) bool {
+	const eps = 1e-4
+	for i := range a {
+		if math.Abs(a[i]-b[i]) > eps {
+			return false
+		}
+	}
+	return true
+}
+
+func (ip *interp) beginMarkedContent(hasProps bool) {
+	if !hasProps {
+		ip.stack = nil
+		ip.marked = append(ip.marked, markedEntry{})
+		return
+	}
+	ops, ok := ip.take(2)
+	if !ok {
+		return
+	}
+	if _, ok := name(ops[0]); !ok {
+		return
+	}
+	props := ip.markedProps(ops[1])
+	if !ip.ocContentVisible(props) {
+		if err := ip.flushText(); err != nil {
+			return
+		}
+		ip.skipDepth = 1
+		ip.diagOnce(diag.Info, "CNT-OC-HIDDEN", "hidden optional content skipped")
+		return
+	}
+	actual := ""
+	if d, ok := props.(syntax.Dict); ok {
+		if v, ok := d.Get("ActualText").(syntax.String); ok {
+			actual = string(v)
+		}
+	}
+	if actual != "" {
+		if err := ip.flushText(); err != nil {
+			return
+		}
+	}
+	ip.marked = append(ip.marked, markedEntry{actual: actual})
+}
+
+type markedEntry struct {
+	actual string
+	used   bool
+}
+
+func (ip *interp) markedProps(props syntax.Object) syntax.Object {
+	if n, ok := props.(syntax.Name); ok {
+		res, ok := ip.resolveDict(ip.pd.Resources.Get("Properties"))
+		if !ok {
+			return props
+		}
+		if v, ok := res[n]; ok {
+			return v
+		}
+	}
+	return props
+}
+
+func (ip *interp) endMarkedContent() error {
+	ip.stack = nil
+	if len(ip.marked) == 0 {
+		ip.diagOnce(diag.Warn, "CNT-ACTUALTEXT-UNBALANCED", "unbalanced marked content")
+		return nil
+	}
+	top := ip.marked[len(ip.marked)-1]
+	if top.actual != "" {
+		if err := ip.flushText(); err != nil {
+			return err
+		}
+	}
+	ip.marked = ip.marked[:len(ip.marked)-1]
+	return nil
+}
+
+func (ip *interp) takeActualText() string {
+	for i := len(ip.marked) - 1; i >= 0; i-- {
+		if ip.marked[i].actual == "" {
+			continue
+		}
+		if ip.marked[i].used {
+			ip.diagOnce(diag.Degraded, "CNT-ACTUALTEXT-MULTI", "ActualText spans multiple text runs")
+			return ""
+		}
+		ip.marked[i].used = true
+		return ip.marked[i].actual
+	}
+	return ""
+}
+
+func (ip *interp) ocContentVisible(props syntax.Object) bool {
+	if ip.pd.OC == nil {
+		return true
+	}
+	if n, ok := props.(syntax.Name); ok {
+		res, ok := ip.resolveDict(ip.pd.Resources.Get("Properties"))
+		if !ok {
+			return true
+		}
+		v, ok := res[n]
+		if !ok {
+			return true
+		}
+		props = v
+	}
+	switch v := props.(type) {
+	case syntax.Ref:
+		visible, ok := ip.pd.OC[v]
+		return !ok || visible
+	case syntax.Array:
+		for _, item := range v {
+			if !ip.ocContentVisible(item) {
+				return false
+			}
+		}
+		return true
+	case syntax.Dict:
+		if oc := v.Get("OC"); oc != nil {
+			return ip.ocContentVisible(oc)
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func pathHint(seg []displaylist.Segment, closed bool) displaylist.PathHint {
+	if len(seg) < 2 || seg[0].Kind != displaylist.SegmentMove {
+		return displaylist.PathGeneric
+	}
+	lines, cubics := 0, 0
+	for _, s := range seg[1:] {
+		switch s.Kind {
+		case displaylist.SegmentLine:
+			lines++
+		case displaylist.SegmentCubic:
+			cubics++
+		}
+	}
+	if lines == 1 && cubics == 0 && len(seg) == 2 && !closed {
+		return displaylist.PathLine
+	}
+	if cubics == 0 && lines > 0 {
+		pts := make([]displaylist.Point, 0, lines+1)
+		pts = append(pts, seg[0].P0)
+		for _, s := range seg[1:] {
+			if s.Kind == displaylist.SegmentLine {
+				pts = append(pts, s.P3)
+			}
+		}
+		if closed && lines == 3 && len(pts) == 4 && isAxisRect(pts) {
+			return displaylist.PathRect
+		}
+		if !closed && lines >= 2 {
+			return displaylist.PathPolyline
+		}
+	}
+	if closed {
+		if cubics == 4 && lines == 0 && isEllipse(seg) {
+			return displaylist.PathEllipse
+		}
+		if cubics == 4 && lines == 4 {
+			return displaylist.PathRoundRect
+		}
+	}
+	return displaylist.PathGeneric
+}
+
+func isAxisRect(p []displaylist.Point) bool {
+	if len(p) != 4 {
+		return false
+	}
+	horizontal := math.Abs(p[0].Y-p[1].Y) < 1e-9
+	for i := 0; i < 4; i++ {
+		a, b := p[i], p[(i+1)%4]
+		if a == b {
+			return false
+		}
+		h := math.Abs(a.Y-b.Y) < 1e-9
+		v := math.Abs(a.X-b.X) < 1e-9
+		if !h && !v {
+			return false
+		}
+		if h != horizontal {
+			return false
+		}
+		horizontal = !horizontal
+	}
+	return true
+}
+
+func isEllipse(seg []displaylist.Segment) bool {
+	var pts []displaylist.Point
+	for _, s := range seg {
+		pts = append(pts, s.P0, s.P3)
+	}
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	for _, p := range pts {
+		minX = math.Min(minX, p.X)
+		minY = math.Min(minY, p.Y)
+		maxX = math.Max(maxX, p.X)
+		maxY = math.Max(maxY, p.Y)
+	}
+	cx, cy := (minX+maxX)/2, (minY+maxY)/2
+	rx, ry := (maxX-minX)/2, (maxY-minY)/2
+	if rx <= 0 || ry <= 0 {
+		return false
+	}
+	for _, s := range seg {
+		if s.Kind == displaylist.SegmentMove || s.Kind == displaylist.SegmentClose {
+			continue
+		}
+		for _, p := range []displaylist.Point{s.P0, s.P3} {
+			x := (p.X - cx) / rx
+			y := (p.Y - cy) / ry
+			if math.Abs(x*x+y*y-1) > 0.02 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func basePaint(vals []float64) (pdfcolor.Space, displaylist.Paint, bool) {
+	var name string
+	switch len(vals) {
+	case 1:
+		name = "DeviceGray"
+	case 3:
+		name = "DeviceRGB"
+	case 4:
+		name = "DeviceCMYK"
+	default:
+		return nil, displaylist.Paint{}, false
+	}
+	sp, err := pdfcolor.Load(context.Background(), nil, syntax.Name(name), nil)
+	if err != nil {
+		return nil, displaylist.Paint{}, false
+	}
+	rgba, approx, err := sp.RGBA(vals)
+	if err != nil {
+		return nil, displaylist.Paint{}, false
+	}
+	return sp, displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: rgba, Space: name, Raw: append([]float64(nil), vals...), Approx: approx}, true
+}
+
+func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error) {
+	obj, ok := ip.resolveObject(obj)
+	if !ok {
+		return nil, errs.Wrap(errs.ErrCorrupt, "CNT-SMASK", "resolve soft mask", -1, 0, -1)
+	}
+	var stm *syntax.Stream
+	subtype := "Alpha"
+	switch v := obj.(type) {
+	case syntax.Dict:
+		if s, ok := v.NameValue("S"); ok {
+			subtype = s
+		}
+		if g := v.Get("G"); g != nil {
+			obj, ok = ip.resolveObject(g)
+			if !ok {
+				return nil, errs.Wrap(errs.ErrCorrupt, "CNT-SMASK", "resolve soft mask group", -1, 0, -1)
+			}
+			stm, _ = obj.(*syntax.Stream)
+		}
+	case *syntax.Stream:
+		stm = v
+	default:
+		return nil, errs.Wrap(errs.ErrCorrupt, "CNT-SMASK", "invalid soft mask", -1, 0, -1)
+	}
+	if stm == nil {
+		return nil, nil
+	}
+	if ip.masks[stm] {
+		ip.diagOnce(diag.Warn, "CNT-SMASK-CYCLE", "soft mask cycle skipped")
+		return nil, nil
+	}
+	if g, ok := stm.Dict.DictValue("Group"); ok {
+		if s, ok := g.NameValue("S"); ok && s == "Luminosity" {
+			subtype = "Luminosity"
+		}
+	}
+	data, err := ip.pd.File.DecodeStream(ip.ctx, stm)
+	if err != nil {
+		return nil, err
+	}
+	res := ip.pd.Resources
+	if v := stm.Dict.Get("Resources"); v != nil {
+		if d, ok := ip.resolveDict(v); ok {
+			res = d
+		}
+	}
+	pm := matrix{1, 0, 0, 1, 0, 0}
+	if v := stm.Dict.Get("Matrix"); v != nil {
+		if m, ok := ip.matrixValue(v); ok {
+			pm = m
+		}
+	}
+	ctm := mmul(ip.st.ctm, pm)
+	nestedPD := ip.pd
+	nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = data, res, [6]float64(ctm)
+	var items []displaylist.Item
+	nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
+		items = append(items, item)
+		return nil
+	})
+	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
+	ip.masks[stm] = true
+	err = nested.run()
+	delete(ip.masks, stm)
+	if err != nil {
+		return nil, err
+	}
+	bbox := ip.pd.CropBox
+	if r, ok := ip.rectValue(stm.Dict.Get("BBox")); ok {
+		p0 := pointAt(ctm, r.X0, r.Y0)
+		p1 := pointAt(ctm, r.X1, r.Y1)
+		bbox = displaylist.Rect{
+			X0: math.Min(p0.X, p1.X), Y0: math.Min(p0.Y, p1.Y),
+			X1: math.Max(p0.X, p1.X), Y1: math.Max(p0.Y, p1.Y),
+		}
+	}
+	return &displaylist.SoftMask{Subtype: subtype, BBox: bbox, Items: items, Clips: nested.clips}, nil
 }

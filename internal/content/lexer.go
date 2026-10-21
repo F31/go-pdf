@@ -346,40 +346,62 @@ func (l *lexer) dict(start int) (token, error) {
 	}
 }
 
-// skipInlineImage is called after the BI operator. It consumes the inline
-// dictionary and binary payload through EI.
-func (l *lexer) skipInlineImage() {
-	idx := bytes.Index(l.data[l.pos:], []byte("ID"))
-	for idx >= 0 {
-		at := l.pos + idx
-		after := at + 2
-		beforeOK := at == 0 || isSpace(l.data[at-1])
-		afterOK := after < len(l.data) && isSpace(l.data[after])
-		if beforeOK && afterOK {
-			l.pos = after + 1
-			break
-		}
-		next := bytes.Index(l.data[at+2:], []byte("ID"))
-		if next < 0 {
-			idx = -1
-			break
-		}
-		idx = at + 2 + next - l.pos
-	}
+// inlineImage is called after the BI operator. It parses the inline image
+// dictionary and returns the binary payload before the EI operator.
+func (l *lexer) inlineImage() (syntax.Dict, []byte, bool) {
+	d := syntax.Dict{}
 	for {
-		idx = bytes.Index(l.data[l.pos:], []byte("EI"))
+		tok, err := l.next()
+		if err != nil {
+			return nil, nil, false
+		}
+		if tok.kind == tokOperator && tok.op == "ID" {
+			break
+		}
+		key, ok := tok.obj.(syntax.Name)
+		if tok.kind != tokObject || !ok {
+			return nil, nil, false
+		}
+		vt, err := l.next()
+		if err != nil || vt.kind != tokObject {
+			return nil, nil, false
+		}
+		d[key] = vt.obj
+	}
+	if l.pos < len(l.data) && isSpace(l.data[l.pos]) {
+		l.pos++
+	}
+	start := l.pos
+	at, end, ok := scanInlineData(l.data, start)
+	if !ok {
+		l.pos = len(l.data)
+		return d, nil, false
+	}
+	dataEnd := at
+	if dataEnd > start && isSpace(l.data[dataEnd-1]) {
+		dataEnd--
+	}
+	l.pos = end
+	return d, l.data[start:dataEnd], true
+}
+
+func scanInlineData(data []byte, start int) (dataEnd, end int, ok bool) {
+	pos := start
+	for {
+		idx := bytes.Index(data[pos:], []byte("EI"))
 		if idx < 0 {
-			l.pos = len(l.data)
-			return
+			return 0, 0, false
 		}
-		at := l.pos + idx
-		beforeOK := at > 0 && isSpace(l.data[at-1])
-		end := at + 2
-		afterOK := end == len(l.data) || isSpace(l.data[end]) || isDelim(l.data[end])
+		at := pos + idx
+		beforeOK := at > 0 && isSpace(data[at-1])
+		next := at + 2
+		afterOK := next == len(data) || isSpace(data[next]) || isDelim(data[next])
 		if beforeOK && afterOK {
-			l.pos = end
-			return
+			return at, next, true
 		}
-		l.pos = at + 2
+		pos = at + 2
 	}
 }
+
+// skipInlineImage consumes an inline image without retaining its data.
+func (l *lexer) skipInlineImage() { _, _, _ = l.inlineImage() }

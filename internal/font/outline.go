@@ -10,9 +10,9 @@ import (
 )
 
 // GlyphOutline returns the glyph outline in 1/1000 text-space units with the
-// y axis pointing up, matching the coordinate system used by
-// displaylist.Glyph.Matrix. The boolean is false when the font has no outline
-// program or the code cannot be mapped to a glyph.
+// y axis pointing up. Scale by 1/1000 before applying displaylist.Glyph.Matrix,
+// which maps text-space units to page space. The boolean is false when the font
+// has no outline program or the code cannot be mapped to a glyph.
 func (f *Font) GlyphOutline(c Code) ([]displaylist.Segment, bool) {
 	gid, ok := f.outlineGID(c)
 	if !ok {
