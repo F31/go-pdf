@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.23.x", "1.24.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Test (no cgo)
+        run: CGO_ENABLED=0 go test ./...
+
+  staticcheck:
+    name: Staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - run: staticcheck ./...
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
+  cross:
+    name: Cross compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build all targets
+        run: |
+          set -e
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              echo "building $os/$arch"
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build ./...
+            done
+          done
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Fuzz
+        run: |
+          set -e
+          go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s
+          go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s
+          go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s
+
+  benchmark:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Run benchmarks
+        run: go test ./... -run=^$ -bench=. -benchmem -count=1 | tee bench.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench.txt
+
+  deps:
+    name: Dependency whitelist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check go.mod
+        run: ./scripts/check-deps.sh

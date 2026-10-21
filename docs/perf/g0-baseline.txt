@@ -1,0 +1,29 @@
+PASS
+ok  	github.com/F31/go-pdf	0.003s
+PASS
+ok  	github.com/F31/go-pdf/displaylist	0.005s
+PASS
+ok  	github.com/F31/go-pdf/internal/budget	0.004s
+PASS
+ok  	github.com/F31/go-pdf/internal/diag	0.004s
+PASS
+ok  	github.com/F31/go-pdf/internal/doc	0.004s
+?   	github.com/F31/go-pdf/internal/errs	[no test files]
+goos: linux
+goarch: amd64
+pkg: github.com/F31/go-pdf/internal/filter
+cpu: Intel(R) Core(TM) Ultra 9 275HX
+BenchmarkFlateDecode-24       	  108451	     11028 ns/op	   6.44 MB/s	   40718 B/op	       7 allocs/op
+BenchmarkASCIIHexDecode-24    	 1387800	       883.1 ns/op	  37.37 MB/s	    4278 B/op	       4 allocs/op
+PASS
+ok  	github.com/F31/go-pdf/internal/filter	3.423s
+goos: linux
+goarch: amd64
+pkg: github.com/F31/go-pdf/internal/syntax
+cpu: Intel(R) Core(TM) Ultra 9 275HX
+BenchmarkParseObject-24        	 1329296	      1013 ns/op	    1408 B/op	      34 allocs/op
+BenchmarkResolveObject-24      	  337249	      2996 ns/op	    5648 B/op	      57 allocs/op
+BenchmarkOpenClassicXref-24    	  448712	      2281 ns/op	    4704 B/op	      31 allocs/op
+PASS
+ok  	github.com/F31/go-pdf/internal/syntax	4.376s
+?   	github.com/F31/go-pdf/internal/testkit	[no test files]
