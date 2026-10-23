@@ -6,7 +6,7 @@
 
 - 简单字体与 Type0/CID 字体的 `/ToUnicode`：`codespacerange`（多长度）、`bfchar`、`bfrange`（连续目标与数组目标）、多 rune 目标
 - Type0 + CIDFontType0/2：`DescendantFonts`、`BaseFont`、`DW`、`W`、`DW2`/`W2` 记录
-- Identity-H/V：双字节字符码、CID、竖排标记与降级诊断
+- Identity-H/V：双字节字符码、CID 与竖排码位
 - 预定义简体中文 CMap：`UniGB-UCS2-H/V`、`UniGB-UTF16-H/V`、`GBK-EUC-H/V`、`GB-EUC-H/V`
 - 预定义 Big5 CMap：`UniCNS-UCS2-H/V`、`UniCNS-UTF16-H/V`、`B5-H/V`、`B5pc-H/V`、`ETen-B5-H/V`、`ETenms-B5-H/V`
 - 预定义日文 CMap：`UniJIS-UCS2-H/V`、`UniJIS-UTF16-H/V`、`90ms-RKSJ-H/V`、`90msp-RKSJ-H/V`、`90pv-RKSJ-H/V`、`EUC-H/V`、`H/V`
@@ -15,7 +15,7 @@
   - 字符码到 CID 的预定义映射，`/W` 按 CID 取宽度
   - `UniGB-UCS2`/`UTF16` 直接由字符码得到 Unicode；GBK/GB 系通过 `GBK-EUC-UCS2` 映射
   - 日韩 legacy CMap 使用 code→Unicode 表（如 `90ms-RKSJ-UCS2`）或 CID→Unicode 表（`Adobe-Japan1-UCS2`/`Adobe-Korea1-UCS2`）与 code→CID 组合
-  - 竖排 CMap 使用 V 变体覆盖标点 CID，并保留 `FNT-VERTICAL-DEFERRED`
+  - 竖排 CMap 使用 V 变体覆盖标点 CID
 - Unicode 解析优先级：简单字体与 Type0 均为 `/ToUnicode` 优先，再回退到 Encoding 或预定义 CMap
 - Type3：`Widths` × `FontMatrix` 计算前进量，`/ToUnicode` 或 Differences 推导 Unicode
 - Type3 CharProcs：每个字形展开为 `Path` 并标记 `FlagFromType3`，同时保留对应 `TextRun`
@@ -57,7 +57,7 @@
 
 - Type3 CharProc 内的嵌套文本被忽略并写 `FNT-TYPE3-TEXT`；嵌套裁剪只写诊断，不做精确合成。
 - Type3 字形路径来自 CharProc 内容流；复杂颜色空间、图案与图像仍按既有能力降级。
-- 竖排（`-V`/`WMode 1`）只做 CID 与标记，不承诺位置精度；`W2`/`DW2` 未用于前进量。
+- 竖排（`-V`/`WMode 1`）已使用 `W2`/`DW2` 计算前进量与字形原点；复杂竖排标点替代与双向混排仍属后续。
 - 多 rune 目标完整写入 `Glyph.Text`，但前进量仍按首字符宽度计算。
 - 预定义 CMap 的多字符 Unicode 目标（当前数据 1,878 条，主要为兼容序列）未写入一维映射表；首字符加变体选择符会归并到首字符。
 - 未包含日韩较少见的 CMap 变体（如 `Add-RKSJ`、`Ext-RKSJ`、`NWP`、`78-RKSJ`、`UniJIS2004` 等）。
@@ -72,7 +72,7 @@
 1. G3b 已提供区域渲染、EvenOdd、虚线/连接、色键遮罩与混合模式；剩余软蒙版/图案光栅化与 G5 语义见 `docs/g3-status.md`。
 2. G3b 区域渲染（路径/图像/裁剪/透明/字体轮廓文字）。
 3. `ActualText` 已支持（`TextRun.ActualText`）；剩余结构与标记内容见 `docs/g3-status.md`。
-4. 竖排 `W2/DW2` 定位（G5）。
+4. 复杂竖排标点替代与双向混排。
 5. Type3 嵌套裁剪、复杂颜色与图案的精确处理。
 6. 参考引擎文本位置 P95 统计。
 7. 多字符 CMap Unicode 目标与少见日韩 CMap 变体（按语料驱动）。

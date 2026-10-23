@@ -27,15 +27,17 @@ type Font struct {
 
 	Type string
 
-	isCID        bool
-	identity     bool
-	codeLen      int
-	predefined   *predefinedCMap
-	toUnicode    *ToUnicode
-	cidWidths    map[uint32]float64
-	defaultWidth float64
-	dw2          [2]float64
-	vertical     bool
+	isCID         bool
+	identity      bool
+	codeLen       int
+	predefined    *predefinedCMap
+	toUnicode     *ToUnicode
+	cidWidths     map[uint32]float64
+	cidVWidths    map[uint32]float64
+	defaultWidth  float64
+	defaultVWidth float64
+	dw2           [2]float64
+	vertical      bool
 
 	type3      bool
 	fontMatrix [6]float64
@@ -49,6 +51,24 @@ type Font struct {
 	program          *fontProgram
 	cidToGID         []byte
 	cidToGIDIdentity bool
+}
+
+// RetainedBytes is a conservative estimate of memory retained by a cached font.
+// It includes the embedded program and decoded tables; Type3 caches grow after
+// this estimate is taken.
+func (f *Font) RetainedBytes() int64 {
+	if f == nil {
+		return 0
+	}
+	n := int64(1024) + int64(len(f.cidToGID)) + int64(len(f.widths))*8
+	if f.program != nil {
+		n += f.program.size
+	}
+	n += int64(len(f.cidWidths))*24 + int64(len(f.cidVWidths))*16
+	if f.toUnicode != nil {
+		n += int64(len(f.toUnicode.Map)) * 32
+	}
+	return n
 }
 
 type Code struct {
@@ -480,7 +500,9 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 	f.isCID = true
 	f.codeLen = 2
 	f.defaultWidth = 1000
+	f.defaultVWidth = 880
 	f.cidWidths = map[uint32]float64{}
+	f.cidVWidths = map[uint32]float64{}
 	df := dict.Get("DescendantFonts")
 	if r, ok := df.(syntax.Ref); ok && file != nil {
 		v, err := file.Resolve(ctx, r)
@@ -589,15 +611,11 @@ func (f *Font) loadType0(ctx context.Context, file *syntax.File, dict syntax.Dic
 	if wmode, ok := dict.IntValue("WMode"); ok && wmode == 1 {
 		f.vertical = true
 	}
-	if f.vertical {
-		dc.Addf(diag.Degraded, "FNT-VERTICAL-DEFERRED", "vertical text positioning deferred", -1, 0, -1)
-	}
 	if dw2, ok := cid.ArrayValue("DW2"); ok && len(dw2) >= 2 {
 		f.dw2 = [2]float64{numeric(dw2[0]), numeric(dw2[1])}
+		f.defaultVWidth = f.dw2[0]
 	}
-	if cid.Has("W2") {
-		dc.Addf(diag.Degraded, "FNT-W2-DEFERRED", "vertical CID widths deferred", -1, 0, -1)
-	}
+	f.loadCIDVerticalWidths(ctx, file, cid)
 	f.toUnicode = f.loadToUnicode(ctx, file, dict, dc)
 	if f.toUnicode == nil && !f.predefined.hasUnicode() {
 		dc.Addf(diag.Degraded, "FNT-NO-TOUNICODE", "Type0 font has no ToUnicode", -1, 0, -1)
@@ -926,6 +944,69 @@ func splitWithSpaces(data []byte, spaces []codeSpace) ([]Code, int) {
 	return out, pos
 }
 
+func (f *Font) loadCIDVerticalWidths(ctx context.Context, file *syntax.File, cid syntax.Dict) {
+	wObj := cid.Get("W2")
+	if r, ok := wObj.(syntax.Ref); ok && file != nil {
+		if v, err := file.Resolve(ctx, r); err == nil {
+			wObj = v
+		}
+	}
+	arr, ok := wObj.(syntax.Array)
+	if !ok {
+		return
+	}
+	resolve := func(o syntax.Object) syntax.Object {
+		if r, ok := o.(syntax.Ref); ok && file != nil {
+			if v, err := file.Resolve(ctx, r); err == nil {
+				return v
+			}
+		}
+		return o
+	}
+	for i := 0; i < len(arr); {
+		cObj := resolve(arr[i])
+		c, ok := syntax.AsInt(cObj)
+		if !ok {
+			i++
+			continue
+		}
+		i++
+		if i >= len(arr) {
+			break
+		}
+		next := resolve(arr[i])
+		if sub, ok := next.(syntax.Array); ok {
+			for j := 0; j < len(sub); j += 3 {
+				if w, ok := syntax.AsNumber(resolve(sub[j])); ok {
+					f.cidVWidths[uint32(c)+uint32(j/3)] = w
+				}
+			}
+			i++
+			continue
+		}
+		if i+1 >= len(arr) {
+			break
+		}
+		last, ok := syntax.AsInt(next)
+		if !ok {
+			i++
+			continue
+		}
+		w, ok := syntax.AsNumber(resolve(arr[i+1]))
+		if !ok {
+			i += 2
+			continue
+		}
+		i += 2
+		if last < c || last-c > 1<<20 {
+			continue
+		}
+		for x := c; x <= last; x++ {
+			f.cidVWidths[uint32(x)] = w
+		}
+	}
+}
+
 func (f *Font) WidthCode(c Code) float64 {
 	if f == nil {
 		return 500
@@ -958,6 +1039,19 @@ func (f *Font) DecodeCode(c Code) (string, bool) {
 		return f.predefined.decode(c)
 	}
 	return "\uFFFD", false
+}
+
+func (f *Font) VerticalWidth(c Code) float64 {
+	if f == nil {
+		return 880
+	}
+	if w, ok := f.cidVWidths[c.CID]; ok {
+		return w
+	}
+	if f.defaultVWidth > 0 {
+		return f.defaultVWidth
+	}
+	return 880
 }
 
 func (f *Font) Vertical() bool { return f != nil && f.vertical }

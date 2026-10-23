@@ -24,6 +24,15 @@ const (
 	maxDPI     = 300
 )
 
+// AnnotationMode selects annotation appearance visibility.
+type AnnotationMode uint8
+
+const (
+	AnnotationNone AnnotationMode = iota
+	AnnotationView
+	AnnotationPrint
+)
+
 // PageOptions controls a RenderRegion call.
 type PageOptions struct {
 	DPI        int
@@ -31,13 +40,40 @@ type PageOptions struct {
 	// IncludeText renders text from embedded sfnt outlines. It defaults to
 	// false; callers that need text must set it explicitly.
 	IncludeText bool
+	// Annotations overlays available annotation appearance streams.
+	Annotations AnnotationMode
 	Exclude     func(displaylist.Item) bool
 	MaxPixels   int
+	// CMYKProfile optionally supplies a 4-component ICC profile for
+	// DeviceCMYK blend spaces. When set, CMYK groups use its B2A/A2B paths
+	// instead of the built-in naive CMYK conversion.
+	CMYKProfile []byte
+	// Fonts supplies outlines for text runs without an embedded GlyphSource,
+	// such as base-14 fonts.
+	Fonts FontProvider
+	// Memory optionally accounts transient raster buffers. Pass the Page itself
+	// to charge the owning document's live-memory budget. The returned image is
+	// owned by the caller and is not covered by this lease.
+	Memory MemoryBudget
+}
+
+// MemoryBudget accounts transient raster allocations such as path/text
+// buffers, transparency groups and soft masks.
+type MemoryBudget interface {
+	AcquireMemory(bytes int64) (func(), error)
+}
+
+// FontProvider supplies glyph outlines when a text run has no embedded
+// displaylist.GlyphSource. Outlines use the same 1/1000 text-space units as
+// FontInfo.GlyphSource and are scaled by Glyph.Matrix by the renderer.
+type FontProvider interface {
+	GlyphOutline(info *displaylist.FontInfo, glyph displaylist.Glyph) ([]displaylist.Segment, bool, error)
 }
 
 // RenderRegion rasterizes the intersection of box with a page. Coordinates are
 // in page space (points, top-left origin). Text uses embedded sfnt outlines;
-// items without outlines are skipped.
+// items without outlines are skipped. The returned image is not covered by the
+// page memory budget; use RenderRegionLease for an owned raster.
 func RenderRegion(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts PageOptions) (image.Image, error) {
 	if page == nil {
 		return nil, errs.Wrap(errs.ErrClosed, "RND-PAGE", "render region", -1, 0, -1)
@@ -45,8 +81,54 @@ func RenderRegion(ctx context.Context, page *pdf.Page, box displaylist.Rect, opt
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "RND-CANCELED", "render region", -1, 0, -1)
 	}
+	w, h, scale, err := regionSpec(box, opts)
+	if err != nil {
+		return nil, err
+	}
+	dl, err := page.DisplayList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	if err := renderRegionInto(ctx, page, box, opts, out, scale, dl); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RenderRegionLease is RenderRegion with the output RGBA buffer charged to the
+// page's live-memory budget. Callers must Release the returned raster.
+func RenderRegionLease(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts PageOptions) (*Raster, error) {
+	if page == nil {
+		return nil, errs.Wrap(errs.ErrClosed, "RND-PAGE", "render region", -1, 0, -1)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errs.Wrap(errs.ErrCanceled, "RND-CANCELED", "render region", -1, 0, -1)
+	}
+	w, h, scale, err := regionSpec(box, opts)
+	if err != nil {
+		return nil, err
+	}
+	dl, err := page.DisplayList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	memory := memoryFor(page, opts)
+	release, err := memory.AcquireMemory(int64(w) * int64(h) * 4)
+	if err != nil {
+		return nil, err
+	}
+	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	if err := renderRegionInto(ctx, page, box, opts, out, scale, dl); err != nil {
+		release()
+		return nil, err
+	}
+	return &Raster{Image: out, release: release}, nil
+}
+
+func regionSpec(box displaylist.Rect, opts PageOptions) (int, int, float64, error) {
 	if box.X1 <= box.X0 || box.Y1 <= box.Y0 {
-		return nil, errs.Wrap(errs.ErrCorrupt, "RND-BOX", "render region", -1, 0, -1)
+		return 0, 0, 0, errs.Wrap(errs.ErrCorrupt, "RND-BOX", "render region", -1, 0, -1)
 	}
 	dpi := opts.DPI
 	if dpi <= 0 {
@@ -59,20 +141,51 @@ func RenderRegion(ctx context.Context, page *pdf.Page, box displaylist.Rect, opt
 	w := int(math.Ceil((box.X1 - box.X0) * scale))
 	h := int(math.Ceil((box.Y1 - box.Y0) * scale))
 	if w <= 0 || h <= 0 {
-		return nil, errs.Wrap(errs.ErrCorrupt, "RND-BOX", "render region", -1, 0, -1)
+		return 0, 0, 0, errs.Wrap(errs.ErrCorrupt, "RND-BOX", "render region", -1, 0, -1)
 	}
 	maxPixels := opts.MaxPixels
 	if maxPixels <= 0 {
 		maxPixels = 64 << 20
 	}
 	if int64(w)*int64(h) > int64(maxPixels) {
-		return nil, errs.Wrap(errs.ErrBudget, "BUD-RASTER-PIXELS", "render region", -1, 0, -1)
+		return 0, 0, 0, errs.Wrap(errs.ErrBudget, "BUD-RASTER-PIXELS", "render region", -1, 0, -1)
 	}
-	dl, err := page.DisplayList(ctx)
+	return w, h, scale, nil
+}
+
+func memoryFor(page *pdf.Page, opts PageOptions) MemoryBudget {
+	if opts.Memory != nil {
+		return opts.Memory
+	}
+	if m, ok := any(page).(MemoryBudget); ok {
+		return m
+	}
+	return noMemory{}
+}
+
+type noMemory struct{}
+
+func (noMemory) AcquireMemory(int64) (func(), error) { return func() {}, nil }
+
+func renderRegionLeaseDL(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts PageOptions, dl *displaylist.Page) (*Raster, error) {
+	w, h, scale, err := regionSpec(box, opts)
+	if err != nil {
+		return nil, err
+	}
+	memory := memoryFor(page, opts)
+	release, err := memory.AcquireMemory(int64(w) * int64(h) * 4)
 	if err != nil {
 		return nil, err
 	}
 	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	if err := renderRegionInto(ctx, page, box, opts, out, scale, dl); err != nil {
+		release()
+		return nil, err
+	}
+	return &Raster{Image: out, release: release}, nil
+}
+
+func renderRegionInto(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts PageOptions, out *image.RGBA, scale float64, dl *displaylist.Page) error {
 	if opts.Background == "white" {
 		draw.Draw(out, out.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	}
@@ -80,27 +193,58 @@ func RenderRegion(ctx context.Context, page *pdf.Page, box displaylist.Rect, opt
 		ctx: ctx, dl: dl, out: out, box: box, scale: scale,
 		pageToPx: displaylist.Matrix{scale, 0, 0, scale, -box.X0 * scale, -box.Y0 * scale},
 		opts:     opts, clips: map[int]*image.Alpha{}, clipList: dl.Clips,
-		softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+		softMasks: map[*displaylist.SoftMask]*image.Alpha{}, memory: memoryFor(page, opts),
 	}
+	defer rr.releaseAll()
 	for _, it := range dl.Items {
 		if opts.Exclude != nil && opts.Exclude(it) {
 			continue
 		}
 		if err := rr.renderItem(it); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return out, nil
+	if opts.Annotations != AnnotationNone {
+		for _, a := range dl.Annotations {
+			if a.Appearance == nil || len(a.Appearance.Items) == 0 || !annotationVisible(a, opts.Annotations) {
+				continue
+			}
+			child := &regionRenderer{
+				ctx: rr.ctx, dl: rr.dl, out: rr.out, box: rr.box, scale: rr.scale,
+				pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+				clipList: a.Appearance.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+				memory: rr.memory,
+			}
+			for _, it := range a.Appearance.Items {
+				if opts.Exclude != nil && opts.Exclude(it) {
+					continue
+				}
+				if err := child.renderItem(it); err != nil {
+					child.releaseAll()
+					return err
+				}
+			}
+			child.releaseAll()
+		}
+	}
+	return nil
 }
 
 func (rr *regionRenderer) renderItem(it displaylist.Item) error {
 	c := it.Base()
 	saved := rr.softMask
 	if !rr.inMask && c.SoftMask != nil {
-		rr.softMask = rr.softMaskFor(c.SoftMask)
+		m, err := rr.softMaskFor(c.SoftMask)
+		if err != nil {
+			return err
+		}
+		rr.softMask = m
 	}
 	err := rr.dispatchItem(it)
 	rr.softMask = saved
+	if err == nil && rr.memErr != nil {
+		err = rr.memErr
+	}
 	return err
 }
 
@@ -126,18 +270,165 @@ func (rr *regionRenderer) group(g *displaylist.Group) error {
 	if g == nil || len(g.Items) == 0 {
 		return nil
 	}
+	// Knockout groups composite each element against the group backdrop instead
+	// of blending elements with each other.
+	if g.Knockout {
+		off := image.NewRGBA(rr.out.Bounds())
+		release, err := rr.acquire(int64(len(off.Pix)))
+		if err != nil {
+			return err
+		}
+		defer release()
+		var base *image.RGBA
+		if !g.Isolated {
+			base = image.NewRGBA(rr.out.Bounds())
+			baseRelease, err := rr.acquire(int64(len(base.Pix)))
+			if err != nil {
+				return err
+			}
+			defer baseRelease()
+			draw.Draw(base, base.Bounds(), rr.out, image.Point{}, draw.Src)
+			draw.Draw(off, off.Bounds(), base, image.Point{}, draw.Src)
+		}
+		for _, it := range g.Items {
+			if rr.opts.Exclude != nil && rr.opts.Exclude(it) {
+				continue
+			}
+			// Render each element without the group backdrop. Only pixels
+			// with non-zero element alpha replace the group result; transparent
+			// holes must not erase earlier elements.
+			item := image.NewRGBA(rr.out.Bounds())
+			itemRelease, err := rr.acquire(int64(len(item.Pix)))
+			if err != nil {
+				return err
+			}
+			child := &regionRenderer{
+				ctx: rr.ctx, dl: rr.dl, out: item, box: rr.box, scale: rr.scale,
+				pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+				clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+				memory: rr.memory, gray: rr.gray || grayBlendSpace(g.BlendColorSpace),
+			}
+			err = child.renderItem(it)
+			child.releaseAll()
+			if err != nil {
+				itemRelease()
+				return err
+			}
+			// For non-Normal blends, render a second copy over the initial
+			// backdrop so the blend mode sees the correct destination. The
+			// transparent item still supplies the coverage mask.
+			var blended *image.RGBA
+			var blendedRelease func()
+			blendMode := it.Base().Blend
+			if base != nil && blendMode != "" && !strings.EqualFold(blendMode, "Normal") {
+				blended = image.NewRGBA(rr.out.Bounds())
+				if blendedRelease, err = rr.acquire(int64(len(blended.Pix))); err != nil {
+					itemRelease()
+					return err
+				}
+				draw.Draw(blended, blended.Bounds(), base, image.Point{}, draw.Src)
+				bchild := &regionRenderer{
+					ctx: rr.ctx, dl: rr.dl, out: blended, box: rr.box, scale: rr.scale,
+					pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+					clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+					memory: rr.memory, gray: rr.gray || grayBlendSpace(g.BlendColorSpace),
+				}
+				err = bchild.renderItem(it)
+				bchild.releaseAll()
+				if err != nil {
+					blendedRelease()
+					itemRelease()
+					return err
+				}
+			}
+			b := it.Base().Bounds
+			dst := pxRect(b, rr.pageToPx).Intersect(off.Bounds())
+			for y := dst.Min.Y; y < dst.Max.Y; y++ {
+				for x := dst.Min.X; x < dst.Max.X; x++ {
+					sp := item.RGBAAt(x, y)
+					sa := float64(sp.A) / 255
+					if sa <= 0 {
+						continue
+					}
+					if base == nil {
+						off.SetRGBA(x, y, sp)
+						continue
+					}
+					if blended != nil {
+						off.SetRGBA(x, y, blended.RGBAAt(x, y))
+						continue
+					}
+					bp := base.RGBAAt(x, y)
+					ba := float64(bp.A) / 255
+					oa := sa + ba*(1-sa)
+					if oa <= 0 {
+						continue
+					}
+					sr, sg, sb := float64(sp.R)/255/sa, float64(sp.G)/255/sa, float64(sp.B)/255/sa
+					br, bg, bb0 := 0.0, 0.0, 0.0
+					if ba > 0 {
+						br, bg, bb0 = float64(bp.R)/255/ba, float64(bp.G)/255/ba, float64(bp.B)/255/ba
+					}
+					r := (sr*sa + br*ba*(1-sa)) / oa
+					gg := (sg*sa + bg*ba*(1-sa)) / oa
+					bb := (sb*sa + bb0*ba*(1-sa)) / oa
+					off.SetRGBA(x, y, color.RGBA{
+						R: uint8(clamp01(r) * oa * 255),
+						G: uint8(clamp01(gg) * oa * 255),
+						B: uint8(clamp01(bb) * oa * 255),
+						A: uint8(clamp01(oa) * 255),
+					})
+				}
+			}
+			if blendedRelease != nil {
+				blendedRelease()
+			}
+			itemRelease()
+		}
+		rr.composite(off, image.Point{}, g.Clip, g.Blend)
+		return nil
+	}
 	// A non-isolated group blends its contents directly with the current
 	// backdrop. This approximates the PDF group model without an offscreen
 	// backdrop copy; isolated groups are rendered offscreen and composited.
+	if len(g.BlendProfile) > 0 {
+		if tr, err := pdfcolor.NewTransform(g.BlendProfile, g.BlendN); err == nil {
+			if done, err := rr.groupDevice(g, iccConverter{tr: tr}); done || err != nil {
+				return err
+			}
+		}
+	}
+	if !g.Knockout && cmykBlendSpace(g.BlendColorSpace) {
+		if len(rr.opts.CMYKProfile) > 0 {
+			if tr, err := pdfcolor.NewTransform(rr.opts.CMYKProfile, 4); err == nil {
+				if done, err := rr.groupDevice(g, iccConverter{tr: tr}); done || err != nil {
+					return err
+				}
+			}
+		}
+		if done, err := rr.groupDevice(g, cmykConverter{}); done || err != nil {
+			return err
+		}
+	}
 	if !g.Isolated && !g.Knockout {
 		off := image.NewRGBA(rr.out.Bounds())
-		draw.Draw(off, off.Bounds(), rr.out, image.Point{}, draw.Src)
+		release, err := rr.acquire(int64(len(off.Pix)))
+		if err != nil {
+			return err
+		}
+		defer release()
+		if g.Backdrop != nil {
+			draw.Draw(off, off.Bounds(), image.NewUniform(rr.solidColor(g.Backdrop.Color, g.Backdrop.Color[3])), image.Point{}, draw.Src)
+		} else {
+			draw.Draw(off, off.Bounds(), rr.out, image.Point{}, draw.Src)
+		}
 		child := &regionRenderer{
 			ctx: rr.ctx, dl: rr.dl, out: off, box: rr.box, scale: rr.scale,
 			pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
 			clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
-			softMask: rr.softMask,
+			softMask: rr.softMask, memory: rr.memory, gray: rr.gray || grayBlendSpace(g.BlendColorSpace),
 		}
+		defer child.releaseAll()
 		for _, it := range g.Items {
 			if rr.opts.Exclude != nil && rr.opts.Exclude(it) {
 				continue
@@ -149,6 +440,9 @@ func (rr *regionRenderer) group(g *displaylist.Group) error {
 		bbox := g.Bounds
 		if bbox.X1 <= bbox.X0 || bbox.Y1 <= bbox.Y0 {
 			bbox = displaylist.Rect{X0: rr.box.X0, Y0: rr.box.Y0, X1: rr.box.X1, Y1: rr.box.Y1}
+		}
+		if grayBlendSpace(g.BlendColorSpace) {
+			toGrayRGBA(off)
 		}
 		dst := pxRect(bbox, rr.pageToPx).Intersect(rr.out.Bounds())
 		if dst.Empty() {
@@ -162,11 +456,21 @@ func (rr *regionRenderer) group(g *displaylist.Group) error {
 		return nil
 	}
 	off := image.NewRGBA(rr.out.Bounds())
+	release, err := rr.acquire(int64(len(off.Pix)))
+	if err != nil {
+		return err
+	}
+	defer release()
+	if g.Backdrop != nil {
+		draw.Draw(off, off.Bounds(), image.NewUniform(rr.solidColor(g.Backdrop.Color, g.Backdrop.Color[3])), image.Point{}, draw.Src)
+	}
 	child := &regionRenderer{
 		ctx: rr.ctx, dl: rr.dl, out: off, box: rr.box, scale: rr.scale,
 		pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
 		clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+		memory: rr.memory, gray: rr.gray || grayBlendSpace(g.BlendColorSpace),
 	}
+	defer child.releaseAll()
 	for _, it := range g.Items {
 		if rr.opts.Exclude != nil && rr.opts.Exclude(it) {
 			continue
@@ -175,8 +479,674 @@ func (rr *regionRenderer) group(g *displaylist.Group) error {
 			return err
 		}
 	}
+	if g.Isolated && grayBlendSpace(g.BlendColorSpace) {
+		toGrayRGBA(off)
+	}
 	rr.composite(off, image.Point{}, g.Clip, g.Blend)
 	return nil
+}
+
+func cmykBlendSpace(name string) bool {
+	return name == "DeviceCMYK" || name == "CMYK"
+}
+
+type deviceConverter interface {
+	components() int
+	fromSRGB([4]float64) ([]float64, error)
+	toSRGB([]float64) ([4]float64, error)
+}
+
+var errDeviceFallback = errors.New("render: device-space conversion unavailable")
+
+type cmykConverter struct{}
+
+func (cmykConverter) components() int { return 4 }
+func (cmykConverter) fromSRGB(rgba [4]float64) ([]float64, error) {
+	c, m, y, k := rgbToCMYK(rgba[0], rgba[1], rgba[2])
+	return []float64{c, m, y, k}, nil
+}
+func (cmykConverter) toSRGB(vals []float64) ([4]float64, error) {
+	if len(vals) < 4 {
+		return [4]float64{}, errors.New("render: CMYK components")
+	}
+	r, g, b := cmykToRGB(vals[0], vals[1], vals[2], vals[3])
+	return [4]float64{r, g, b, 1}, nil
+}
+
+type iccConverter struct{ tr *pdfcolor.Transform }
+
+func (c iccConverter) components() int { return c.tr.Components() }
+func (c iccConverter) fromSRGB(rgba [4]float64) ([]float64, error) {
+	return c.tr.FromSRGB(rgba)
+}
+func (c iccConverter) toSRGB(vals []float64) ([4]float64, error) {
+	rgba, _, err := c.tr.ToSRGB(vals)
+	return rgba, err
+}
+
+func sourceDeviceFunc(conv deviceConverter, space string, profile []byte, n int) (func([]float64) ([]float64, error), bool) {
+	switch space {
+	case "DeviceCMYK":
+		if n != 4 {
+			return nil, false
+		}
+		if _, ok := conv.(cmykConverter); ok {
+			return func(vals []float64) ([]float64, error) {
+				if len(vals) != 4 {
+					return nil, errors.New("render: CMYK source components")
+				}
+				return []float64{vals[0], vals[1], vals[2], vals[3]}, nil
+			}, true
+		}
+		return func(vals []float64) ([]float64, error) {
+			if len(vals) != 4 {
+				return nil, errors.New("render: CMYK source components")
+			}
+			r, g, b := cmykToRGB(vals[0], vals[1], vals[2], vals[3])
+			return conv.fromSRGB([4]float64{r, g, b, 1})
+		}, true
+	case "DeviceRGB":
+		if n != 3 {
+			return nil, false
+		}
+		return func(vals []float64) ([]float64, error) {
+			if len(vals) != 3 {
+				return nil, errors.New("render: RGB source components")
+			}
+			return conv.fromSRGB([4]float64{vals[0], vals[1], vals[2], 1})
+		}, true
+	case "DeviceGray", "ImageMask":
+		if n != 1 {
+			return nil, false
+		}
+		return func(vals []float64) ([]float64, error) {
+			if len(vals) != 1 {
+				return nil, errors.New("render: gray source component")
+			}
+			return conv.fromSRGB([4]float64{vals[0], vals[0], vals[0], 1})
+		}, true
+	case "ICCBased":
+		if n != 1 && n != 3 && n != 4 {
+			return nil, false
+		}
+		tr, err := pdfcolor.NewTransform(profile, n)
+		if err != nil {
+			return nil, false
+		}
+		target, direct := conv.(iccConverter)
+		return func(vals []float64) ([]float64, error) {
+			if len(vals) != n {
+				return nil, errors.New("render: ICC source components")
+			}
+			if direct && target.tr != nil {
+				if pcs, err := tr.ToLabPCS(vals); err == nil {
+					if out, err := target.tr.FromLabPCS(pcs); err == nil {
+						return out, nil
+					}
+				}
+			}
+			rgba, _, err := tr.ToSRGB(vals)
+			if err != nil {
+				return nil, err
+			}
+			return conv.fromSRGB(rgba)
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func (rr *regionRenderer) groupImageSamples(im *displaylist.Image, conv deviceConverter, roi image.Rectangle, n, w, h int) ([]float32, []float32, func(), bool, error) {
+	ref, ok := im.Data.(displaylist.ImageSampleRef)
+	if !ok {
+		return nil, nil, nil, false, nil
+	}
+	samples, err := ref.DecodeSamples(rr.ctx)
+	if err != nil {
+		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
+			return nil, nil, nil, false, err
+		}
+		return nil, nil, nil, false, nil
+	}
+	defer samples.Close()
+	if samples.Width <= 0 || samples.Height <= 0 || samples.Components <= 0 {
+		return nil, nil, nil, false, nil
+	}
+	isMask := im.Info.ColorSpace == "ImageMask"
+	var convert func([]float64) ([]float64, error)
+	if !isMask {
+		convert, ok = sourceDeviceFunc(conv, samples.ColorSpace, samples.Profile, samples.Components)
+		if !ok {
+			return nil, nil, nil, false, nil
+		}
+	}
+	bbox := imageRect(im.Matrix, rr.pageToPx).Intersect(roi)
+	if bbox.Empty() {
+		return nil, nil, func() {}, true, nil
+	}
+	inv, ok := invert(im.Matrix)
+	if !ok {
+		return nil, nil, func() {}, true, nil
+	}
+	clip := rr.clipMask(im.Clip)
+	var maskImg image.Image
+	if im.Mask != nil && im.Mask.Image != nil && !im.Mask.IsColorKey {
+		maskImg, _, _ = decodeImage(rr.ctx, im.Mask.Image)
+	}
+	itemAcc := make([]float32, w*h*n)
+	itemAlpha := make([]float32, w*h)
+	release, err := rr.acquire(int64(len(itemAcc))*4 + int64(len(itemAlpha))*4)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	okOut := true
+	fail := func(err error) ([]float32, []float32, func(), bool, error) {
+		release()
+		return nil, nil, nil, false, err
+	}
+	alpha := fillAlpha(&im.Common)
+	sw, sh := samples.Width, samples.Height
+	for y := bbox.Min.Y; y < bbox.Max.Y; y++ {
+		for x := bbox.Min.X; x < bbox.Max.X; x++ {
+			p := displaylist.Point{X: rr.box.X0 + (float64(x)+0.5)/rr.scale, Y: rr.box.Y0 + (float64(y)+0.5)/rr.scale}
+			q := apply(inv, p.X, p.Y)
+			u, v := q.X, q.Y
+			if u < 0 || u >= 1 || v < 0 || v >= 1 {
+				continue
+			}
+			sx := int(u * float64(sw))
+			sy := int((1 - v) * float64(sh))
+			if sx < 0 || sx >= sw || sy < 0 || sy >= sh {
+				continue
+			}
+			var vals []float64
+			var a = alpha
+			if isMask {
+				a = fillAlpha(&im.Common) * (1 - clamp01(float64(samples.Data[(sy*sw+sx)*samples.Components])))
+				fill := [4]float64{0, 0, 0, 1}
+				if im.Fill != nil && im.Fill.Kind == displaylist.PaintSolid {
+					fill = im.Fill.RGBA
+				}
+				vals, err = conv.fromSRGB(fill)
+				if err != nil {
+					okOut = false
+					break
+				}
+			} else {
+				vals = make([]float64, samples.Components)
+				for j := 0; j < samples.Components; j++ {
+					vals[j] = float64(samples.Data[(sy*sw+sx)*samples.Components+j])
+				}
+				if im.Mask != nil {
+					if im.Mask.IsColorKey {
+						if colorKeySourceAlpha(im, vals) == 0 {
+							continue
+						}
+					} else {
+						a *= rr.maskAlpha(im, maskImg, u, v)
+					}
+				}
+				vals, err = convert(vals)
+				if err != nil {
+					okOut = false
+					break
+				}
+			}
+			if clip != nil {
+				a *= float64(clip.AlphaAt(x, y).A) / 255
+			}
+			if rr.mask != nil {
+				a *= float64(rr.mask.AlphaAt(x, y).A) / 255
+			}
+			if rr.softMask != nil {
+				a *= float64(rr.softMask.AlphaAt(x, y).A) / 255
+			}
+			if len(vals) != n {
+				okOut = false
+				break
+			}
+			i := (y-roi.Min.Y)*w + (x - roi.Min.X)
+			itemAlpha[i] = float32(clamp01(a))
+			for j := 0; j < n; j++ {
+				itemAcc[i*n+j] = float32(vals[j])
+			}
+		}
+		if !okOut {
+			break
+		}
+	}
+	if !okOut {
+		return fail(nil)
+	}
+	return itemAcc, itemAlpha, release, true, nil
+}
+
+func colorKeySourceAlpha(im *displaylist.Image, vals []float64) float64 {
+	if im.Mask == nil || len(im.Mask.ColorKey) < len(vals) {
+		return 1
+	}
+	for i, v := range vals {
+		if math.Abs(v-im.Mask.ColorKey[i]) > 1.0/255 {
+			return 1
+		}
+	}
+	return 0
+}
+
+// groupTextGlyphs renders a text run one glyph (and one fill/stroke operation)
+// at a time, converting each small tile into the group's device space. This
+// avoids flattening the whole run into one sRGB item while keeping per-glyph
+// memory bounded.
+func (rr *regionRenderer) groupTextGlyphs(t *displaylist.TextRun, conv deviceConverter, clips []displaylist.Clip, roi image.Rectangle, merge func(*image.RGBA, image.Point) error) (bool, error) {
+	if t == nil || t.Font == nil || len(t.Glyphs) == 0 {
+		return false, nil
+	}
+	if t.TextFlags&displaylist.TextInvisible != 0 || t.RenderMode == 3 || t.RenderMode < 0 || t.RenderMode > 7 {
+		return t.RenderMode == 3 || t.TextFlags&displaylist.TextInvisible != 0, nil
+	}
+	modes := []int{t.RenderMode}
+	if t.RenderMode == 2 {
+		modes = []int{0, 1}
+	}
+	const glyphScale = 0.001
+	for _, g := range t.Glyphs {
+		var seg []displaylist.Segment
+		var ok bool
+		if t.Font.GlyphSource != nil {
+			seg, ok = t.Font.GlyphSource.GlyphOutline(g.Code, g.CID)
+		}
+		if !ok && rr.opts.Fonts != nil {
+			var err error
+			seg, ok, err = rr.opts.Fonts.GlyphOutline(t.Font, g)
+			if err != nil {
+				return false, err
+			}
+		}
+		if !ok || len(seg) == 0 {
+			continue
+		}
+		pageM := mul(g.Matrix, displaylist.Matrix{glyphScale, 0, 0, glyphScale, 0, 0})
+		paths := flattenPath(seg, pageM, image.Point{})
+		if len(paths) == 0 {
+			continue
+		}
+		minX, minY := math.Inf(1), math.Inf(1)
+		maxX, maxY := math.Inf(-1), math.Inf(-1)
+		for _, pts := range paths {
+			for _, p := range pts {
+				if p.X < minX {
+					minX = p.X
+				}
+				if p.Y < minY {
+					minY = p.Y
+				}
+				if p.X > maxX {
+					maxX = p.X
+				}
+				if p.Y > maxY {
+					maxY = p.Y
+				}
+			}
+		}
+		if math.IsInf(minX, 1) {
+			continue
+		}
+		pageBox := displaylist.Rect{X0: minX, Y0: minY, X1: maxX, Y1: maxY}
+		pxBox := pxRect(pageBox, rr.pageToPx)
+		pad := int(math.Ceil(t.Size * rr.scale))
+		if containsInt(modes, 1) {
+			pad += int(math.Ceil(t.Line.Width * rr.scale / 2))
+		}
+		pxBox = image.Rect(pxBox.Min.X-pad, pxBox.Min.Y-pad, pxBox.Max.X+pad, pxBox.Max.Y+pad)
+		visible := pxBox.Intersect(roi)
+		if visible.Empty() {
+			continue
+		}
+		for _, mode := range modes {
+			tile := image.NewRGBA(image.Rect(0, 0, visible.Dx(), visible.Dy()))
+			release, err := rr.acquire(int64(len(tile.Pix)))
+			if err != nil {
+				return false, err
+			}
+			localToPx := mul(translate(float64(-visible.Min.X), float64(-visible.Min.Y)), rr.pageToPx)
+			child := &regionRenderer{
+				ctx: rr.ctx, dl: rr.dl, out: tile, box: rr.box, scale: rr.scale,
+				pageToPx: localToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+				clipList: clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+				mask: rr.mask, softMask: rr.softMask, memory: rr.memory,
+			}
+			one := *t
+			one.Glyphs = []displaylist.Glyph{g}
+			one.Spans = nil
+			one.Bounds = pageBox
+			one.RenderMode = mode
+			if mode == 0 {
+				one.Stroke = nil
+			}
+			err = child.renderItem(&one)
+			child.releaseAll()
+			if err == nil {
+				err = merge(tile, visible.Min)
+			}
+			release()
+			if err != nil {
+				if errors.Is(err, errDeviceFallback) {
+					return false, nil
+				}
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+
+func containsInt(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func (rr *regionRenderer) groupDevice(g *displaylist.Group, conv deviceConverter) (bool, error) {
+	n := conv.components()
+	if n <= 0 {
+		return false, nil
+	}
+	bbox := g.Bounds
+	if bbox.X1 <= bbox.X0 || bbox.Y1 <= bbox.Y0 {
+		bbox = displaylist.Rect{X0: rr.box.X0, Y0: rr.box.Y0, X1: rr.box.X1, Y1: rr.box.Y1}
+	}
+	roi := pxRect(bbox, rr.pageToPx).Intersect(rr.out.Bounds())
+	if roi.Empty() {
+		return true, nil
+	}
+	w, h := roi.Dx(), roi.Dy()
+	acc := make([]float32, w*h*n)
+	alpha := make([]float32, w*h)
+	release, err := rr.acquire(int64(len(acc))*4 + int64(len(alpha))*4)
+	if err != nil {
+		return true, err
+	}
+	defer release()
+	if !g.Isolated {
+		for y := roi.Min.Y; y < roi.Max.Y; y++ {
+			for x := roi.Min.X; x < roi.Max.X; x++ {
+				p := rr.out.RGBAAt(x, y)
+				i := (y-roi.Min.Y)*w + (x - roi.Min.X)
+				a := float64(p.A) / 255
+				if a > 0 {
+					sr, sg, sb := float64(p.R)/255/a, float64(p.G)/255/a, float64(p.B)/255/a
+					d, err := conv.fromSRGB([4]float64{sr, sg, sb, 1})
+					if err != nil || len(d) != n {
+						return false, nil
+					}
+					for j := 0; j < n; j++ {
+						acc[i*n+j] = float32(d[j])
+					}
+				}
+				alpha[i] = float32(a)
+			}
+		}
+	}
+	for _, it := range g.Items {
+		if rr.opts.Exclude != nil && rr.opts.Exclude(it) {
+			continue
+		}
+		if im, ok := it.(*displaylist.Image); ok && im.Data != nil {
+			if _, sampleRef := im.Data.(displaylist.ImageSampleRef); sampleRef {
+				child := &regionRenderer{
+					ctx: rr.ctx, dl: rr.dl, out: rr.out, box: rr.box, scale: rr.scale,
+					pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+					clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+					mask: rr.mask, softMask: rr.softMask, memory: rr.memory,
+				}
+				itemAcc, itemAlpha, itemRelease, ok, err := child.groupImageSamples(im, conv, roi, n, w, h)
+				child.releaseAll()
+				if err != nil {
+					return true, err
+				}
+				if ok {
+					for y := roi.Min.Y; y < roi.Max.Y; y++ {
+						for x := roi.Min.X; x < roi.Max.X; x++ {
+							i := (y-roi.Min.Y)*w + (x - roi.Min.X)
+							sa := float64(itemAlpha[i])
+							if sa <= 0 {
+								continue
+							}
+							da := float64(alpha[i])
+							oa := sa + da*(1-sa)
+							if oa <= 0 {
+								continue
+							}
+							for j := 0; j < n; j++ {
+								sd := float64(itemAcc[i*n+j])
+								dd := float64(acc[i*n+j])
+								acc[i*n+j] = float32((sd*sa + dd*da*(1-sa)) / oa)
+							}
+							alpha[i] = float32(oa)
+						}
+					}
+					if itemRelease != nil {
+						itemRelease()
+					}
+					continue
+				}
+				if itemRelease != nil {
+					itemRelease()
+				}
+			}
+		}
+		mergeItem := func(item *image.RGBA, at image.Point) error {
+			for yy := item.Rect.Min.Y; yy < item.Rect.Max.Y; yy++ {
+				y := yy + at.Y
+				if y < roi.Min.Y || y >= roi.Max.Y {
+					continue
+				}
+				for xx := item.Rect.Min.X; xx < item.Rect.Max.X; xx++ {
+					x := xx + at.X
+					if x < roi.Min.X || x >= roi.Max.X {
+						continue
+					}
+					sp := item.RGBAAt(xx, yy)
+					sa := float64(sp.A) / 255
+					if sa == 0 {
+						continue
+					}
+					i := (y-roi.Min.Y)*w + (x - roi.Min.X)
+					da := float64(alpha[i])
+					oa := sa + da*(1-sa)
+					if oa <= 0 {
+						continue
+					}
+					sr, sg, sb := float64(sp.R)/255/sa, float64(sp.G)/255/sa, float64(sp.B)/255/sa
+					sd, err := conv.fromSRGB([4]float64{sr, sg, sb, 1})
+					if err != nil || len(sd) != n {
+						return errDeviceFallback
+					}
+					for j := 0; j < n; j++ {
+						dd := float64(acc[i*n+j])
+						acc[i*n+j] = float32((sd[j]*sa + dd*da*(1-sa)) / oa)
+					}
+					alpha[i] = float32(oa)
+				}
+			}
+			return nil
+		}
+		renderItem := func(it displaylist.Item) error {
+			item := image.NewRGBA(rr.out.Bounds())
+			itemRelease, err := rr.acquire(int64(len(item.Pix)))
+			if err != nil {
+				return err
+			}
+			child := &regionRenderer{
+				ctx: rr.ctx, dl: rr.dl, out: item, box: rr.box, scale: rr.scale,
+				pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
+				clipList: g.Clips, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+				memory: rr.memory,
+			}
+			err = child.renderItem(it)
+			child.releaseAll()
+			if err == nil {
+				err = mergeItem(item, image.Point{})
+			}
+			itemRelease()
+			return err
+		}
+		// Text runs are composed one glyph at a time so each glyph is
+		// introduced into device space independently.
+		if tr, ok := it.(*displaylist.TextRun); ok {
+			handled, err := rr.groupTextGlyphs(tr, conv, g.Clips, roi, func(item *image.RGBA, at image.Point) error {
+				return mergeItem(item, at)
+			})
+			if err != nil {
+				return true, err
+			}
+			if handled {
+				continue
+			}
+		}
+		// Fill and stroke are separate painting operations. Split them so each
+		// is converted into the group's device space instead of being flattened
+		// into one sRGB item first.
+		if tr, ok := it.(*displaylist.TextRun); ok && tr.RenderMode == 2 && tr.Stroke != nil {
+			fill := *tr
+			fill.RenderMode = 0
+			fill.Stroke = nil
+			if err := renderItem(&fill); err != nil {
+				if errors.Is(err, errDeviceFallback) {
+					return false, nil
+				}
+				return true, err
+			}
+			stroke := *tr
+			stroke.RenderMode = 1
+			if err := renderItem(&stroke); err != nil {
+				if errors.Is(err, errDeviceFallback) {
+					return false, nil
+				}
+				return true, err
+			}
+			continue
+		}
+		if p, ok := it.(*displaylist.Path); ok && p.Fill != nil && p.Stroke != nil {
+			fill := *p
+			fill.Stroke = nil
+			if err := renderItem(&fill); err != nil {
+				if errors.Is(err, errDeviceFallback) {
+					return false, nil
+				}
+				return true, err
+			}
+			stroke := *p
+			stroke.Fill = nil
+			if err := renderItem(&stroke); err != nil {
+				if errors.Is(err, errDeviceFallback) {
+					return false, nil
+				}
+				return true, err
+			}
+			continue
+		}
+		if err := renderItem(it); err != nil {
+			if errors.Is(err, errDeviceFallback) {
+				return false, nil
+			}
+			return true, err
+		}
+	}
+	var mask *image.Alpha
+	if !g.Isolated {
+		mask = rr.clipMask(g.Clip)
+	}
+	var isolatedOut *image.RGBA
+	if g.Isolated {
+		isolatedOut = image.NewRGBA(rr.out.Bounds())
+		release, err := rr.acquire(int64(len(isolatedOut.Pix)))
+		if err != nil {
+			return true, err
+		}
+		defer release()
+	}
+	for y := roi.Min.Y; y < roi.Max.Y; y++ {
+		for x := roi.Min.X; x < roi.Max.X; x++ {
+			i := (y-roi.Min.Y)*w + (x - roi.Min.X)
+			a := float64(alpha[i])
+			if a <= 0 {
+				continue
+			}
+			if mask != nil {
+				a *= float64(mask.AlphaAt(x, y).A) / 255
+			}
+			vals := make([]float64, n)
+			for j := 0; j < n; j++ {
+				vals[j] = float64(acc[i*n+j])
+			}
+			rgba, err := conv.toSRGB(vals)
+			if err != nil {
+				return false, nil
+			}
+			dst := rr.out
+			if g.Isolated {
+				dst = isolatedOut
+			}
+			dst.SetRGBA(x, y, color.RGBA{
+				R: uint8(clamp01(rgba[0]) * 255), G: uint8(clamp01(rgba[1]) * 255),
+				B: uint8(clamp01(rgba[2]) * 255), A: uint8(clamp01(a) * 255),
+			})
+		}
+	}
+	if g.Isolated {
+		rr.composite(isolatedOut, image.Point{}, g.Clip, g.Blend)
+	}
+	return true, nil
+}
+
+func rgbToCMYK(r, g, b float64) (float64, float64, float64, float64) {
+	k := 1 - math.Max(r, math.Max(g, b))
+	if k >= 0.999 {
+		return 0, 0, 0, 1
+	}
+	return (1 - r - k) / (1 - k), (1 - g - k) / (1 - k), (1 - b - k) / (1 - k), k
+}
+
+func cmykToRGB(c, m, y, k float64) (float64, float64, float64) {
+	return (1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)
+}
+
+func grayBlendSpace(name string) bool {
+	return name == "DeviceGray" || name == "G" || name == "Gray"
+}
+
+func toGrayRGBA(img *image.RGBA) {
+	for y := img.Rect.Min.Y; y < img.Rect.Max.Y; y++ {
+		row := img.Pix[img.PixOffset(img.Rect.Min.X, y):img.PixOffset(img.Rect.Max.X, y)]
+		for i := 0; i+3 < len(row); i += 4 {
+			l := uint8((299*int(row[i]) + 587*int(row[i+1]) + 114*int(row[i+2]) + 500) / 1000)
+			row[i], row[i+1], row[i+2] = l, l, l
+		}
+	}
+}
+
+func fillAlpha(c *displaylist.Common) float64 {
+	if c != nil && c.PaintState != nil {
+		return c.PaintState.FillAlpha
+	}
+	if c != nil {
+		return c.Alpha
+	}
+	return 1
+}
+
+func strokeAlpha(c *displaylist.Common) float64 {
+	if c != nil && c.PaintState != nil {
+		return c.PaintState.StrokeAlpha
+	}
+	if c != nil {
+		return c.Alpha
+	}
+	return 1
 }
 
 type regionRenderer struct {
@@ -193,6 +1163,24 @@ type regionRenderer struct {
 	softMask  *image.Alpha
 	softMasks map[*displaylist.SoftMask]*image.Alpha
 	inMask    bool
+	memory    MemoryBudget
+	memErr    error
+	gray      bool
+	leases    []func()
+}
+
+func (rr *regionRenderer) acquire(n int64) (func(), error) {
+	if rr.memory == nil || n <= 0 {
+		return func() {}, nil
+	}
+	return rr.memory.AcquireMemory(n)
+}
+
+func (rr *regionRenderer) releaseAll() {
+	for i := len(rr.leases) - 1; i >= 0; i-- {
+		rr.leases[i]()
+	}
+	rr.leases = nil
 }
 
 func (rr *regionRenderer) path(p *displaylist.Path) error {
@@ -214,59 +1202,144 @@ func (rr *regionRenderer) path(p *displaylist.Path) error {
 		return nil
 	}
 	tmp := image.NewRGBA(image.Rect(0, 0, bbox.Dx(), bbox.Dy()))
+	release, err := rr.acquire(int64(len(tmp.Pix)))
+	if err != nil {
+		return err
+	}
+	defer release()
 	offset := image.Pt(bbox.Min.X, bbox.Min.Y)
 	if p.Fill != nil && p.Fill.Kind == displaylist.PaintPattern && p.Fill.Pattern != nil {
 		mask := rr.pathMask(p)
 		rr.pattern(p, mask)
 	} else if p.Fill != nil && p.Fill.Kind == displaylist.PaintSolid {
-		rr.fill(tmp, p.Segments, p.FillRule, p.Closed, solidColor(p.Fill.RGBA, p.Alpha), offset)
+		rr.fill(tmp, p.Segments, p.FillRule, p.Closed, rr.solidColor(p.Fill.RGBA, fillAlpha(&p.Common)), offset)
 	}
 	if p.Stroke != nil && p.Stroke.Kind == displaylist.PaintSolid {
-		rr.stroke(tmp, p.Segments, p.Stroke, p.Alpha, offset, p.Line, p.Closed)
+		rr.stroke(tmp, p.Segments, p.Stroke, strokeAlpha(&p.Common), offset, p.Line, p.Closed)
 	}
 	rr.composite(tmp, bbox.Min, p.Clip, p.Blend)
 	return nil
 }
 
 func (rr *regionRenderer) text(t *displaylist.TextRun) error {
-	if t == nil || t.Font == nil || t.Font.GlyphSource == nil || len(t.Glyphs) == 0 {
+	if t == nil || t.Font == nil || len(t.Glyphs) == 0 {
 		return nil
 	}
-	if t.TextFlags&displaylist.TextInvisible != 0 {
+	if t.Font.GlyphSource == nil && rr.opts.Fonts == nil {
+		return nil
+	}
+	mode := t.RenderMode
+	if mode < 0 || mode > 7 {
+		mode = 0
+	}
+	if mode == 3 || t.TextFlags&displaylist.TextInvisible != 0 {
+		return nil
+	}
+	fillMode := mode == 0 || mode == 2
+	strokeMode := mode == 1 || mode == 2
+	if !fillMode && !strokeMode {
+		// Text clipping modes (4-7) are not yet represented as a renderable
+		// text clip surface.
 		return nil
 	}
 	bbox := pxRect(t.Bounds, rr.pageToPx)
 	pad := int(math.Ceil(t.Size * rr.scale))
+	if strokeMode {
+		pad += int(math.Ceil(t.Line.Width * rr.scale / 2))
+	}
 	bbox = image.Rect(bbox.Min.X-pad, bbox.Min.Y-pad, bbox.Max.X+pad, bbox.Max.Y+pad)
 	bbox = bbox.Intersect(rr.out.Bounds())
 	if bbox.Empty() {
 		return nil
 	}
 	tmp := image.NewRGBA(image.Rect(0, 0, bbox.Dx(), bbox.Dy()))
+	release, err := rr.acquire(int64(len(tmp.Pix)))
+	if err != nil {
+		return err
+	}
+	defer release()
 	offset := image.Pt(bbox.Min.X, bbox.Min.Y)
-	var r vector.Rasterizer
-	r.Reset(tmp.Bounds().Dx(), tmp.Bounds().Dy())
+	var fillR, strokeR vector.Rasterizer
+	if fillMode {
+		fillR.Reset(tmp.Bounds().Dx(), tmp.Bounds().Dy())
+	}
+	if strokeMode {
+		strokeR.Reset(tmp.Bounds().Dx(), tmp.Bounds().Dy())
+	}
 	added := false
 	for _, g := range t.Glyphs {
-		seg, ok := t.Font.GlyphSource.GlyphOutline(g.Code, g.CID)
+		var seg []displaylist.Segment
+		var ok bool
+		if t.Font.GlyphSource != nil {
+			seg, ok = t.Font.GlyphSource.GlyphOutline(g.Code, g.CID)
+		}
+		if !ok && rr.opts.Fonts != nil {
+			var err error
+			seg, ok, err = rr.opts.Fonts.GlyphOutline(t.Font, g)
+			if err != nil {
+				return err
+			}
+		}
 		if !ok {
 			continue
 		}
 		const glyphScale = 0.001
 		m := mul(rr.pageToPx, mul(g.Matrix, displaylist.Matrix{glyphScale, 0, 0, glyphScale, 0, 0}))
-		addSegments(&r, seg, m, offset)
+		if fillMode {
+			addSegments(&fillR, seg, m, offset)
+		}
+		if strokeMode {
+			for _, pts := range flattenPath(seg, m, offset) {
+				strokePoints(&strokeR, pts, t.Line.Width*rr.scale/2, textLine(t.Line, rr.scale), true)
+			}
+		}
 		added = true
 	}
 	if !added {
 		return nil
 	}
-	fill := displaylist.Paint{RGBA: [4]float64{0, 0, 0, 1}}
-	if t.Fill.Kind == displaylist.PaintSolid {
-		fill = t.Fill
+	if fillMode {
+		fill := displaylist.Paint{RGBA: [4]float64{0, 0, 0, 1}}
+		if t.Fill.Kind == displaylist.PaintSolid {
+			fill = t.Fill
+		}
+		fillR.Draw(tmp, tmp.Bounds(), image.NewUniform(rr.solidColor(fill.RGBA, fillAlpha(&t.Common))), image.Point{})
 	}
-	r.Draw(tmp, tmp.Bounds(), image.NewUniform(solidColor(fill.RGBA, t.Alpha)), image.Point{})
+	if strokeMode {
+		stroke := displaylist.Paint{RGBA: [4]float64{0, 0, 0, 1}}
+		if t.Stroke != nil && t.Stroke.Kind == displaylist.PaintSolid {
+			stroke = *t.Stroke
+		}
+		strokeR.Draw(tmp, tmp.Bounds(), image.NewUniform(rr.solidColor(stroke.RGBA, strokeAlpha(&t.Common))), image.Point{})
+	}
 	rr.composite(tmp, bbox.Min, t.Clip, t.Blend)
 	return nil
+}
+
+func textLine(line displaylist.LineStyle, scale float64) displaylist.LineStyle {
+	if scale != 1 && scale > 0 {
+		if len(line.Dash) > 0 {
+			dash := make([]float64, len(line.Dash))
+			for i, d := range line.Dash {
+				dash[i] = d * scale
+			}
+			line.Dash = dash
+		}
+		line.Phase *= scale
+	}
+	return line
+}
+
+type leasedDecoder interface {
+	DecodeLease(context.Context) (image.Image, func(), error)
+}
+
+func decodeImage(ctx context.Context, ref displaylist.ImageRef) (image.Image, func(), error) {
+	if l, ok := ref.(leasedDecoder); ok {
+		return l.DecodeLease(ctx)
+	}
+	img, err := ref.Decode(ctx)
+	return img, func() {}, err
 }
 
 func (rr *regionRenderer) image(im *displaylist.Image) (err error) {
@@ -274,16 +1347,29 @@ func (rr *regionRenderer) image(im *displaylist.Image) (err error) {
 		return nil
 	}
 	isMask := im.Info.ColorSpace == "ImageMask"
-	decoded, err := im.Data.Decode(rr.ctx)
+	decoded, release, err := decodeImage(rr.ctx, im.Data)
+	if release != nil {
+		defer release()
+	}
+	if rr.gray && decoded != nil {
+		decoded = grayImage{decoded}
+	}
 	if err != nil {
 		if errors.Is(err, errs.ErrUnsupported) {
 			return errs.Wrap(errs.ErrUnsupported, "RND-IMAGE", "decode image", -1, 0, -1)
+		}
+		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
+			return err
 		}
 		return errs.Wrap(errs.ErrCorrupt, "RND-IMAGE", "decode image", -1, 0, -1)
 	}
 	var maskImg image.Image
 	if im.Mask != nil && im.Mask.Image != nil {
-		maskImg, _ = im.Mask.Image.Decode(rr.ctx)
+		var maskRelease func()
+		maskImg, maskRelease, _ = decodeImage(rr.ctx, im.Mask.Image)
+		if maskRelease != nil {
+			defer maskRelease()
+		}
 	}
 	bbox := imageRect(im.Matrix, rr.pageToPx).Intersect(rr.out.Bounds())
 	if bbox.Empty() {
@@ -296,7 +1382,7 @@ func (rr *regionRenderer) image(im *displaylist.Image) (err error) {
 	clip := rr.clipMask(im.Clip)
 	sb := decoded.Bounds()
 	sw, sh := float64(sb.Dx()), float64(sb.Dy())
-	alpha := im.Alpha
+	alpha := fillAlpha(&im.Common)
 	for y := bbox.Min.Y; y < bbox.Max.Y; y++ {
 		for x := bbox.Min.X; x < bbox.Max.X; x++ {
 			p := displaylist.Point{X: rr.box.X0 + (float64(x)+0.5)/rr.scale, Y: rr.box.Y0 + (float64(y)+0.5)/rr.scale}
@@ -318,7 +1404,7 @@ func (rr *regionRenderer) image(im *displaylist.Image) (err error) {
 				if im.Fill != nil && im.Fill.Kind == displaylist.PaintSolid {
 					fill = im.Fill.RGBA
 				}
-				src := solidColor(fill, alpha)
+				src := rr.solidColor(fill, alpha)
 				src = scaleColor(src, float64(ma)/65535)
 				r, g, b, a = uint32(src.R)*0x101, uint32(src.G)*0x101, uint32(src.B)*0x101, uint32(src.A)*0x101
 				oldA = a
@@ -430,7 +1516,7 @@ func (rr *regionRenderer) shading(s *displaylist.Shading) error {
 				t = 1
 			}
 			c := shadingColor(s.Stops, t)
-			a := float64(s.Alpha) * float64(c.A) / 255
+			a := fillAlpha(&s.Common) * float64(c.A) / 255
 			if clip != nil {
 				a *= float64(clip.AlphaAt(x, y).A) / 255
 			}
@@ -448,8 +1534,20 @@ func (rr *regionRenderer) shading(s *displaylist.Shading) error {
 
 func (rr *regionRenderer) pathMask(p *displaylist.Path) *image.Alpha {
 	m := image.NewAlpha(rr.out.Bounds())
+	release, err := rr.acquire(int64(len(m.Pix)))
+	if err != nil {
+		rr.memErr = err
+		return nil
+	}
+	rr.leases = append(rr.leases, release)
 	if p.FillRule == displaylist.EvenOdd {
 		tmp := image.NewRGBA(rr.out.Bounds())
+		tmpRelease, err := rr.acquire(int64(len(tmp.Pix)))
+		if err != nil {
+			rr.memErr = err
+			return nil
+		}
+		defer tmpRelease()
 		paths := flattenPath(p.Segments, rr.pageToPx, image.Point{})
 		if p.Closed {
 			for i := range paths {
@@ -479,10 +1577,10 @@ func (rr *regionRenderer) pathMask(p *displaylist.Path) *image.Alpha {
 			}
 		}
 	}
-	if p.Alpha < 1 {
+	if a := fillAlpha(&p.Common); a < 1 {
 		for y := 0; y < m.Bounds().Dy(); y++ {
 			for x := 0; x < m.Bounds().Dx(); x++ {
-				m.SetAlpha(x, y, color.Alpha{A: uint8(float64(m.AlphaAt(x, y).A) * p.Alpha)})
+				m.SetAlpha(x, y, color.Alpha{A: uint8(float64(m.AlphaAt(x, y).A) * a)})
 			}
 		}
 	}
@@ -567,7 +1665,7 @@ func (rr *regionRenderer) stroke(dst *image.RGBA, seg []displaylist.Segment, pai
 	for _, pts := range flattenPath(seg, rr.pageToPx, offset) {
 		strokePoints(&r, pts, half, line, closed)
 	}
-	r.Draw(dst, dst.Bounds(), image.NewUniform(solidColor(paint.RGBA, alpha)), image.Point{})
+	r.Draw(dst, dst.Bounds(), image.NewUniform(rr.solidColor(paint.RGBA, alpha)), image.Point{})
 }
 
 func (rr *regionRenderer) composite(src *image.RGBA, at image.Point, clip int, mode string) {
@@ -601,24 +1699,56 @@ func (rr *regionRenderer) clipMask(id int) *image.Alpha {
 	if m, ok := rr.clips[id]; ok {
 		return m
 	}
-	c := rr.clipList[id]
+	m, release := rr.clipValue(rr.clipList[id])
+	if m == nil {
+		return nil
+	}
+	rr.leases = append(rr.leases, release)
+	rr.clips[id] = m
+	return m
+}
+
+func (rr *regionRenderer) clipValue(c displaylist.Clip) (*image.Alpha, func()) {
 	m := image.NewAlpha(rr.out.Bounds())
+	release, err := rr.acquire(int64(len(m.Pix)))
+	if err != nil {
+		rr.memErr = err
+		return nil, func() {}
+	}
 	if c.Rule == displaylist.EvenOdd {
 		tmp := image.NewRGBA(rr.out.Bounds())
+		tmpRelease, err := rr.acquire(int64(len(tmp.Pix)))
+		if err != nil {
+			rr.memErr = err
+			release()
+			return nil, func() {}
+		}
 		fillEvenOdd(tmp, flattenPath(c.Path, rr.pageToPx, image.Point{}), color.RGBA{R: 255, G: 255, B: 255, A: 255})
 		for y := 0; y < rr.out.Bounds().Dy(); y++ {
 			for x := 0; x < rr.out.Bounds().Dx(); x++ {
 				m.SetAlpha(x, y, color.Alpha{A: tmp.RGBAAt(x, y).A})
 			}
 		}
+		tmpRelease()
 	} else {
 		var r vector.Rasterizer
 		r.Reset(rr.out.Bounds().Dx(), rr.out.Bounds().Dy())
 		addSegments(&r, c.Path, rr.pageToPx, image.Point{})
 		r.Draw(m, m.Bounds(), image.NewUniform(color.Alpha{A: 255}), image.Point{})
 	}
-	rr.clips[id] = m
-	return m
+	for _, sub := range c.Intersect {
+		sm, subRelease := rr.clipValue(sub)
+		if sm == nil {
+			continue
+		}
+		for y := 0; y < m.Bounds().Dy(); y++ {
+			for x := 0; x < m.Bounds().Dx(); x++ {
+				m.SetAlpha(x, y, color.Alpha{A: uint8(float64(m.AlphaAt(x, y).A) * float64(sm.AlphaAt(x, y).A) / 255)})
+			}
+		}
+		subRelease()
+	}
+	return m, release
 }
 
 func translate(x, y float64) displaylist.Matrix {
@@ -860,6 +1990,29 @@ func addSegments(r *vector.Rasterizer, seg []displaylist.Segment, m displaylist.
 			r.ClosePath()
 		}
 	}
+}
+
+type grayImage struct{ image.Image }
+
+func (g grayImage) At(x, y int) color.Color {
+	r, gg, b, a := g.Image.At(x, y).RGBA()
+	if a == 0 {
+		return color.NRGBA{}
+	}
+	// RGBA() is premultiplied; undo it before computing luminance.
+	r = r * 0xffff / a
+	gg = gg * 0xffff / a
+	b = b * 0xffff / a
+	l := uint8((299*r + 587*gg + 114*b) / 1000 >> 8)
+	return color.NRGBA{R: l, G: l, B: l, A: uint8(a >> 8)}
+}
+
+func (rr *regionRenderer) solidColor(rgba [4]float64, alpha float64) color.RGBA {
+	if rr != nil && rr.gray {
+		l := 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+		rgba[0], rgba[1], rgba[2] = l, l, l
+	}
+	return solidColor(rgba, alpha)
 }
 
 func solidColor(rgba [4]float64, alpha float64) color.RGBA {
@@ -1547,26 +2700,43 @@ func minInt(a, b int) int {
 	return b
 }
 
-func (rr *regionRenderer) softMaskFor(sm *displaylist.SoftMask) *image.Alpha {
+func (rr *regionRenderer) softMaskFor(sm *displaylist.SoftMask) (*image.Alpha, error) {
 	if sm == nil {
-		return nil
+		return nil, nil
 	}
 	if m, ok := rr.softMasks[sm]; ok {
-		return m
+		return m, nil
 	}
 	maskRGBA := image.NewRGBA(rr.out.Bounds())
+	if sm.HasBackdrop {
+		draw.Draw(maskRGBA, maskRGBA.Bounds(), image.NewUniform(solidColor(sm.Backdrop, sm.Backdrop[3])), image.Point{}, draw.Src)
+	}
+	maskRelease, err := rr.acquire(int64(len(maskRGBA.Pix)))
+	if err != nil {
+		return nil, err
+	}
+	defer maskRelease()
 	child := &regionRenderer{
 		ctx: rr.ctx, dl: rr.dl, out: maskRGBA, box: rr.box, scale: rr.scale,
 		pageToPx: rr.pageToPx, opts: rr.opts, clips: map[int]*image.Alpha{},
 		clipList: sm.Clips, inMask: true, softMasks: map[*displaylist.SoftMask]*image.Alpha{},
+		memory: rr.memory,
 	}
+	defer child.releaseAll()
 	for _, it := range sm.Items {
 		if rr.opts.Exclude != nil && rr.opts.Exclude(it) {
 			continue
 		}
-		_ = child.renderItem(it)
+		if err := child.renderItem(it); err != nil {
+			return nil, err
+		}
 	}
 	m := image.NewAlpha(rr.out.Bounds())
+	release, err := rr.acquire(int64(len(m.Pix)))
+	if err != nil {
+		return nil, err
+	}
+	rr.leases = append(rr.leases, release)
 	for y := 0; y < rr.out.Bounds().Dy(); y++ {
 		for x := 0; x < rr.out.Bounds().Dx(); x++ {
 			page := displaylist.Point{X: rr.box.X0 + (float64(x)+0.5)/rr.scale, Y: rr.box.Y0 + (float64(y)+0.5)/rr.scale}
@@ -1582,5 +2752,21 @@ func (rr *regionRenderer) softMaskFor(sm *displaylist.SoftMask) *image.Alpha {
 		}
 	}
 	rr.softMasks[sm] = m
-	return m
+	return m, nil
+}
+
+func annotationVisible(a displaylist.Annotation, mode AnnotationMode) bool {
+	const (
+		flagInvisible = 1
+		flagHidden    = 2
+		flagPrint     = 4
+		flagNoView    = 32
+	)
+	if a.Flags&(flagInvisible|flagHidden) != 0 {
+		return false
+	}
+	if mode == AnnotationPrint {
+		return a.Flags&flagPrint != 0
+	}
+	return mode == AnnotationView && a.Flags&flagNoView == 0
 }

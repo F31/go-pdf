@@ -1,19 +1,34 @@
 package displaylist
 
 import (
-	"encoding/binary"
-	"hash/fnv"
 	"math"
+)
+
+const (
+	fnvOffset uint64 = 14695981039346656037
+	fnvPrime  uint64 = 1099511628211
 )
 
 // Signature returns a stable content signature for cross-page duplicate
 // detection. Geometry is measured relative to the item's Bounds origin so the
 // same visual element at different positions has the same signature.
 func Signature(it Item) uint64 {
-	w := &sigWriter{h: fnv.New64a()}
+	w := &sigWriter{h: fnvOffset}
 	c := it.Base()
 	w.f(c.Alpha)
 	w.s(c.Blend)
+	w.s(c.Layer)
+	if c.PaintState != nil {
+		w.s("paint-state")
+		w.f(c.PaintState.FillAlpha)
+		w.f(c.PaintState.StrokeAlpha)
+		w.b(c.PaintState.FillOverprint)
+		w.b(c.PaintState.StrokeOverprint)
+		w.i(c.PaintState.OverprintMode)
+		w.s(c.PaintState.RenderingIntent)
+	} else {
+		w.s("no-paint-state")
+	}
 	ox, oy := c.Bounds.X0, c.Bounds.Y0
 	switch v := it.(type) {
 	case *TextRun:
@@ -36,6 +51,14 @@ func Signature(it Item) uint64 {
 		w.f(v.HScale)
 		w.f(v.Rise)
 		w.i(int(v.TextFlags))
+		for _, sp := range v.Spans {
+			w.s(sp.Text)
+			w.i(sp.GlyphStart)
+			w.i(sp.GlyphEnd)
+			w.b(sp.ActualText)
+			w.i(sp.MCID)
+			w.i(sp.StructRef)
+		}
 		for _, g := range v.Glyphs {
 			w.s(g.Text)
 			w.b(g.UnicodeOK)
@@ -125,8 +148,7 @@ func Signature(it Item) uint64 {
 		}
 		w.b(v.Extend[0])
 		w.b(v.Extend[1])
-		w.u(uint64(len(v.Raw)))
-		w.h.Write(v.Raw)
+		w.bytes(v.Raw)
 		w.i(v.BitsPerCoordinate)
 		w.i(v.BitsPerComponent)
 		w.i(v.BitsPerFlag)
@@ -160,29 +182,39 @@ func Signature(it Item) uint64 {
 	default:
 		w.s("item")
 	}
-	return w.h.Sum64()
+	return w.h
 }
 
 type sigWriter struct {
-	h interface {
-		Write([]byte) (int, error)
-		Sum64() uint64
-	}
+	h uint64
 }
 
 func (w *sigWriter) b(v bool) {
 	if v {
-		w.h.Write([]byte{1})
+		w.h ^= 1
+		w.h *= fnvPrime
 	} else {
-		w.h.Write([]byte{0})
+		w.h ^= 0
+		w.h *= fnvPrime
 	}
 }
 
 func (w *sigWriter) i(v int) { w.u(uint64(v)) }
+
 func (w *sigWriter) u(v uint64) {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], v)
-	w.h.Write(b[:])
+	for i := 0; i < 8; i++ {
+		w.h ^= uint64(byte(v))
+		w.h *= fnvPrime
+		v >>= 8
+	}
+}
+
+func (w *sigWriter) bytes(v []byte) {
+	w.u(uint64(len(v)))
+	for _, b := range v {
+		w.h ^= uint64(b)
+		w.h *= fnvPrime
+	}
 }
 
 func (w *sigWriter) f(v float64) {
@@ -194,7 +226,10 @@ func (w *sigWriter) f(v float64) {
 
 func (w *sigWriter) s(v string) {
 	w.u(uint64(len(v)))
-	w.h.Write([]byte(v))
+	for i := 0; i < len(v); i++ {
+		w.h ^= uint64(v[i])
+		w.h *= fnvPrime
+	}
 }
 
 func (w *sigWriter) pt(p Point, ox, oy float64) {
@@ -228,8 +263,7 @@ func (w *sigWriter) paint(p Paint) {
 		for _, v := range p.Pattern.Base {
 			w.f(v)
 		}
-		w.u(uint64(len(p.Pattern.Content)))
-		w.h.Write(p.Pattern.Content)
+		w.bytes(p.Pattern.Content)
 	}
 	w.b(p.Approx)
 }

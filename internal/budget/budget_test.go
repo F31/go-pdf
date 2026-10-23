@@ -88,3 +88,32 @@ func TestConcurrentCounters(t *testing.T) {
 		t.Fatalf("objects=%d decoded=%d", tr.Objects(), tr.Decoded())
 	}
 }
+
+func TestLiveMemory(t *testing.T) {
+	b := DefaultBudget
+	b.MaxLiveBytes = 10
+	tr := NewTracker(&b)
+	r1, err := tr.Acquire(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := tr.Acquire(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Live() != 10 || tr.Peak() != 10 {
+		t.Fatalf("live=%d peak=%d", tr.Live(), tr.Peak())
+	}
+	if _, err := tr.Acquire(1); !errors.Is(err, errs.ErrBudget) {
+		t.Fatalf("got %v", err)
+	}
+	r2()
+	r2()
+	if tr.Live() != 4 {
+		t.Fatalf("live=%d", tr.Live())
+	}
+	r1()
+	if tr.Live() != 0 {
+		t.Fatalf("live=%d", tr.Live())
+	}
+}

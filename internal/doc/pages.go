@@ -74,7 +74,7 @@ func (d *Document) loadPages(ctx context.Context) error {
 			if typ == "" {
 				d.file.Diag().Add(diag.Diagnostic{Level: diag.Warn, Code: "DOC-PAGE-TYPE", Msg: "page node missing Type", Page: -1, Offset: -1})
 			}
-			p, err := d.makePage(ctx, len(d.pages), node, inh)
+			p, err := d.makePage(ctx, len(d.pages), node, fr.ref, inh)
 			if err != nil {
 				return err
 			}
@@ -167,7 +167,7 @@ func (d *Document) applyInherited(ctx context.Context, in inherited, node syntax
 	return out, nil
 }
 
-func (d *Document) makePage(ctx context.Context, index int, node syntax.Dict, inh inherited) (*Page, error) {
+func (d *Document) makePage(ctx context.Context, index int, node syntax.Dict, ref syntax.Ref, inh inherited) (*Page, error) {
 	media := inh.media
 	if !inh.haveMedia {
 		media = Box{0, 0, 612, 792}
@@ -196,7 +196,7 @@ func (d *Document) makePage(ctx context.Context, index int, node syntax.Dict, in
 		w, h = h, w
 	}
 	p := &Page{
-		doc: d, index: index, dict: node, resources: inh.resources,
+		doc: d, ref: ref, index: index, dict: node, resources: inh.resources,
 		media: media, crop: crop, rotate: rotate, userUnit: unit,
 		width: w * unit, height: h * unit,
 	}
@@ -360,6 +360,8 @@ func (p *Page) Interpret(ctx context.Context, emit func(displaylist.Item) error)
 		MediaBox: displaylist.Rect{X0: info.MediaBox.X0, Y0: info.MediaBox.Y0, X1: info.MediaBox.X1, Y1: info.MediaBox.Y1},
 		CropBox:  displaylist.Rect{X0: info.CropBox.X0, Y0: info.CropBox.Y0, X1: info.CropBox.X1, Y1: info.CropBox.Y1},
 		File:     p.doc.file, Fonts: p.doc.fonts, Tracker: tracker, Diag: dc, OC: p.doc.oc,
-		PreserveForms: p.doc.opts.PreserveForms,
+		Lease:         p.doc.acquireLease,
+		PreserveForms: p.doc.opts.PreserveForms, Decoders: p.doc.opts.Decoders,
+		ColorManager: p.doc.opts.ColorManager, OCNames: p.doc.ocNames,
 	}, emit)
 }

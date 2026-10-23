@@ -6,11 +6,14 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync"
 
+	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/budget"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/doc"
 	"github.com/F31/go-pdf/internal/errs"
+	pdfimage "github.com/F31/go-pdf/internal/image"
 	"github.com/F31/go-pdf/internal/syntax"
 )
 
@@ -21,6 +24,25 @@ type Document struct {
 	tracker *budget.Tracker
 	diag    *diag.Collector
 	budget  *budget.Budget
+
+	structureMu   sync.Mutex
+	structure     []StructElement
+	structureDone bool
+	structureErr  error
+
+	release     func()
+	releaseOnce sync.Once
+	dataRelease func()
+	dataOnce    sync.Once
+}
+
+// ResourceUsage is a point-in-time view of document resource accounting.
+type ResourceUsage struct {
+	LiveBytes    int64
+	PeakBytes    int64
+	DecodedBytes int64
+	Objects      int64
+	MaxLiveBytes int64
 }
 
 func OpenFile(ctx context.Context, path string, opts ...Option) (*Document, error) {
@@ -43,11 +65,17 @@ func OpenFile(ctx context.Context, path string, opts ...Option) (*Document, erro
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "SYN-CANCELED", "open file", -1, 0, -1)
 	}
-	data, err := readAll(f, st.Size())
+	data, dataRelease, err := mapReadOnly(f, st.Size())
 	if err != nil {
 		return nil, errs.Wrap(err, "SYN-READ", "read file", -1, 0, -1)
 	}
-	return openData(ctx, data, o)
+	doc, err := openData(ctx, data, o)
+	if err != nil {
+		dataRelease()
+		return nil, err
+	}
+	doc.dataRelease = dataRelease
+	return doc, nil
 }
 
 func Open(ctx context.Context, r io.ReaderAt, size int64, opts ...Option) (*Document, error) {
@@ -63,6 +91,19 @@ func Open(ctx context.Context, r io.ReaderAt, size int64, opts ...Option) (*Docu
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "SYN-CANCELED", "open reader", -1, 0, -1)
+	}
+	if f, ok := r.(*os.File); ok {
+		data, release, err := mapReadOnly(f, size)
+		if err != nil {
+			return nil, errs.Wrap(err, "SYN-READ", "read reader", -1, 0, -1)
+		}
+		doc, err := openData(ctx, data, o)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		doc.dataRelease = release
+		return doc, nil
 	}
 	data, err := readAll(r, size)
 	if err != nil {
@@ -92,20 +133,34 @@ func openData(ctx context.Context, data []byte, o options) (*Document, error) {
 	ctx = budget.WithTracker(ctx, tracker)
 	ctx = diag.WithCollector(ctx, collector)
 
-	file, err := syntax.Open(ctx, data, syntax.Options{
-		Repair: o.repair, Tracker: tracker, Diag: collector,
-	})
+	release, err := tracker.Acquire(int64(len(data)))
 	if err != nil {
 		return nil, err
 	}
-	inner, err := doc.Open(ctx, file, doc.Options{
-		Repair: o.repair, IncludeHidden: o.hidden, PreserveForms: o.forms, Tracker: tracker, Diag: collector,
+	file, err := syntax.Open(ctx, data, syntax.Options{
+		Repair: o.repair, Password: o.password, Tracker: tracker, Diag: collector,
 	})
 	if err != nil {
+		release()
+		return nil, err
+	}
+	var decoders pdfimage.DecoderLookup
+	if o.decoders != nil {
+		reg := o.decoders
+		decoders = func(ctx context.Context, enc displaylist.ImageEncoding, info displaylist.ImageInfo) (pdfimage.ExternalDecoder, error) {
+			return reg.decoder(ctx, enc, info)
+		}
+	}
+	inner, err := doc.Open(ctx, file, doc.Options{
+		Repair: o.repair, IncludeHidden: o.hidden, PreserveForms: o.forms,
+		Decoders: decoders, ColorManager: o.colorManager, Tracker: tracker, Diag: collector,
+	})
+	if err != nil {
+		release()
 		_ = file.Close()
 		return nil, err
 	}
-	return &Document{inner: inner, tracker: tracker, diag: collector, budget: o.budget}, nil
+	return &Document{inner: inner, tracker: tracker, diag: collector, budget: o.budget, release: release}, nil
 }
 
 func (d *Document) NumPages() int {
@@ -159,6 +214,14 @@ func (d *Document) Repaired() bool {
 	return d.inner.Repaired()
 }
 
+// PageLabel returns the label for a zero-based page index.
+func (d *Document) PageLabel(ctx context.Context, index int) (string, error) {
+	if d == nil || d.inner == nil {
+		return "", nil
+	}
+	return d.inner.PageLabel(ctx, index), nil
+}
+
 func (d *Document) Encrypted() bool {
 	if d == nil || d.inner == nil {
 		return false
@@ -182,7 +245,31 @@ func (d *Document) Close() error {
 	if d == nil || d.inner == nil {
 		return nil
 	}
-	return d.inner.Close()
+	err := d.inner.Close()
+	d.releaseOnce.Do(func() {
+		if d.release != nil {
+			d.release()
+		}
+	})
+	d.dataOnce.Do(func() {
+		if d.dataRelease != nil {
+			d.dataRelease()
+		}
+	})
+	return err
+}
+
+// ResourceUsage reports live, peak, decoded and object counts. LiveBytes drops
+// after Close; PeakBytes remains as the high-water mark.
+func (d *Document) ResourceUsage() ResourceUsage {
+	if d == nil || d.tracker == nil {
+		return ResourceUsage{}
+	}
+	return ResourceUsage{
+		LiveBytes: d.tracker.Live(), PeakBytes: d.tracker.Peak(),
+		DecodedBytes: d.tracker.Decoded(), Objects: d.tracker.Objects(),
+		MaxLiveBytes: d.tracker.Budget().MaxLiveBytes,
+	}
 }
 
 type Info struct {

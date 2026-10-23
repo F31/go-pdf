@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/F31/go-pdf/displaylist"
@@ -74,14 +75,7 @@ func TestBudgetOption(t *testing.T) {
 }
 
 func TestEncryptedPublic(t *testing.T) {
-	objs := []testkit.Obj{
-		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
-		testkit.Raw(4, "<< /Filter /Standard /V 1 /R 2 >>"),
-	}
-	data := testkit.Build(objs, "/Root 1 0 R /Encrypt 4 0 R")
-	_, err := Open(context.Background(), bytes.NewReader(data), int64(len(data)))
+	_, err := OpenFile(context.Background(), "testdata/encrypted/rc4-128.pdf")
 	if !errors.Is(err, ErrPassword) {
 		t.Fatalf("got %v", err)
 	}
@@ -166,4 +160,94 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestResourceUsage(t *testing.T) {
+	d := openTest(t, testkit.Basic("0 0 10 10"))
+	u := d.ResourceUsage()
+	if u.LiveBytes <= 0 || u.PeakBytes < u.LiveBytes || u.MaxLiveBytes <= 0 {
+		t.Fatalf("usage %#v", u)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	u = d.ResourceUsage()
+	if u.LiveBytes != 0 || u.PeakBytes <= 0 {
+		t.Fatalf("after close %#v", u)
+	}
+}
+
+func TestLiveMemoryBudget(t *testing.T) {
+	data := testkit.Basic("0 0 10 10")
+	b := DefaultBudget
+	b.MaxLiveBytes = 1
+	_, err := Open(context.Background(), bytes.NewReader(data), int64(len(data)), WithBudget(&b))
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestPreflight(t *testing.T) {
+	d := openTest(t, testkit.Basic("0 0 10 10"))
+	rep, err := d.Preflight(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Pages != 1 || rep.Scanned != 1 {
+		t.Fatalf("pages %#v", rep)
+	}
+	if rep.Domains[DomainExtract].Status != CapabilitySupported {
+		t.Fatalf("extract %#v", rep.Domains[DomainExtract])
+	}
+	if rep.Domains[DomainRender].Status != CapabilityApproximate {
+		t.Fatalf("render %#v", rep.Domains[DomainRender])
+	}
+	if rep.Domains[DomainEdit].Status != CapabilityUnsupported {
+		t.Fatalf("edit %#v", rep.Domains[DomainEdit])
+	}
+}
+
+func TestPageMemoryLease(t *testing.T) {
+	d := openTest(t, testkit.Basic("0 0 10 10"))
+	p, _ := d.Page(0)
+	before := d.ResourceUsage().LiveBytes
+	release, err := p.AcquireMemory(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.ResourceUsage().LiveBytes != before+128 {
+		t.Fatalf("live %#v", d.ResourceUsage())
+	}
+	release()
+	if d.ResourceUsage().LiveBytes != before {
+		t.Fatalf("release %#v", d.ResourceUsage())
+	}
+}
+
+func TestOpenFileMappedAndReleased(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "mapped-*.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := testkit.Basic("0 0 10 10")
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := OpenFile(context.Background(), f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := d.ResourceUsage()
+	if u.LiveBytes < int64(len(data)) || u.PeakBytes < u.LiveBytes {
+		t.Fatalf("usage %#v", u)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.ResourceUsage().LiveBytes; got != 0 {
+		t.Fatalf("live after close %d", got)
+	}
 }

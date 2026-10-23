@@ -154,3 +154,19 @@ func (c *Collector) Dropped() int {
 func AddContext(ctx context.Context, d Diagnostic) {
 	From(ctx).Add(d)
 }
+
+// ForPage returns diagnostics for one page without copying the full list.
+func (c *Collector) ForPage(page int) []Diagnostic {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]Diagnostic, 0, 8)
+	for _, d := range c.items {
+		if d.Page == page {
+			out = append(out, d)
+		}
+	}
+	return out
+}

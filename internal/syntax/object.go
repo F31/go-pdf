@@ -26,6 +26,7 @@ type Stream struct {
 	Dict   Dict
 	Raw    []byte
 	Offset int64
+	Ref    Ref
 }
 
 type Ref struct {

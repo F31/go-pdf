@@ -119,25 +119,15 @@ func TestEncryptedDetection(t *testing.T) {
 		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
 		testkit.Raw(4, "<< /Filter /Standard /V 2 /R 3 >>"),
 	}
-	data := testkit.Build(objs, "/Root 1 0 R /Encrypt 4 0 R")
 	b := budget.DefaultBudget
 	tr := budget.NewTracker(&b)
-	f, err := syntax.Open(context.Background(), data, syntax.Options{Tracker: tr, Diag: diag.New(100)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if _, err := Open(context.Background(), f, Options{Tracker: tr}); !errors.Is(err, errs.ErrPassword) {
+	_, err := syntax.Open(context.Background(), testkit.Build(objs, "/Root 1 0 R /Encrypt 4 0 R"), syntax.Options{Tracker: tr, Diag: diag.New(100)})
+	if !errors.Is(err, errs.ErrCorrupt) {
 		t.Fatalf("got %v", err)
 	}
-
 	objs[3] = testkit.Raw(4, "<< /Filter /Adobe.PubSec >>")
-	f2, err := syntax.Open(context.Background(), testkit.Build(objs, "/Root 1 0 R /Encrypt 4 0 R"), syntax.Options{Tracker: tr, Diag: diag.New(100)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f2.Close()
-	if _, err := Open(context.Background(), f2, Options{Tracker: tr}); !errors.Is(err, errs.ErrUnsupported) {
+	_, err = syntax.Open(context.Background(), testkit.Build(objs, "/Root 1 0 R /Encrypt 4 0 R"), syntax.Options{Tracker: tr, Diag: diag.New(100)})
+	if !errors.Is(err, errs.ErrUnsupported) {
 		t.Fatalf("got %v", err)
 	}
 }

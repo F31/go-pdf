@@ -6,6 +6,7 @@ package budget
 import (
 	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"github.com/F31/go-pdf/internal/errs"
@@ -33,6 +34,7 @@ type Budget struct {
 	MaxFunctionSteps int64
 	MaxConcurrency   int
 	MaxRasterPixels  int64
+	MaxLiveBytes     int64
 }
 
 // DefaultBudget is the starting point from design section 15.1. Values are
@@ -53,6 +55,7 @@ var DefaultBudget = Budget{
 	MaxFunctionSteps: 100_000,
 	MaxConcurrency:   runtime.GOMAXPROCS(0),
 	MaxRasterPixels:  64 * 1_000_000,
+	MaxLiveBytes:     1 * GiB,
 }
 
 // Clone returns a copy so callers cannot mutate a shared budget.
@@ -91,6 +94,8 @@ type Tracker struct {
 	budget  *Budget
 	objects atomic.Int64
 	decoded atomic.Int64
+	live    atomic.Int64
+	peak    atomic.Int64
 }
 
 func NewTracker(b *Budget) *Tracker {
@@ -104,6 +109,36 @@ func (t *Tracker) Budget() *Budget { return t.budget }
 
 func (t *Tracker) Objects() int64 { return t.objects.Load() }
 func (t *Tracker) Decoded() int64 { return t.decoded.Load() }
+func (t *Tracker) Live() int64    { return t.live.Load() }
+func (t *Tracker) Peak() int64    { return t.peak.Load() }
+
+// Acquire reserves n bytes of live memory. The returned release function is
+// idempotent. Callers must release when the allocation is no longer retained.
+func (t *Tracker) Acquire(n int64) (func(), error) {
+	if n < 0 {
+		return nil, errs.Wrap(errs.ErrBudget, "BUD-LIVE-BYTES", "reserve live memory", -1, 0, -1)
+	}
+	if n == 0 {
+		return func() {}, nil
+	}
+	for {
+		cur := t.live.Load()
+		next := cur + n
+		if t.budget.MaxLiveBytes > 0 && next > t.budget.MaxLiveBytes {
+			return nil, errs.Wrap(errs.ErrBudget, "BUD-LIVE-MEMORY", "reserve live memory", -1, 0, -1)
+		}
+		if t.live.CompareAndSwap(cur, next) {
+			for {
+				p := t.peak.Load()
+				if next <= p || t.peak.CompareAndSwap(p, next) {
+					break
+				}
+			}
+			var once sync.Once
+			return func() { once.Do(func() { t.live.Add(-n) }) }, nil
+		}
+	}
+}
 
 // CheckFileSize enforces MaxFileSize.
 func (t *Tracker) CheckFileSize(n int64) error {

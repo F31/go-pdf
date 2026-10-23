@@ -13,7 +13,7 @@ license review. Current dependencies are listed below.
 | --- | --- | --- | --- | --- |
 | Go standard library | toolchain | BSD-3-Clause | Runtime and tests | https://go.dev/ |
 | `golang.org/x/image` | v0.39.0 | BSD-3-Clause | `font/sfnt` metrics/outlines, `ccitt` G3/G4 decoding, and `vector` region rasterization | https://pkg.go.dev/golang.org/x/image |
-| `golang.org/x/text` | v0.36.0 | BSD-3-Clause | Transitive dependency of `x/image/font/sfnt` | https://pkg.go.dev/golang.org/x/text |
+| `golang.org/x/text` | v0.39.0 | BSD-3-Clause | Unicode NFKC/SASLprep normalization for AES-256 passwords; also transitive for `x/image/font/sfnt` | https://pkg.go.dev/golang.org/x/text |
 
 ## Embedded resources
 

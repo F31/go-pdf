@@ -19,15 +19,53 @@ type Space interface {
 	RGBA(vals []float64) ([4]float64, bool, error)
 }
 
+// Manager optionally converts PDF color components to sRGB. profile is the
+// decoded ICC stream for ICCBased spaces and nil otherwise.
+type Manager interface {
+	Convert(space string, profile []byte, n int, values []float64) ([4]float64, bool, error)
+}
+
+type approxReporter interface {
+	Approximate(space string) bool
+}
+
+type managedSpace struct {
+	base    Space
+	manager Manager
+	name    string
+	profile []byte
+	n       int
+}
+
+func (m managedSpace) Name() string    { return m.name }
+func (m managedSpace) Components() int { return m.n }
+func (m managedSpace) Approx() bool {
+	if a, ok := m.manager.(approxReporter); ok {
+		return a.Approximate(m.name)
+	}
+	return true
+}
+func (m managedSpace) RGBA(vals []float64) ([4]float64, bool, error) {
+	return m.manager.Convert(m.name, m.profile, m.n, vals)
+}
+
 // Load resolves a color space name or array.
-func Load(ctx context.Context, file *syntax.File, obj syntax.Object, tracker *budget.Tracker) (Space, error) {
+func Load(ctx context.Context, file *syntax.File, obj syntax.Object, tracker *budget.Tracker, managers ...Manager) (Space, error) {
+	var manager Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
 	obj, err := resolve(ctx, file, obj)
 	if err != nil {
 		return nil, err
 	}
 	switch v := obj.(type) {
 	case syntax.Name:
-		return byName(string(v), nil)
+		sp, err := byName(string(v), nil)
+		if err == nil && manager != nil && string(v) == "DeviceCMYK" {
+			return managedSpace{base: sp, manager: manager, name: string(v), n: sp.Components()}, nil
+		}
+		return sp, err
 	case syntax.Array:
 		if len(v) == 0 {
 			return nil, clrErr("CLR-SPACE", "empty color space array")
@@ -36,13 +74,13 @@ func Load(ctx context.Context, file *syntax.File, obj syntax.Object, tracker *bu
 		if !ok {
 			return nil, clrErr("CLR-SPACE", "color space family is not a name")
 		}
-		return loadFamily(ctx, file, string(name), v, tracker)
+		return loadFamily(ctx, file, string(name), v, tracker, manager)
 	default:
 		return nil, clrErr("CLR-SPACE", "invalid color space object")
 	}
 }
 
-func loadFamily(ctx context.Context, file *syntax.File, family string, arr syntax.Array, tracker *budget.Tracker) (Space, error) {
+func loadFamily(ctx context.Context, file *syntax.File, family string, arr syntax.Array, tracker *budget.Tracker, managers ...Manager) (Space, error) {
 	switch family {
 	case "CalGray", "CalRGB", "Lab":
 		if len(arr) < 2 {
@@ -61,7 +99,7 @@ func loadFamily(ctx context.Context, file *syntax.File, family string, arr synta
 			return loadLab(dict)
 		}
 	case "ICCBased":
-		return loadICC(ctx, file, arr)
+		return loadICC(ctx, file, arr, managers...)
 	case "Indexed", "I":
 		return loadIndexed(ctx, file, arr, tracker)
 	case "Separation":
@@ -186,13 +224,17 @@ func (l labSpace) RGBA(vals []float64) ([4]float64, bool, error) {
 }
 
 type icc struct {
-	base Space
+	base    Space
+	profile *iccProfile
 }
 
 func (i icc) Name() string    { return "ICCBased" }
 func (i icc) Components() int { return i.base.Components() }
-func (i icc) Approx() bool    { return true }
+func (i icc) Approx() bool    { return i.profile == nil }
 func (i icc) RGBA(vals []float64) ([4]float64, bool, error) {
+	if i.profile != nil {
+		return i.profile.rgba(vals)
+	}
 	rgba, _, err := i.base.RGBA(vals)
 	return rgba, true, err
 }
@@ -309,7 +351,7 @@ func loadLab(d syntax.Dict) (Space, error) {
 	return labSpace{white: to3(wp), black: to3(bp), rng: [4]float64{rng[0], rng[1], rng[2], rng[3]}}, nil
 }
 
-func loadICC(ctx context.Context, file *syntax.File, arr syntax.Array) (Space, error) {
+func loadICC(ctx context.Context, file *syntax.File, arr syntax.Array, managers ...Manager) (Space, error) {
 	if len(arr) < 2 {
 		return nil, clrErr("CLR-ICC", "missing ICC stream")
 	}
@@ -318,16 +360,41 @@ func loadICC(ctx context.Context, file *syntax.File, arr syntax.Array) (Space, e
 		return nil, err
 	}
 	n, _ := stm.Dict.IntValue("N")
-	var base Space
-	switch n {
-	case 1:
-		base = device{name: "DeviceGray", n: 1}
-	case 4:
-		base = device{name: "DeviceCMYK", n: 4}
-	default:
-		base = device{name: "DeviceRGB", n: 3}
+	base := iccBase(int(n))
+	if file == nil {
+		return icc{base: base}, nil
+	}
+	data, err := file.DecodeStream(ctx, stm)
+	if err == nil && len(managers) > 0 && managers[0] != nil {
+		return managedSpace{base: base, manager: managers[0], name: "ICCBased", profile: data, n: base.Components()}, nil
+	}
+	if err == nil {
+		if profile, perr := parseICCProfile(data, int(n)); perr == nil {
+			return icc{base: iccBase(profile.components()), profile: profile}, nil
+		}
 	}
 	return icc{base: base}, nil
+}
+
+func iccBase(n int) Space {
+	switch n {
+	case 1:
+		return device{name: "DeviceGray", n: 1}
+	case 4:
+		return device{name: "DeviceCMYK", n: 4}
+	default:
+		return device{name: "DeviceRGB", n: 3}
+	}
+}
+
+func (p *iccProfile) components() int {
+	if p.lut != nil {
+		return p.lut.in
+	}
+	if p.isGray {
+		return 1
+	}
+	return 3
 }
 
 func loadIndexed(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker) (Space, error) {

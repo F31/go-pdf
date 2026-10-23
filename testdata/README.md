@@ -26,3 +26,10 @@ next to them. They are not part of the PDF corpus manifest.
 
 Confidential or customer documents must stay in the separate internal corpus
 repository and must never be committed here.
+
+
+## Encrypted fixtures
+
+`encrypted/` contains tiny PDFs generated with pypdf for read-only security
+tests: RC4-40, RC4-128, AES-128, AES-256-R5, AES-256 and an AES-256 SASLprep fixture (NBSP password).
+They contain only a test title and the string "Hello encrypted".

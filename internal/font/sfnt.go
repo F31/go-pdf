@@ -20,6 +20,7 @@ type fontProgram struct {
 	face     *sfnt.Font
 	upem     int
 	avgWidth int
+	size     int64
 }
 
 func (f *Font) loadFontProgram(ctx context.Context, file *syntax.File, fd syntax.Dict, info *displaylist.FontInfo, dc *diag.Collector) {
@@ -82,7 +83,7 @@ func (f *Font) loadFontProgram(ctx context.Context, file *syntax.File, fd syntax
 			continue
 		}
 		avgWidth, _ := os2AvgWidth(data)
-		f.program = &fontProgram{face: face, upem: upem, avgWidth: avgWidth}
+		f.program = &fontProgram{face: face, upem: upem, avgWidth: avgWidth, size: int64(len(data))}
 		info.Embedded = true
 		return
 	}

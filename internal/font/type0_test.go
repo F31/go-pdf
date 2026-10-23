@@ -168,8 +168,36 @@ func TestType0PredefinedVertical(t *testing.T) {
 	if len(codes) != 1 || codes[0].CID != 575 {
 		t.Fatalf("codes %#v", codes)
 	}
-	if !hasDiag(dc, "FNT-VERTICAL-DEFERRED") {
-		t.Fatalf("missing vertical diagnostic: %v", diagCodes(dc))
+	if f.VerticalWidth(codes[0]) != 880 {
+		t.Fatalf("vertical width %v", f.VerticalWidth(codes[0]))
+	}
+	if hasDiag(dc, "FNT-VERTICAL-DEFERRED") || hasDiag(dc, "FNT-W2-DEFERRED") {
+		t.Fatalf("unexpected vertical diagnostics: %v", diagCodes(dc))
+	}
+}
+
+func TestType0VerticalWidths(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(5, "<< /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-V /DescendantFonts [6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimSun /DW 1000 /DW2 [900 -1000] /W2 [1 [700 250 900] 2 4 800] >>"),
+	}
+	file, dc := type0FileWith(t, objs)
+	defer file.Close()
+	o, _ := file.ResolveRef(context.Background(), syntax.Ref{Num: 5})
+	f, err := Load(context.Background(), file, o.(syntax.Dict), dc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := f.VerticalWidth(Code{CID: 1}); w != 700 {
+		t.Fatalf("cid1 %v", w)
+	}
+	for _, cid := range []uint32{2, 3, 4} {
+		if w := f.VerticalWidth(Code{CID: cid}); w != 800 {
+			t.Fatalf("cid%d %v", cid, w)
+		}
+	}
+	if w := f.VerticalWidth(Code{CID: 9}); w != 900 {
+		t.Fatalf("default %v", w)
 	}
 }
 

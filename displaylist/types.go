@@ -1,11 +1,12 @@
 // Package displaylist defines the stable contract between go-pdf and its
 // consumers. G0 froze the type skeleton at Version 1.0; field additions since
-// then increment the minor version (currently 1.11).
+// then increment the minor version (currently 1.14).
 package displaylist
 
 import (
 	"context"
 	"image"
+	"sync"
 )
 
 // Matrix is [a b c d e f] in page space: x' = a*x + c*y + e, y' = b*x + d*y + f.
@@ -135,6 +136,50 @@ type ImageRef interface {
 	Decode(ctx context.Context) (image.Image, error)
 }
 
+// ImageSamples preserves normalized source-color samples before any output
+// color conversion. Data is interleaved and row-major, top-down. Components is
+// the number of source components per pixel. ColorSpace may be "ICCBased"; in
+// that case Profile contains the embedded ICC profile.
+//
+// Callers must call Close when the samples are no longer needed. ImageRefs
+// that cannot expose source samples do not implement ImageSampleRef.
+type ImageSamples struct {
+	Width, Height int
+	Components    int
+	ColorSpace    string
+	Profile       []byte
+	Data          []float32
+
+	release func()
+	once    sync.Once
+}
+
+// NewImageSamples builds a sample buffer owned by release. release may be nil.
+func NewImageSamples(width, height, components int, space string, profile []byte, data []float32, release func()) *ImageSamples {
+	return &ImageSamples{
+		Width: width, Height: height, Components: components,
+		ColorSpace: space, Profile: profile, Data: data, release: release,
+	}
+}
+
+// Close releases the sample buffer lease. It is idempotent.
+func (s *ImageSamples) Close() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
+}
+
+// ImageSampleRef is implemented by image resources that can expose normalized
+// source samples without first converting them to sRGB.
+type ImageSampleRef interface {
+	DecodeSamples(ctx context.Context) (*ImageSamples, error)
+}
+
 type MaskRef struct {
 	IsColorKey bool
 	ColorKey   []float64
@@ -207,26 +252,52 @@ type Glyph struct {
 }
 
 type SoftMask struct {
-	Subtype string
-	BBox    Rect
-	Items   []Item
-	Clips   []Clip
+	Subtype     string
+	BBox        Rect
+	Items       []Item
+	Clips       []Clip
+	Backdrop    [4]float64
+	HasBackdrop bool
+}
+
+// PaintState preserves fill/stroke alpha and print-related graphics state that
+// a single effective Alpha cannot represent. Consumers that only understand
+// Alpha may continue to use it as the conservative composite value.
+type PaintState struct {
+	FillAlpha       float64
+	StrokeAlpha     float64
+	FillOverprint   bool
+	StrokeOverprint bool
+	OverprintMode   int
+	RenderingIntent string
+}
+
+// TextSpan maps a Unicode substitution (usually ActualText) to a glyph range.
+// GlyphEnd is inclusive. Text must not be duplicated into every glyph.
+type TextSpan struct {
+	Text       string
+	GlyphStart int
+	GlyphEnd   int
+	ActualText bool
+	MCID       int
+	StructRef  int
 }
 
 type Common struct {
-	Z         int
-	Clip      int
-	Alpha     float64
-	Blend     string
-	Layer     string
-	MCID      int
-	StructRef int
-	SoftMask  *SoftMask
-	Flags     Flags
-	Bounds    Rect
-	ID        int
-	Source    SrcRef
-	Sig       uint64
+	Z          int
+	Clip       int
+	Alpha      float64
+	Blend      string
+	Layer      string
+	MCID       int
+	StructRef  int
+	SoftMask   *SoftMask
+	PaintState *PaintState `json:",omitempty"`
+	Flags      Flags
+	Bounds     Rect
+	ID         int
+	Source     SrcRef
+	Sig        uint64
 }
 
 func (c *Common) Base() *Common { return c }
@@ -247,7 +318,9 @@ type TextRun struct {
 	WordSpace  float64
 	HScale     float64
 	Rise       float64
+	Line       LineStyle
 	TextFlags  TextFlags
+	Spans      []TextSpan `json:",omitempty"`
 }
 
 type Path struct {
@@ -299,26 +372,57 @@ type Shading struct {
 	Grid              *ShadingGrid
 }
 
+type Backdrop struct {
+	Color  [4]float64
+	Bounds Rect
+}
+
 type Group struct {
 	Common
-	Name       string
-	Items      []Item
-	Clips      []Clip
-	Isolated   bool
-	Knockout   bool
-	ColorSpace string
+	Name            string
+	Items           []Item
+	Clips           []Clip
+	Isolated        bool
+	Knockout        bool
+	ColorSpace      string
+	BlendColorSpace string
+	BlendN          int
+	BlendProfile    []byte
+	Backdrop        *Backdrop
 }
 
 type Clip struct {
-	Path   []Segment
-	Rule   FillRule
-	Bounds Rect
+	Path      []Segment
+	Rule      FillRule
+	Bounds    Rect
+	Intersect []Clip `json:",omitempty"`
 }
 
 type Link struct {
 	Rect Rect
 	URI  string
 	Page int
+}
+
+// Annotation is a generic page annotation or form widget.
+type Annotation struct {
+	Subtype    string
+	Rect       Rect
+	Contents   string
+	URI        string
+	Page       int
+	Flags      int
+	FieldName  string
+	FieldValue string
+	FieldType  string
+	Appearance *AnnotationAppearance
+}
+
+// AnnotationAppearance contains one appearance stream expanded into page-space
+// display items and clips.
+type AnnotationAppearance struct {
+	Items []Item
+	Clips []Clip
 }
 
 type BackgroundHint struct {
@@ -337,16 +441,18 @@ type Diagnostic struct {
 }
 
 type Page struct {
-	Index      int
-	Width      float64
-	Height     float64
-	Rotate     int
-	MediaBox   Rect
-	CropBox    Rect
-	Clips      []Clip
-	Items      []Item
-	Diag       []Diagnostic
-	Links      []Link
-	Background *BackgroundHint
-	Scanned    bool
+	Index       int
+	Width       float64
+	Height      float64
+	Rotate      int
+	Label       string
+	MediaBox    Rect
+	CropBox     Rect
+	Clips       []Clip
+	Items       []Item
+	Diag        []Diagnostic
+	Links       []Link
+	Annotations []Annotation
+	Background  *BackgroundHint
+	Scanned     bool
 }

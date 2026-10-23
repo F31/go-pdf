@@ -10,9 +10,11 @@ import (
 	"sync"
 
 	"github.com/F31/go-pdf/internal/budget"
+	pdfcolor "github.com/F31/go-pdf/internal/color"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/font"
+	pdfimage "github.com/F31/go-pdf/internal/image"
 	"github.com/F31/go-pdf/internal/syntax"
 )
 
@@ -39,6 +41,8 @@ type Options struct {
 	Repair        bool
 	IncludeHidden bool
 	PreserveForms bool
+	Decoders      pdfimage.DecoderLookup
+	ColorManager  pdfcolor.Manager
 	Tracker       *budget.Tracker
 	Diag          *diag.Collector
 }
@@ -52,13 +56,17 @@ type Document struct {
 	opts    Options
 	fonts   *font.Cache
 	oc      map[syntax.Ref]bool
+	ocNames map[syntax.Ref]string
 
-	mu     sync.RWMutex
-	closed bool
+	mu      sync.RWMutex
+	leaseMu sync.Mutex
+	leases  []func()
+	closed  bool
 }
 
 type Page struct {
 	doc       *Document
+	ref       syntax.Ref
 	index     int
 	dict      syntax.Dict
 	resources syntax.Dict
@@ -72,19 +80,7 @@ type Page struct {
 }
 
 func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, error) {
-	d := &Document{file: file, opts: opts, fonts: font.NewCache()}
-	if enc, ok, err := file.EncryptDict(ctx); err != nil {
-		return nil, err
-	} else if ok {
-		f := ""
-		if v, ok := enc.NameValue("Filter"); ok {
-			f = v
-		}
-		if f == "Adobe.PubSec" {
-			return nil, errs.Wrap(errs.ErrUnsupported, "CRY-PUBSEC", "open encrypted document", -1, 0, -1)
-		}
-		return nil, errs.Wrap(errs.ErrPassword, "CRY-PASSWORD", "open encrypted document", -1, 0, -1)
-	}
+	d := &Document{file: file, opts: opts, fonts: font.NewCache(opts.Tracker)}
 	catalog, err := file.ResolveRoot(ctx)
 	if err != nil {
 		return nil, err
@@ -97,7 +93,9 @@ func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, erro
 					d.catalog = c2
 					d.info = Info{}
 					d.pages = nil
-					d.fonts = font.NewCache()
+					d.fonts.Close()
+					d.releaseLeases()
+					d.fonts = font.NewCache(opts.Tracker)
 					if e3 := d.initialize(ctx); e3 == nil {
 						return d, nil
 					} else {
@@ -106,6 +104,8 @@ func Open(ctx context.Context, file *syntax.File, opts Options) (*Document, erro
 				}
 			}
 		}
+		d.fonts.Close()
+		d.releaseLeases()
 		return nil, err
 	}
 	return d, nil
@@ -194,14 +194,38 @@ func (d *Document) Close() error {
 	}
 	d.closed = true
 	d.mu.Unlock()
+	d.fonts.Close()
+	d.releaseLeases()
 	return d.file.Close()
+}
+
+func (d *Document) acquireLease(n int64) (func(), error) {
+	if d == nil || d.opts.Tracker == nil || n <= 0 {
+		return func() {}, nil
+	}
+	release, err := d.opts.Tracker.Acquire(n)
+	if err != nil {
+		return nil, err
+	}
+	d.leaseMu.Lock()
+	d.leases = append(d.leases, release)
+	d.leaseMu.Unlock()
+	return release, nil
+}
+
+func (d *Document) releaseLeases() {
+	d.leaseMu.Lock()
+	leases := d.leases
+	d.leases = nil
+	d.leaseMu.Unlock()
+	for i := len(leases) - 1; i >= 0; i-- {
+		leases[i]()
+	}
 }
 
 func (d *Document) loadOC(ctx context.Context) {
 	d.oc = nil
-	if d.opts.IncludeHidden {
-		return
-	}
+	d.ocNames = nil
 	obj, err := d.file.Resolve(ctx, d.catalog.Get("OCProperties"))
 	if err != nil {
 		return
@@ -210,13 +234,30 @@ func (d *Document) loadOC(ctx context.Context) {
 	if !ok {
 		return
 	}
+	d.ocNames = map[syntax.Ref]string{}
 	visible := map[syntax.Ref]bool{}
 	if arr, ok := ocp.Get("OCGs").(syntax.Array); ok {
 		for _, item := range arr {
-			if ref, ok := item.(syntax.Ref); ok {
-				visible[ref] = true
+			ref, ok := item.(syntax.Ref)
+			if !ok {
+				continue
+			}
+			visible[ref] = true
+			o, err := d.file.Resolve(ctx, ref)
+			if err != nil {
+				continue
+			}
+			if dict, ok := o.(syntax.Dict); ok {
+				if n, ok := dict.Get("Name").(syntax.String); ok {
+					d.ocNames[ref] = decodeTextString(n)
+				} else if n, ok := dict.Get("Name").(syntax.Name); ok {
+					d.ocNames[ref] = string(n)
+				}
 			}
 		}
+	}
+	if d.opts.IncludeHidden {
+		return
 	}
 	dconf, _ := d.file.Resolve(ctx, ocp.Get("D"))
 	conf, _ := dconf.(syntax.Dict)
@@ -250,6 +291,7 @@ func (d *Document) loadInfo(ctx context.Context) error {
 	infoObj, ok := d.file.Trailer()["Info"]
 	if !ok {
 		d.info.XMP = d.loadXMP(ctx)
+		applyXMP(&d.info, d.info.XMP)
 		return nil
 	}
 	o, err := d.file.Resolve(ctx, infoObj)
@@ -272,6 +314,7 @@ func (d *Document) loadInfo(ctx context.Context) error {
 		ModDate:      decodeText(dict.Get("ModDate")),
 	}
 	d.info.XMP = d.loadXMP(ctx)
+	applyXMP(&d.info, d.info.XMP)
 	return nil
 }
 
@@ -430,4 +473,11 @@ func pdfDocRune(c byte) rune {
 func (d *Document) Unsupported(code, op string, page int) error {
 	d.file.Diag().Add(diag.Diagnostic{Level: diag.Degraded, Code: code, Msg: op + " is not implemented in G0", Page: page, Offset: -1})
 	return errs.Wrap(errs.ErrUnsupported, code, op, -1, 0, page)
+}
+
+func (d *Document) DiagnosticsForPage(page int) []diag.Diagnostic {
+	if d == nil || d.file == nil {
+		return nil
+	}
+	return d.file.Diag().ForPage(page)
 }

@@ -9,11 +9,16 @@
 - Benchmarks: `go test ./... -run=^$ -bench=. -benchmem`
 - Dependency policy: `./scripts/check-deps.sh`
 
+## Performance baseline
+
+- Poppler 24.02 local baseline: `docs/perf/poppler-24.02-baseline.md`.
+  Compare only on the same host, corpus, DPI, background and output format.
+
 ## Repository rules
 
 - Only the Go standard library and `golang.org/x/*` are allowed. A new
   dependency requires an ADR and a `THIRD_PARTY.md` entry.
-- Public packages are the module root (`pdf`), `displaylist`, and `render`. Internal PDF
+- Public packages are the module root (`pdf`), `displaylist`, `render`, and `text`. Internal PDF
   objects must not appear in public signatures.
 - Do not silently degrade. Every approximation or unsupported feature must
   return an appropriate error or record a diagnostic.

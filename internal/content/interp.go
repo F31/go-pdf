@@ -30,6 +30,10 @@ type PageData struct {
 	Diag          *diag.Collector
 	OC            map[syntax.Ref]bool
 	PreserveForms bool
+	Decoders      pdfimage.DecoderLookup
+	Lease         func(int64) (func(), error)
+	ColorManager  pdfcolor.Manager
+	OCNames       map[syntax.Ref]string
 }
 
 type Result struct {
@@ -42,6 +46,10 @@ type matrix [6]float64
 
 func (m matrix) apply(x, y float64) (float64, float64) {
 	return m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]
+}
+
+func (m matrix) applyPoint(p displaylist.Point) displaylist.Point {
+	return displaylist.Point{X: m[0]*p.X + m[2]*p.Y + m[4], Y: m[1]*p.X + m[3]*p.Y + m[5]}
 }
 
 func (m matrix) scale() float64 {
@@ -67,6 +75,7 @@ func translate(x, y float64) matrix { return matrix{1, 0, 0, 1, x, y} }
 
 type state struct {
 	ctm           matrix
+	clip          int
 	lineWidth     float64
 	cap           int
 	join          int
@@ -90,14 +99,29 @@ type state struct {
 	rise      float64
 	render    int
 
-	fillAlpha   float64
-	strokeAlpha float64
-	blend       string
+	fillAlpha       float64
+	strokeAlpha     float64
+	blend           string
+	fillOverprint   bool
+	strokeOverprint bool
+	overprintMode   int
+	renderingIntent string
 }
 
 func (s state) clone() state {
 	s.dash = append([]float64(nil), s.dash...)
 	return s
+}
+
+type patternKey struct {
+	stm *syntax.Stream
+	ctm [6]float64
+}
+
+type maskKey struct {
+	stm     *syntax.Stream
+	ctm     [6]float64
+	subtype string
 }
 
 type interp struct {
@@ -127,16 +151,19 @@ type interp struct {
 	trBounds    displaylist.Rect
 	trHasBounds bool
 
-	ops         int
-	type3Glyphs int
-	unknown     map[string]bool
-	suppress    bool
-	forms       map[*syntax.Stream]bool
-	patterns    map[*syntax.Stream]bool
-	masks       map[*syntax.Stream]bool
-	skipDepth   int
-	marked      []markedEntry
-	result      Result
+	ops          int
+	type3Glyphs  int
+	unknown      map[string]bool
+	suppress     bool
+	forms        map[*syntax.Stream]bool
+	patterns     map[*syntax.Stream]bool
+	masks        map[*syntax.Stream]bool
+	decoded      map[*syntax.Stream][]byte
+	patternCache map[patternKey]*displaylist.Pattern
+	maskCache    map[maskKey]*displaylist.SoftMask
+	skipDepth    int
+	marked       []markedEntry
+	result       Result
 }
 
 func Interpret(ctx context.Context, pd PageData, emit func(displaylist.Item) error) (*Result, error) {
@@ -159,9 +186,11 @@ func newInterp(ctx context.Context, pd PageData, emit func(displaylist.Item) err
 		ctx: ctx, pd: pd, sink: emit, lx: newLexer(pd.Content, maxDepth),
 		curClip: -1, trClip: -1, unknown: map[string]bool{}, clips: make([]displaylist.Clip, 0),
 		forms: map[*syntax.Stream]bool{}, patterns: map[*syntax.Stream]bool{}, masks: map[*syntax.Stream]bool{},
+		decoded: map[*syntax.Stream][]byte{}, patternCache: map[patternKey]*displaylist.Pattern{},
+		maskCache: map[maskKey]*displaylist.SoftMask{},
 	}
 	ip.st = state{
-		ctm: matrix(pd.Matrix), lineWidth: 1, cap: 0, join: 0, miter: 10, hscale: 1,
+		ctm: matrix(pd.Matrix), clip: -1, lineWidth: 1, cap: 0, join: 0, miter: 10, hscale: 1,
 		fill:        displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
 		stroke:      displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 0, 1}},
 		fillAlpha:   1,
@@ -171,6 +200,17 @@ func newInterp(ctx context.Context, pd PageData, emit func(displaylist.Item) err
 	}
 	ip.tm, ip.tlm = matrix{1, 0, 0, 1, 0, 0}, matrix{1, 0, 0, 1, 0, 0}
 	return ip
+}
+
+func (ip *interp) streamData(stm *syntax.Stream) ([]byte, error) {
+	if b, ok := ip.decoded[stm]; ok {
+		return b, nil
+	}
+	b, err := ip.pd.File.DecodeStream(ip.ctx, stm)
+	if err == nil {
+		ip.decoded[stm] = b
+	}
+	return b, err
 }
 
 func (ip *interp) run() error {
@@ -271,6 +311,7 @@ func (ip *interp) dispatch(t token) error {
 	switch t.op {
 	case "q":
 		ip.stack = nil
+		ip.st.clip = ip.curClip
 		ip.gstack = append(ip.gstack, ip.st.clone())
 	case "Q":
 		ip.stack = nil
@@ -282,6 +323,7 @@ func (ip *interp) dispatch(t token) error {
 			return err
 		}
 		ip.st = ip.gstack[len(ip.gstack)-1]
+		ip.curClip = ip.st.clip
 		ip.gstack = ip.gstack[:len(ip.gstack)-1]
 	case "cm":
 		ops, ok := ip.take(6)
@@ -480,7 +522,13 @@ func (ip *interp) dispatch(t token) error {
 		ip.beginMarkedContent(true)
 	case "EMC":
 		return ip.endMarkedContent()
-	case "ri", "i", "MP", "DP", "d0", "d1":
+	case "ri":
+		if ops, ok := ip.take(1); ok {
+			if n, ok := name(ops[0]); ok {
+				ip.st.renderingIntent = n
+			}
+		}
+	case "i", "MP", "DP", "d0", "d1":
 		ip.stack = nil
 	default:
 		ip.stack = nil
@@ -552,12 +600,21 @@ func (ip *interp) setCMYK(stroke bool) {
 		}
 		c[i] = v
 	}
-	k := c[3]
-	rgba := [4]float64{(1 - c[0]) * (1 - k), (1 - c[1]) * (1 - k), (1 - c[2]) * (1 - k), 1}
+	sp := deviceCMYK()
+	if ip.pd.ColorManager != nil {
+		if s, err := pdfcolor.Load(ip.ctx, ip.pd.File, syntax.Name("DeviceCMYK"), nil, ip.pd.ColorManager); err == nil {
+			sp = s
+		}
+	}
+	rgba, approx, err := sp.RGBA(c[:])
+	if err != nil {
+		ip.diagOnce(diag.Degraded, "CLR-CONVERT", "cannot convert color")
+		return
+	}
 	ip.diagOnce(diag.Info, "CLR-CMYK-APPROX", "CMYK converted with fixed approximation")
-	ip.setSpace(stroke, deviceCMYK())
+	ip.setSpace(stroke, sp)
 	ip.setPatternFlag(stroke, false)
-	ip.setPaint(stroke, "DeviceCMYK", c[:], rgba, true)
+	ip.setPaint(stroke, "DeviceCMYK", c[:], rgba, approx || sp.Approx())
 }
 
 func (ip *interp) setComponents(stroke bool) {
@@ -624,7 +681,7 @@ func (ip *interp) setColorSpace(stroke bool, name string) {
 			return
 		}
 	}
-	sp, err := pdfcolor.Load(ip.ctx, ip.pd.File, obj, ip.pd.Tracker)
+	sp, err := pdfcolor.Load(ip.ctx, ip.pd.File, obj, ip.pd.Tracker, ip.pd.ColorManager)
 	if err != nil {
 		ip.diagOnce(diag.Degraded, "CLR-SPACE", "cannot load color space")
 		return
@@ -717,7 +774,7 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 	var clips []displaylist.Clip
 	if stm != nil && ip.pd.File != nil {
 		var err error
-		content, err = ip.pd.File.DecodeStream(ip.ctx, stm)
+		content, err = ip.streamData(stm)
 		if err != nil {
 			return nil, err
 		}
@@ -732,6 +789,15 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 					}
 				}
 				ctm := mmul(ip.st.ctm, pm)
+				ck := patternKey{stm: stm, ctm: [6]float64(ctm)}
+				cacheable := paintType == 1 && dict.Has("Resources")
+				if cacheable {
+					if p, ok := ip.patternCache[ck]; ok {
+						cp := *p
+						cp.Name = name
+						return &cp, nil
+					}
+				}
 				nestedPD := ip.pd
 				nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = content, res, [6]float64(ctm)
 				nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
@@ -739,6 +805,7 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 					return nil
 				})
 				nested.forms, nested.patterns = ip.forms, ip.patterns
+				nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
 				if paintType == 2 && len(base) > 0 {
 					if sp, paint, ok := basePaint(base); ok {
 						nested.st.fill, nested.st.stroke = paint, paint
@@ -755,11 +822,17 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 			}
 		}
 	}
-	return &displaylist.Pattern{
+	pat := &displaylist.Pattern{
 		Name: name, Type: 1, PaintType: int(paintType), TilingType: int(tilingType),
 		BBox: bbox, XStep: xstep, YStep: ystep, Matrix: [6]float64(mmul(ip.st.ctm, pm)),
 		Base: append([]float64(nil), base...), Content: content, Items: items, Clips: clips,
-	}, nil
+	}
+	if paintType == 1 && dict.Has("Resources") && len(items) > 0 {
+		if ip.cacheLease(estimatePattern(pat), "BUD-PATTERN-CACHE") {
+			ip.patternCache[patternKey{stm: stm, ctm: [6]float64(mmul(ip.st.ctm, pm))}] = pat
+		}
+	}
+	return pat, nil
 }
 
 func (ip *interp) setPaintPattern(stroke bool, p *displaylist.Pattern, base []float64) {
@@ -938,11 +1011,13 @@ func (ip *interp) paint(op string) error {
 		return nil
 	}
 	if ip.pendingClip != nil {
+		c := *ip.pendingClip
 		if ip.curClip >= 0 {
-			ip.diagOnce(diag.Degraded, "CNT-CLIP-INTERSECT", "clip intersection is not represented exactly")
+			c.Intersect = []displaylist.Clip{ip.clips[ip.curClip]}
 		}
-		ip.clips = append(ip.clips, *ip.pendingClip)
+		ip.clips = append(ip.clips, c)
 		ip.curClip = len(ip.clips) - 1
+		ip.st.clip = ip.curClip
 		ip.pendingClip = nil
 	}
 	if op == "n" {
@@ -979,9 +1054,6 @@ func (ip *interp) paint(op string) error {
 	if stroke && !fill {
 		c.Alpha = ip.st.strokeAlpha
 	} else if fill && stroke {
-		if ip.st.fillAlpha != ip.st.strokeAlpha {
-			ip.diagOnce(diag.Degraded, "CNT-GSTATE-ALPHA", "fill and stroke alpha differ; using the lower value")
-		}
 		c.Alpha = math.Min(ip.st.fillAlpha, ip.st.strokeAlpha)
 	}
 	closed := op != "S"
@@ -1021,8 +1093,16 @@ func (ip *interp) closeCurrent() {
 }
 
 func (ip *interp) common() displaylist.Common {
-	return displaylist.Common{Z: ip.z, Clip: ip.curClip, Alpha: ip.st.fillAlpha, Blend: ip.st.blend, MCID: -1, StructRef: -1,
-		SoftMask: ip.st.softMask, Source: displaylist.SrcRef{OpIndex: ip.ops}}
+	return displaylist.Common{
+		Z: ip.z, Clip: ip.curClip, Alpha: ip.st.fillAlpha, Blend: ip.st.blend,
+		MCID: ip.activeMCID(), StructRef: -1, SoftMask: ip.st.softMask, Layer: ip.activeLayer(),
+		PaintState: &displaylist.PaintState{
+			FillAlpha: ip.st.fillAlpha, StrokeAlpha: ip.st.strokeAlpha,
+			FillOverprint: ip.st.fillOverprint, StrokeOverprint: ip.st.strokeOverprint,
+			OverprintMode: ip.st.overprintMode, RenderingIntent: ip.st.renderingIntent,
+		},
+		Source: displaylist.SrcRef{OpIndex: ip.ops},
+	}
 }
 
 func (ip *interp) emit(item displaylist.Item) error {
@@ -1033,6 +1113,116 @@ func (ip *interp) emit(item displaylist.Item) error {
 	ip.z++
 	ip.id++
 	return ip.sink(item)
+}
+
+func (ip *interp) addTextClip(t *displaylist.TextRun) {
+	if t == nil || len(t.Glyphs) == 0 {
+		ip.diagOnce(diag.Degraded, "CNT-TEXT-CLIP", "text clipping path is unavailable")
+		return
+	}
+	var path []displaylist.Segment
+	const glyphScale = 0.001
+	for _, g := range t.Glyphs {
+		var seg []displaylist.Segment
+		rawPage := false
+		ok := false
+		if ip.st.font != nil && ip.st.font.Type3() {
+			if p, found := ip.type3ClipPath(g, ip.st.font); found {
+				seg, ok, rawPage = p, true, true
+			}
+		}
+		if t.Font != nil && t.Font.GlyphSource != nil && !ok {
+			seg, ok = t.Font.GlyphSource.GlyphOutline(g.Code, g.CID)
+		}
+		if !ok || len(seg) == 0 {
+			if strings.TrimSpace(g.Text) == "" && g.Text != "" {
+				continue
+			}
+			seg = fallbackGlyphBox(t, g)
+			ip.diagOnce(diag.Degraded, "CNT-TEXT-CLIP-BBOX", "text clipping uses conservative glyph em box")
+		}
+		m := mmul(matrix(g.Matrix), matrix{glyphScale, 0, 0, glyphScale, 0, 0})
+		for _, s := range seg {
+			if !rawPage {
+				s.P0 = m.applyPoint(s.P0)
+				s.P1 = m.applyPoint(s.P1)
+				s.P2 = m.applyPoint(s.P2)
+				s.P3 = m.applyPoint(s.P3)
+			}
+			path = append(path, s)
+		}
+	}
+	if len(path) == 0 {
+		ip.diagOnce(diag.Degraded, "CNT-TEXT-CLIP", "text clipping path is empty")
+		return
+	}
+	c := displaylist.Clip{Path: path, Rule: displaylist.NonZero, Bounds: segmentBounds(path)}
+	if ip.curClip >= 0 {
+		c.Intersect = []displaylist.Clip{ip.clips[ip.curClip]}
+	}
+	ip.clips = append(ip.clips, c)
+	ip.curClip = len(ip.clips) - 1
+	ip.st.clip = ip.curClip
+}
+
+func (ip *interp) type3ClipPath(g displaylist.Glyph, f *font.Font) ([]displaylist.Segment, bool) {
+	if f == nil || !f.Type3() || g.Code > 255 || ip.pd.File == nil {
+		return nil, false
+	}
+	glyph, ok, err := f.Type3Proc(ip.ctx, ip.pd.File, byte(g.Code))
+	if err != nil || !ok {
+		return nil, false
+	}
+	var path []displaylist.Segment
+	nestedPD := ip.pd
+	nestedPD.Content = glyph.Data
+	nestedPD.Resources = glyph.Resources
+	nestedPD.Matrix = [6]float64(mmul(matrix(g.Matrix), matrix(glyph.Matrix)))
+	nestedPD.PreserveForms = false
+	nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
+		p, ok := item.(*displaylist.Path)
+		if !ok || (p.Fill == nil && p.Stroke == nil) {
+			return nil
+		}
+		path = append(path, p.Segments...)
+		return nil
+	})
+	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
+	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+	nested.st = ip.st.clone()
+	nested.st.ctm = matrix(nestedPD.Matrix)
+	nested.type3Glyphs = ip.type3Glyphs
+	if err := nested.run(); err != nil {
+		return nil, false
+	}
+	ip.type3Glyphs = nested.type3Glyphs
+	return path, len(path) > 0
+}
+
+func fallbackGlyphBox(t *displaylist.TextRun, g displaylist.Glyph) []displaylist.Segment {
+	ascent, descent := 800.0, -200.0
+	if t.Font != nil && t.Font.Metrics.UnitsPerEm > 0 {
+		u := float64(t.Font.Metrics.UnitsPerEm)
+		if t.Font.Metrics.Ascent > 0 {
+			ascent = float64(t.Font.Metrics.Ascent) * 1000 / u
+		}
+		if t.Font.Metrics.Descent > 0 {
+			descent = -float64(t.Font.Metrics.Descent) * 1000 / u
+		}
+	}
+	pts := []displaylist.Point{
+		{X: 0, Y: descent},
+		{X: 1000, Y: descent},
+		{X: 1000, Y: ascent},
+		{X: 0, Y: ascent},
+	}
+	return []displaylist.Segment{
+		{Kind: displaylist.SegmentMove, P0: pts[0]},
+		{Kind: displaylist.SegmentLine, P0: pts[0], P3: pts[1]},
+		{Kind: displaylist.SegmentLine, P0: pts[1], P3: pts[2]},
+		{Kind: displaylist.SegmentLine, P0: pts[2], P3: pts[3]},
+		{Kind: displaylist.SegmentClose, P0: pts[3], P3: pts[0]},
+	}
 }
 
 func (ip *interp) flushText() error {
@@ -1051,9 +1241,18 @@ func (ip *interp) flushText() error {
 		if b.String() != ip.tr.ActualText {
 			ip.diagOnce(diag.Info, "CNT-ACTUALTEXT-CONFLICT", "ActualText differs from glyph mapping")
 		}
+		if len(ip.tr.Glyphs) > 0 {
+			ip.tr.Spans = []displaylist.TextSpan{{
+				Text: ip.tr.ActualText, GlyphStart: 0, GlyphEnd: len(ip.tr.Glyphs) - 1,
+				ActualText: true, MCID: ip.tr.MCID,
+			}}
+		}
 	}
 	if err := ip.emit(ip.tr); err != nil {
 		return err
+	}
+	if ip.tr.RenderMode >= 4 && ip.tr.RenderMode <= 7 {
+		ip.addTextClip(ip.tr)
 	}
 	ip.tr = nil
 	ip.trHasBounds = false
@@ -1107,7 +1306,9 @@ func (ip *interp) loadFont(name string) *font.Font {
 						if ff, err := font.Load(ip.ctx, ip.pd.File, d, ip.pd.Diag); err == nil {
 							f = ff
 							if ref.Num != 0 && ip.pd.Fonts != nil {
-								ip.pd.Fonts.Put(ref, ff)
+								if !ip.pd.Fonts.Put(ref, ff) {
+									ip.diagOnce(diag.Degraded, "BUD-FONT-CACHE", "font cache budget exceeded")
+								}
 							}
 						}
 					}
@@ -1221,6 +1422,10 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 			Font: fontInfo(ip.st.font), Size: ip.st.fontSize, Fill: ip.st.fill,
 			RenderMode: ip.st.render, CharSpace: ip.st.charSpace,
 			WordSpace: ip.st.wordSpace, HScale: ip.st.hscale, Rise: ip.st.rise,
+			Line: displaylist.LineStyle{
+				Width: ip.st.lineWidth * ip.st.ctm.scale(), Cap: ip.st.cap, Join: ip.st.join,
+				Miter: ip.st.miter, Dash: append([]float64(nil), ip.st.dash...), Phase: ip.st.dashPhase,
+			},
 			Vertical: ip.st.font != nil && ip.st.font.Vertical(),
 		}
 		ip.tr.Common = ip.common()
@@ -1233,9 +1438,6 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 			ip.tr.TextFlags |= displaylist.TextStroked
 			p := ip.st.stroke
 			ip.tr.Stroke = &p
-			if ip.st.fillAlpha != ip.st.strokeAlpha {
-				ip.diagOnce(diag.Degraded, "CNT-GSTATE-ALPHA", "fill and stroke alpha differ; using the lower value")
-			}
 			ip.tr.Common.Alpha = math.Min(ip.st.fillAlpha, ip.st.strokeAlpha)
 		}
 	}
@@ -1248,14 +1450,26 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 		}
 		ox, oy := trm.apply(0, 0)
 		width := 500.0
+		vwidth := 880.0
 		text, ok := "\uFFFD", false
 		if ip.st.font != nil {
 			width = ip.st.font.WidthCode(c)
+			vwidth = ip.st.font.VerticalWidth(c)
 			text, ok = ip.st.font.DecodeCode(c)
 		}
-		adv := (width/1000*ip.st.fontSize + ip.st.charSpace) * ip.st.hscale
-		if c.Bytes == 1 && c.Value == 32 {
-			adv = (width/1000*ip.st.fontSize + ip.st.charSpace + ip.st.wordSpace) * ip.st.hscale
+		vertical := ip.tr.Vertical
+		var adv float64
+		if vertical {
+			ox, oy = trm.apply(width/2000, 0)
+			adv = vwidth/1000*ip.st.fontSize + ip.st.charSpace
+			if c.Bytes == 1 && c.Value == 32 {
+				adv += ip.st.wordSpace
+			}
+		} else {
+			adv = (width/1000*ip.st.fontSize + ip.st.charSpace) * ip.st.hscale
+			if c.Bytes == 1 && c.Value == 32 {
+				adv = (width/1000*ip.st.fontSize + ip.st.charSpace + ip.st.wordSpace) * ip.st.hscale
+			}
 		}
 		g := displaylist.Glyph{
 			Text: text, UnicodeOK: ok, Code: c.Value, CID: c.CID,
@@ -1263,7 +1477,11 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 		}
 		ip.tr.Glyphs = append(ip.tr.Glyphs, g)
 		ip.growTextBounds(g)
-		ip.tm = mmul(translate(adv, 0), ip.tm)
+		if vertical {
+			ip.tm = mmul(translate(0, -adv), ip.tm)
+		} else {
+			ip.tm = mmul(translate(adv, 0), ip.tm)
+		}
 	}
 	return nil
 }
@@ -1292,17 +1510,12 @@ func (ip *interp) expandType3(c font.Code, trm matrix) error {
 	}
 	pd.Matrix = [6]float64(mmul(trm, matrix(glyph.Matrix)))
 	nested := newInterp(ip.ctx, pd, func(item displaylist.Item) error {
-		switch v := item.(type) {
-		case *displaylist.Path:
-			v.Flags |= displaylist.FlagFromType3
-			v.Common.Clip = ip.curClip
-			return ip.emit(v)
-		case *displaylist.TextRun:
-			ip.diagOnce(diag.Warn, "FNT-TYPE3-TEXT", "text inside Type3 CharProc ignored")
-			return nil
-		}
-		return nil
+		c := item.Base()
+		c.Flags |= displaylist.FlagFromType3
+		c.Clip = ip.curClip
+		return ip.emit(item)
 	})
+	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
 	nested.st.fill = ip.st.fill
 	nested.st.stroke = ip.st.stroke
 	nested.st.lineWidth = ip.st.lineWidth
@@ -1357,6 +1570,13 @@ func (ip *interp) textMatrix() matrix {
 
 func (ip *interp) growTextBounds(g displaylist.Glyph) {
 	r := displaylist.Rect{X0: g.Origin.X, Y0: g.Origin.Y - ip.st.fontSize, X1: g.Origin.X + g.Advance, Y1: g.Origin.Y + ip.st.fontSize*0.2}
+	if ip.tr != nil && ip.tr.Vertical {
+		half := ip.st.fontSize * 0.5
+		r = displaylist.Rect{
+			X0: g.Origin.X - half, Y0: g.Origin.Y - ip.st.fontSize,
+			X1: g.Origin.X + half, Y1: g.Origin.Y + ip.st.fontSize*0.2,
+		}
+	}
 	if !ip.trHasBounds {
 		ip.trBounds = r
 		ip.trHasBounds = true
@@ -1393,7 +1613,11 @@ func (ip *interp) showTJ() error {
 			}
 		default:
 			if n, ok := num(o); ok {
-				ip.tm = mmul(translate(-n*ip.st.fontSize*ip.st.hscale/1000, 0), ip.tm)
+				if ip.tr != nil && ip.tr.Vertical {
+					ip.tm = mmul(translate(0, -n*ip.st.fontSize/1000), ip.tm)
+				} else {
+					ip.tm = mmul(translate(-n*ip.st.fontSize*ip.st.hscale/1000, 0), ip.tm)
+				}
 			}
 		}
 	}
@@ -1515,7 +1739,7 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 	if len(ip.forms) >= maxDepth {
 		return errs.Wrap(errs.ErrBudget, "BUD-FORM-DEPTH", "interpret form XObject", -1, 0, ip.pd.Index)
 	}
-	data, err := ip.pd.File.DecodeStream(ip.ctx, stm)
+	data, err := ip.streamData(stm)
 	if err != nil {
 		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
 			return err
@@ -1571,7 +1795,8 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 		c.Source.OpIndex += ip.ops
 		return ip.emit(item)
 	})
-	nested.forms = ip.forms
+	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
+	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
 	nested.st = ip.st.clone()
 	nested.st.ctm = ctm
 	nested.suppress = ip.suppress
@@ -1617,8 +1842,10 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 			Common: c, Name: formName, Items: groupItems, Clips: nested.clips,
 			Isolated: boolValue(groupDict, "I"), Knockout: boolValue(groupDict, "K"),
 		}
-		if n, ok := groupDict.NameValue("CS"); ok {
-			g.ColorSpace = n
+		g.BlendColorSpace, g.BlendN, g.BlendProfile = ip.groupBlendInfo(groupDict)
+		g.ColorSpace = g.BlendColorSpace
+		if bc, ok := ip.backdropColor(groupDict); ok {
+			g.Backdrop = &displaylist.Backdrop{Color: bc, Bounds: c.Bounds}
 		}
 		err = ip.emit(g)
 	} else {
@@ -1735,7 +1962,7 @@ func pointAt(m matrix, x, y float64) displaylist.Point {
 }
 
 func (ip *interp) emitImage(stm *syntax.Stream) error {
-	ref, mask, err := pdfimage.NewXObject(ip.ctx, ip.pd.File, stm, ip.pd.Tracker, ip.pd.Diag)
+	ref, mask, err := pdfimage.NewXObject(ip.ctx, ip.pd.File, stm, ip.pd.Tracker, ip.pd.Diag, ip.pd.Decoders, ip.pd.ColorManager)
 	if err != nil {
 		if errors.Is(err, errs.ErrBudget) || errors.Is(err, errs.ErrCanceled) {
 			return err
@@ -1755,7 +1982,7 @@ func (ip *interp) doInlineImage() error {
 		ip.diagOnce(diag.Degraded, "CNT-INLINE-IMAGE", "malformed inline image")
 		return nil
 	}
-	ref, err := pdfimage.NewInline(dict, data, ip.pd.Tracker, ip.pd.Diag)
+	ref, err := pdfimage.NewInline(ip.ctx, dict, data, ip.pd.Tracker, ip.pd.Diag, ip.pd.Decoders, ip.pd.ColorManager)
 	if err != nil {
 		ip.diagOnce(diag.Degraded, "IMG-INFO", "cannot read inline image")
 		return nil
@@ -1848,6 +2075,22 @@ func (ip *interp) applyGStateDict(gs syntax.Dict) {
 	} else if v, ok := gs.Get("CA").(syntax.Int); ok {
 		ip.st.strokeAlpha = clamp01(float64(v))
 	}
+	if v, ok := gs.Get("RI").(syntax.Name); ok {
+		ip.st.renderingIntent = string(v)
+	} else if v, ok := gs.Get("RI").(syntax.Array); ok && len(v) > 0 {
+		if n, ok := v[0].(syntax.Name); ok {
+			ip.st.renderingIntent = string(n)
+		}
+	}
+	if v, ok := gs.Get("OP").(syntax.Bool); ok {
+		ip.st.strokeOverprint = bool(v)
+	}
+	if v, ok := gs.Get("op").(syntax.Bool); ok {
+		ip.st.fillOverprint = bool(v)
+	}
+	if v, ok := gs.Get("OPM").(syntax.Int); ok {
+		ip.st.overprintMode = int(v)
+	}
 	if v := gs.Get("BM"); v != nil {
 		switch bm := v.(type) {
 		case syntax.Name:
@@ -1863,7 +2106,7 @@ func (ip *interp) applyGStateDict(gs syntax.Dict) {
 	if gs.Has("Font") {
 		ip.diagOnce(diag.Degraded, "CNT-GSTATE-FONT", "ExtGState font changes are not applied")
 	}
-	for _, key := range []string{"AIS", "TK", "RI", "OP", "op", "OPM", "SA", "TR", "TR2", "HT", "BG", "BG2", "UCR"} {
+	for _, key := range []string{"AIS", "TK", "SA", "TR", "TR2", "HT", "BG", "BG2", "UCR"} {
 		if gs.Has(key) {
 			ip.diagOnce(diag.Degraded, "CNT-GSTATE-UNSUPPORTED", "unsupported ExtGState key: "+key)
 		}
@@ -2024,7 +2267,7 @@ func (ip *interp) doShading() error {
 		}
 		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "shading color space missing; inferred from function")
 	}
-	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker)
+	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker, ip.pd.ColorManager)
 	if err != nil || space.Components() != fn.Outputs() {
 		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "invalid shading color space")
 		return nil
@@ -2083,7 +2326,7 @@ func (ip *interp) functionShading(dict syntax.Dict) error {
 		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "function shading color space missing")
 		return nil
 	}
-	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker)
+	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker, ip.pd.ColorManager)
 	if err != nil || space.Components() != fn.Outputs() {
 		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "invalid function shading color space")
 		return nil
@@ -2189,21 +2432,28 @@ func (ip *interp) beginMarkedContent(hasProps bool) {
 		return
 	}
 	actual := ""
-	if d, ok := props.(syntax.Dict); ok {
-		if v, ok := d.Get("ActualText").(syntax.String); ok {
+	mcid := -1
+	d, _ := ip.resolveObject(props)
+	if dict, ok := d.(syntax.Dict); ok {
+		if v, ok := dict.Get("ActualText").(syntax.String); ok {
 			actual = string(v)
 		}
+		if v, ok := dict.IntValue("MCID"); ok {
+			mcid = int(v)
+		}
 	}
-	if actual != "" {
+	if actual != "" || mcid >= 0 {
 		if err := ip.flushText(); err != nil {
 			return
 		}
 	}
-	ip.marked = append(ip.marked, markedEntry{actual: actual})
+	ip.marked = append(ip.marked, markedEntry{actual: actual, mcid: mcid, layer: ip.layerName(props)})
 }
 
 type markedEntry struct {
 	actual string
+	mcid   int
+	layer  string
 	used   bool
 }
 
@@ -2227,7 +2477,7 @@ func (ip *interp) endMarkedContent() error {
 		return nil
 	}
 	top := ip.marked[len(ip.marked)-1]
-	if top.actual != "" {
+	if top.actual != "" || top.mcid >= 0 {
 		if err := ip.flushText(); err != nil {
 			return err
 		}
@@ -2251,7 +2501,126 @@ func (ip *interp) takeActualText() string {
 	return ""
 }
 
+func (ip *interp) activeLayer() string {
+	for i := len(ip.marked) - 1; i >= 0; i-- {
+		if ip.marked[i].layer != "" {
+			return ip.marked[i].layer
+		}
+	}
+	return ""
+}
+
+func (ip *interp) layerName(props syntax.Object) string {
+	switch v := props.(type) {
+	case syntax.Ref:
+		if ip.pd.OCNames != nil {
+			return ip.pd.OCNames[v]
+		}
+	case syntax.Array:
+		for _, item := range v {
+			if n := ip.layerName(item); n != "" {
+				return n
+			}
+		}
+	case syntax.Dict:
+		if oc := v.Get("OC"); oc != nil {
+			return ip.layerName(oc)
+		}
+	}
+	return ""
+}
+
+func (ip *interp) groupBlendInfo(d syntax.Dict) (string, int, []byte) {
+	obj := d.Get("CS")
+	obj, _ = ip.resolveObject(obj)
+	switch v := obj.(type) {
+	case syntax.Name:
+		n := 3
+		switch string(v) {
+		case "DeviceGray", "G":
+			n = 1
+		case "DeviceCMYK", "CMYK":
+			n = 4
+		}
+		return string(v), n, nil
+	case syntax.Array:
+		if len(v) < 2 {
+			return "", 0, nil
+		}
+		if family, ok := v[0].(syntax.Name); ok && family == "ICCBased" {
+			stm, ok := ip.resolveObject(v[1])
+			if !ok {
+				return "ICCBased", 0, nil
+			}
+			s, ok := stm.(*syntax.Stream)
+			if !ok || ip.pd.File == nil {
+				return "ICCBased", 0, nil
+			}
+			data, err := ip.pd.File.DecodeStream(ip.ctx, s)
+			if err != nil {
+				return "ICCBased", 0, nil
+			}
+			n, _ := s.Dict.IntValue("N")
+			return "ICCBased", int(n), data
+		}
+	}
+	return "", 0, nil
+}
+
+func (ip *interp) backdropColor(dict syntax.Dict) ([4]float64, bool) {
+	if dict == nil {
+		return [4]float64{}, false
+	}
+	arr, ok := dict.Get("BC").(syntax.Array)
+	if !ok || len(arr) == 0 {
+		return [4]float64{}, false
+	}
+	vals := make([]float64, 0, len(arr))
+	for _, o := range arr {
+		v, ok := num(o)
+		if !ok {
+			return [4]float64{}, false
+		}
+		vals = append(vals, v)
+	}
+	name := ""
+	switch len(vals) {
+	case 1:
+		name = "DeviceGray"
+	case 3:
+		name = "DeviceRGB"
+	case 4:
+		name = "DeviceCMYK"
+	default:
+		return [4]float64{}, false
+	}
+	sp, err := pdfcolor.Load(ip.ctx, ip.pd.File, syntax.Name(name), ip.pd.Tracker, ip.pd.ColorManager)
+	if err != nil {
+		return [4]float64{}, false
+	}
+	rgba, _, err := sp.RGBA(vals)
+	if err != nil {
+		return [4]float64{}, false
+	}
+	return rgba, true
+}
+
 func (ip *interp) ocContentVisible(props syntax.Object) bool {
+	return ip.ocContentVisibleDepth(props, 0)
+}
+
+func (ip *interp) ocVisibleRef(ref syntax.Ref) bool {
+	if ip.pd.OC == nil {
+		return true
+	}
+	visible, ok := ip.pd.OC[ref]
+	return !ok || visible
+}
+
+func (ip *interp) ocContentVisibleDepth(props syntax.Object, depth int) bool {
+	if depth > 32 {
+		return true
+	}
 	if ip.pd.OC == nil {
 		return true
 	}
@@ -2268,23 +2637,112 @@ func (ip *interp) ocContentVisible(props syntax.Object) bool {
 	}
 	switch v := props.(type) {
 	case syntax.Ref:
-		visible, ok := ip.pd.OC[v]
-		return !ok || visible
+		if ip.pd.OC != nil {
+			if visible, ok := ip.pd.OC[v]; ok {
+				return visible
+			}
+		}
+		if obj, ok := ip.resolveObject(v); ok && obj != nil {
+			return ip.ocContentVisibleDepth(obj, depth+1)
+		}
+		return true
 	case syntax.Array:
+		if len(v) > 0 {
+			if n, ok := v[0].(syntax.Name); ok && (n == "And" || n == "Or" || n == "Not") {
+				return ip.ocExprVisible(v, depth+1)
+			}
+		}
 		for _, item := range v {
-			if !ip.ocContentVisible(item) {
+			if !ip.ocContentVisibleDepth(item, depth+1) {
 				return false
 			}
 		}
 		return true
 	case syntax.Dict:
+		if ve := v.Get("VE"); ve != nil {
+			return ip.ocExprVisible(ve, depth+1)
+		}
 		if oc := v.Get("OC"); oc != nil {
-			return ip.ocContentVisible(oc)
+			return ip.ocContentVisibleDepth(oc, depth+1)
+		}
+		if policy, ok := v.NameValue("P"); ok {
+			return ip.ocPolicyVisible(policy, v.Get("OCGs"), depth+1)
 		}
 		return true
 	default:
 		return true
 	}
+}
+
+func (ip *interp) ocExprVisible(expr syntax.Object, depth int) bool {
+	arr, ok := expr.(syntax.Array)
+	if !ok || len(arr) == 0 {
+		return ip.ocContentVisibleDepth(expr, depth+1)
+	}
+	op, ok := arr[0].(syntax.Name)
+	if !ok {
+		return ip.ocContentVisibleDepth(expr, depth+1)
+	}
+	switch string(op) {
+	case "And":
+		for _, item := range arr[1:] {
+			if !ip.ocContentVisibleDepth(item, depth+1) {
+				return false
+			}
+		}
+		return true
+	case "Or":
+		for _, item := range arr[1:] {
+			if ip.ocContentVisibleDepth(item, depth+1) {
+				return true
+			}
+		}
+		return len(arr) == 1
+	case "Not":
+		if len(arr) < 2 {
+			return true
+		}
+		return !ip.ocContentVisibleDepth(arr[1], depth+1)
+	}
+	return ip.ocContentVisibleDepth(expr, depth+1)
+}
+
+func (ip *interp) ocPolicyVisible(policy string, ocgs syntax.Object, depth int) bool {
+	arr, ok := ocgs.(syntax.Array)
+	if !ok {
+		if obj, ok := ip.resolveObject(ocgs); ok {
+			arr, _ = obj.(syntax.Array)
+		}
+		if len(arr) == 0 {
+			if ref, ok := ocgs.(syntax.Ref); ok {
+				arr = syntax.Array{ref}
+			}
+		}
+	}
+	if len(arr) == 0 {
+		return true
+	}
+	var on, off int
+	for _, item := range arr {
+		if ref, ok := item.(syntax.Ref); ok {
+			if ip.ocVisibleRef(ref) {
+				on++
+			} else {
+				off++
+			}
+		}
+	}
+	switch policy {
+	case "AllOn":
+		return off == 0
+	case "AnyOn":
+		return on > 0
+	case "AnyOff":
+		return off > 0
+	case "AllOff":
+		return on == 0
+	}
+	return on > 0
 }
 
 func pathHint(seg []displaylist.Segment, closed bool) displaylist.PathHint {
@@ -2414,8 +2872,10 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 	}
 	var stm *syntax.Stream
 	subtype := "Alpha"
+	var maskDict syntax.Dict
 	switch v := obj.(type) {
 	case syntax.Dict:
+		maskDict = v
 		if s, ok := v.NameValue("S"); ok {
 			subtype = s
 		}
@@ -2443,7 +2903,7 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 			subtype = "Luminosity"
 		}
 	}
-	data, err := ip.pd.File.DecodeStream(ip.ctx, stm)
+	data, err := ip.streamData(stm)
 	if err != nil {
 		return nil, err
 	}
@@ -2460,6 +2920,13 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 		}
 	}
 	ctm := mmul(ip.st.ctm, pm)
+	mk := maskKey{stm: stm, ctm: [6]float64(ctm), subtype: subtype}
+	cacheable := stm.Dict.Has("Resources")
+	if cacheable {
+		if sm, ok := ip.maskCache[mk]; ok {
+			return sm, nil
+		}
+	}
 	nestedPD := ip.pd
 	nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = data, res, [6]float64(ctm)
 	var items []displaylist.Item
@@ -2468,6 +2935,7 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 		return nil
 	})
 	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
+	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
 	ip.masks[stm] = true
 	err = nested.run()
 	delete(ip.masks, stm)
@@ -2483,5 +2951,24 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 			X1: math.Max(p0.X, p1.X), Y1: math.Max(p0.Y, p1.Y),
 		}
 	}
-	return &displaylist.SoftMask{Subtype: subtype, BBox: bbox, Items: items, Clips: nested.clips}, nil
+	sm := &displaylist.SoftMask{Subtype: subtype, BBox: bbox, Items: items, Clips: nested.clips}
+	if bc, ok := ip.backdropColor(maskDict); ok {
+		sm.Backdrop = bc
+		sm.HasBackdrop = true
+	}
+	if cacheable && len(items) > 0 {
+		if ip.cacheLease(estimateSoftMask(sm), "BUD-SMASK-CACHE") {
+			ip.maskCache[mk] = sm
+		}
+	}
+	return sm, nil
+}
+
+func (ip *interp) activeMCID() int {
+	for i := len(ip.marked) - 1; i >= 0; i-- {
+		if ip.marked[i].mcid >= 0 {
+			return ip.marked[i].mcid
+		}
+	}
+	return -1
 }

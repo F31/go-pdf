@@ -7,6 +7,7 @@ import (
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/doc"
 	"github.com/F31/go-pdf/internal/errs"
+	pdftext "github.com/F31/go-pdf/text"
 )
 
 // Box is an axis-aligned rectangle in PDF user space.
@@ -70,6 +71,57 @@ func (p *Page) Walk(ctx context.Context, fn func(displaylist.Item) error) error 
 	return err
 }
 
+// Annotations returns generic annotation and widget metadata.
+func (p *Page) Annotations(ctx context.Context) ([]displaylist.Annotation, error) {
+	if p == nil || p.inner == nil {
+		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "list annotations", -1, 0, -1)
+	}
+	return p.inner.Annotations(ctx)
+}
+
+// Links returns link annotations with page-space rectangles.
+func (p *Page) Links(ctx context.Context) ([]displaylist.Link, error) {
+	if p == nil || p.inner == nil {
+		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "list links", -1, 0, -1)
+	}
+	return p.inner.Links(ctx)
+}
+
+// Label returns the page label (for example "iv" or "A-3").
+func (p *Page) Label(ctx context.Context) (string, error) {
+	if p == nil || p.inner == nil {
+		return "", errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "page label", -1, 0, -1)
+	}
+	return p.inner.Document().PageLabel(ctx, p.Index()), nil
+}
+
+// Text extracts a basic character/word/line index from the page.
+func (p *Page) Text(ctx context.Context) (*pdftext.Page, error) {
+	dl, err := p.DisplayList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pdftext.Extract(dl, pdftext.Options{}), nil
+}
+
+// Search finds query occurrences in the page text.
+func (p *Page) Search(ctx context.Context, query string, opts pdftext.SearchOptions) ([]pdftext.Hit, error) {
+	pg, err := p.Text(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pg.Search(query, opts), nil
+}
+
+// AcquireMemory reserves live memory from the owning document for a transient
+// raster buffer. The returned release function is idempotent.
+func (p *Page) AcquireMemory(bytes int64) (func(), error) {
+	if p == nil || p.doc == nil || p.doc.tracker == nil {
+		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "acquire page memory", -1, 0, -1)
+	}
+	return p.doc.tracker.Acquire(bytes)
+}
+
 // DisplayList materializes the page display list.
 func (p *Page) DisplayList(ctx context.Context) (*displaylist.Page, error) {
 	if err := ctx.Err(); err != nil {
@@ -88,7 +140,7 @@ func (p *Page) DisplayList(ctx context.Context) (*displaylist.Page, error) {
 	}
 	info := p.Info()
 	diags := make([]displaylist.Diagnostic, 0)
-	for _, d := range p.doc.Diagnostics() {
+	for _, d := range p.doc.inner.DiagnosticsForPage(p.Index()) {
 		if d.Page == p.Index() {
 			diags = append(diags, displaylist.Diagnostic{
 				Level: d.Level.String(), Code: d.Code, Msg: d.Msg,
@@ -96,10 +148,24 @@ func (p *Page) DisplayList(ctx context.Context) (*displaylist.Page, error) {
 			})
 		}
 	}
+	label, _ := p.Label(ctx)
 	page := &displaylist.Page{
-		Index: info.Index, Width: info.Width, Height: info.Height, Rotate: info.Rotate,
+		Index: info.Index, Width: info.Width, Height: info.Height, Rotate: info.Rotate, Label: label,
 		MediaBox: rect(info.MediaBox), CropBox: rect(info.CropBox),
 		Clips: res.Clips, Items: items, Diag: diags,
+	}
+	page.Links, _ = p.inner.Links(ctx)
+	page.Annotations, _ = p.inner.Annotations(ctx)
+	if tree, err := p.doc.StructureTree(ctx); err == nil {
+		ids := structureIDs(tree, page.Index)
+		walkItems(page.Items, func(it displaylist.Item) {
+			c := it.Base()
+			if c.MCID >= 0 {
+				if id, ok := ids[c.MCID]; ok {
+					c.StructRef = id
+				}
+			}
+		})
 	}
 	page.Scanned = scannedPage(items, page.CropBox)
 	return page, nil
@@ -186,4 +252,23 @@ func walkItems(items []displaylist.Item, fn func(displaylist.Item)) {
 			walkItems(g.Items, fn)
 		}
 	}
+}
+
+func structureIDs(tree []StructElement, page int) map[int]int {
+	ids := map[int]int{}
+	var walk func([]StructElement)
+	walk = func(nodes []StructElement) {
+		for _, n := range nodes {
+			if n.Page == page {
+				for _, mcid := range n.MCIDs {
+					if n.ID > 0 {
+						ids[mcid] = n.ID
+					}
+				}
+			}
+			walk(n.Children)
+		}
+	}
+	walk(tree)
+	return ids
 }

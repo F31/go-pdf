@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/F31/go-pdf/internal/budget"
+	"github.com/F31/go-pdf/internal/crypt"
 	"github.com/F31/go-pdf/internal/diag"
 	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/filter"
@@ -34,9 +35,10 @@ type XRefEntry struct {
 }
 
 type Options struct {
-	Repair  bool
-	Tracker *budget.Tracker
-	Diag    *diag.Collector
+	Repair   bool
+	Password string
+	Tracker  *budget.Tracker
+	Diag     *diag.Collector
 }
 
 type cacheItem struct {
@@ -50,15 +52,18 @@ type File struct {
 	tracker *budget.Tracker
 	diag    *diag.Collector
 
-	mu        sync.Mutex
-	closed    bool
-	xref      map[int]XRefEntry
-	trailer   Dict
-	cache     map[Ref]*list.Element
-	lru       *list.List
-	objStm    map[Ref]Object
-	repaired  map[Ref]Object
-	expanding map[int]bool
+	mu         sync.Mutex
+	closed     bool
+	xref       map[int]XRefEntry
+	trailer    Dict
+	cache      map[Ref]*list.Element
+	lru        *list.List
+	objStm     map[Ref]Object
+	repaired   map[Ref]Object
+	expanding  map[int]bool
+	crypt      *crypt.Handler
+	encryptRef Ref
+	encryptSet bool
 
 	repairedFlag bool
 	header       string
@@ -105,6 +110,9 @@ func Open(ctx context.Context, data []byte, opts Options) (f *File, err error) {
 		}
 		return f, nil
 	} else if err != nil {
+		return nil, err
+	}
+	if err := f.initSecurity(ctx, opts.Password); err != nil {
 		return nil, err
 	}
 	if opts.Repair {
@@ -560,14 +568,25 @@ func (f *File) objStmObjects(ctx context.Context, stm *Stream) (map[Ref]Object, 
 
 // decodeStream applies the stream's filter chain.
 func (f *File) decodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
+	raw := stm.Raw
+	if f.crypt != nil && stm.Ref.Num != 0 {
+		typ, _ := stm.Dict.NameValue("Type")
+		if typ != "XRef" && !(typ == "Metadata" && !f.crypt.MetadataEncrypted()) {
+			var err error
+			raw, err = f.crypt.DecryptStream(stm.Ref.Num, stm.Ref.Gen, raw)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	names, parms, err := f.filterSpec(ctx, stm.Dict)
 	if err != nil {
 		return nil, err
 	}
 	if len(names) == 0 {
-		return stm.Raw, nil
+		return raw, nil
 	}
-	r, err := filter.DecodeChain(ctx, bytes.NewReader(stm.Raw), names, parms, f.tracker, int64(len(stm.Raw)))
+	r, err := filter.DecodeChain(ctx, bytes.NewReader(raw), names, parms, f.tracker, int64(len(raw)))
 	if err != nil {
 		return nil, err
 	}
@@ -770,7 +789,7 @@ func (f *File) parseIndirectAt(ctx context.Context, offset int64, lenient bool) 
 			if p.hasKeyword("endstream") {
 				p.pos += len("endstream")
 			}
-			obj = &Stream{Dict: d, Raw: raw, Offset: offset}
+			obj = &Stream{Dict: d, Raw: raw, Offset: offset, Ref: ref}
 		} else {
 			p.pos = save
 		}
@@ -778,6 +797,9 @@ func (f *File) parseIndirectAt(ctx context.Context, offset int64, lenient bool) 
 	p.skipSpace()
 	if p.hasKeyword("endobj") {
 		p.pos += len("endobj")
+	}
+	if f.crypt != nil && !(f.encryptSet && ref == f.encryptRef) {
+		obj = f.decryptObject(obj, ref)
 	}
 	return ref, obj, nil
 }
@@ -930,4 +952,99 @@ func (f *File) DecodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
 		return nil, errs.Wrap(errs.ErrClosed, "SYN-CLOSED", "decode stream", stm.Offset, 0, -1)
 	}
 	return f.decodeStream(ctx, stm)
+}
+
+func (f *File) initSecurity(ctx context.Context, password string) error {
+	v, ok := f.trailer["Encrypt"]
+	if !ok {
+		return nil
+	}
+	if r, ok := v.(Ref); ok {
+		f.encryptRef, f.encryptSet = r, true
+	}
+	obj, err := f.Resolve(ctx, v)
+	if err != nil {
+		return err
+	}
+	dict, ok := obj.(Dict)
+	if !ok {
+		return errs.Wrap(errs.ErrCorrupt, "CRY-ENCRYPT-TYPE", "read encrypt dictionary", -1, 0, -1)
+	}
+	filter, _ := dict.NameValue("Filter")
+	if filter != "Standard" {
+		return errs.Wrap(errs.ErrUnsupported, "CRY-PUBFILTER", "unsupported security handler", -1, 0, -1)
+	}
+	vNum, _ := dict.IntValue("V")
+	rNum, _ := dict.IntValue("R")
+	length, _ := dict.IntValue("Length")
+	pNum, _ := dict.IntValue("P")
+	oObj, _ := dict.Get("O").(String)
+	uObj, _ := dict.Get("U").(String)
+	oeObj, _ := dict.Get("OE").(String)
+	ueObj, _ := dict.Get("UE").(String)
+	permsObj, _ := dict.Get("Perms").(String)
+	encMeta := true
+	if b, ok := dict.Get("EncryptMetadata").(Bool); ok {
+		encMeta = bool(b)
+	}
+	var id []byte
+	if arr, ok := f.trailer.Get("ID").(Array); ok && len(arr) > 0 {
+		if s, ok := arr[0].(String); ok {
+			id = []byte(s)
+		}
+	}
+	filters := map[string]crypt.Filter{}
+	if cf, ok := dict.Get("CF").(Dict); ok {
+		for name, raw := range cf {
+			fd, ok := raw.(Dict)
+			if !ok {
+				continue
+			}
+			cfm, _ := fd.NameValue("CFM")
+			flen, _ := fd.IntValue("Length")
+			filters[string(name)] = crypt.Filter{CFM: cfm, Length: int(flen)}
+		}
+	}
+	stmF, _ := dict.NameValue("StmF")
+	strF, _ := dict.NameValue("StrF")
+	h, err := crypt.New(crypt.Options{
+		V: int(vNum), R: int(rNum), Length: int(length), P: int(pNum),
+		O: []byte(oObj), U: []byte(uObj), OE: []byte(oeObj), UE: []byte(ueObj),
+		Perms: []byte(permsObj), ID: id, EncryptMetadata: encMeta,
+		StmF: stmF, StrF: strF, Filters: filters,
+	}, password)
+	if err != nil {
+		return err
+	}
+	f.crypt = h
+	return nil
+}
+
+func (f *File) decryptObject(obj Object, ref Ref) Object {
+	switch v := obj.(type) {
+	case String:
+		b, err := f.crypt.DecryptString(ref.Num, ref.Gen, []byte(v))
+		if err != nil {
+			return v
+		}
+		return String(b)
+	case Array:
+		for i := range v {
+			v[i] = f.decryptObject(v[i], ref)
+		}
+		return v
+	case Dict:
+		for k, val := range v {
+			v[k] = f.decryptObject(val, ref)
+		}
+		return v
+	case *Stream:
+		if v.Dict != nil {
+			v.Dict = f.decryptObject(v.Dict, ref).(Dict)
+		}
+		v.Ref = ref
+		return v
+	default:
+		return obj
+	}
 }
