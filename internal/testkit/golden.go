@@ -2,9 +2,12 @@ package testkit
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -30,6 +33,61 @@ func Golden(t testing.TB, path string, got []byte) {
 		return
 	}
 	t.Fatalf("golden mismatch %s:\n%s", path, lineDiff(want, got))
+}
+
+// GoldenJSON compares JSON with floats rounded to six decimal places. It keeps
+// integer fields (including signatures) exact while avoiding architecture-
+// specific low-bit differences in computed geometry.
+func GoldenJSON(t testing.TB, path string, got []byte) {
+	t.Helper()
+	normalized, err := normalizeJSON(got)
+	if err != nil {
+		t.Fatalf("golden json normalize %s: %v", path, err)
+	}
+	Golden(t, path, normalized)
+}
+
+func normalizeJSON(data []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	v = normalizeJSONValue(v)
+	return json.Marshal(v)
+}
+
+func normalizeJSONValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, value := range x {
+			x[k] = normalizeJSONValue(value)
+		}
+		return x
+	case []any:
+		for i, value := range x {
+			x[i] = normalizeJSONValue(value)
+		}
+		return x
+	case json.Number:
+		s := x.String()
+		if !strings.ContainsAny(s, ".eE") {
+			if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+				return u
+			}
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return i
+			}
+		}
+		f, err := x.Float64()
+		if err != nil {
+			return s
+		}
+		return math.Round(f*1e6) / 1e6
+	default:
+		return v
+	}
 }
 
 func lineDiff(want, got []byte) string {

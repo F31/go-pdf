@@ -166,7 +166,7 @@ func TestDisplayListTextGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testkit.Golden(t, "testdata/goldens/displaylist-text.json", b)
+	testkit.GoldenJSON(t, "testdata/goldens/displaylist-text.json", b)
 }
 
 func TestTextMetricsGolden(t *testing.T) {
