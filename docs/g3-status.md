@@ -77,7 +77,8 @@
   - Pattern 内容继承当前 ExtGState，`/SMask` 对 tiling/shading pattern 均生效
   - `PatternType 2` 解析 `/Shading`，支持 axial/radial shading pattern；按路径 mask 合成。mesh/function shading pattern 记录诊断并按设计降级
   - `ShadingType 1` 记录为 `ShadingFunction`；`4–7` 记录为 `ShadingMesh` 并保留原始码流
-  - 当前渲染支持 type 6/7 patch；type 4/5 尚未解码渲染，pattern 内 mesh/function 记录诊断，不静默近似
+  - 渲染支持 type 4–7：type 4/5 顶点网格与 type 6/7 patch；支持 `/Function` 颜色、32 MiB 流上限；超限或空流记录诊断，不静默近似
+  - Pattern 子渲染器的临时租约在 tile 完成后释放，避免跨页累计导致 `BUD-LIVE-MEMORY`
 - 渐变：
   - 支持 `ShadingType 2`（轴向）与 `3`（径向），输出 `displaylist.Shading`
   - 函数结果通过颜色空间转为 64 个色标，保留 `Extend` 与 CTM 变换

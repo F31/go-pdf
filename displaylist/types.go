@@ -360,6 +360,9 @@ type ShadingGrid struct {
 	Colors [][4]float64
 }
 
+// MeshColorFunc maps mesh colour components through the shading function.
+type MeshColorFunc func([]float64) ([]float64, error)
+
 type Shading struct {
 	Common
 	Kind              ShadingKind
@@ -375,8 +378,13 @@ type Shading struct {
 	ColorSpace        string
 	MeshType          int
 	VerticesPerRow    int
-	Matrix            Matrix
-	Grid              *ShadingGrid
+	// MeshComponents is the number of decoded colour components per vertex.
+	// Zero means the shading colour space's component count.
+	MeshComponents int `json:"-"`
+	// MeshColor applies the Type 4-7 /Function. It is not serialized.
+	MeshColor MeshColorFunc `json:"-"`
+	Matrix    Matrix
+	Grid      *ShadingGrid
 }
 
 type Backdrop struct {

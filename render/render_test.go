@@ -1538,3 +1538,83 @@ func TestBlendPremultipliedAlpha(t *testing.T) {
 		t.Fatalf("drawPixel produced empty pixel")
 	}
 }
+
+func TestRenderMeshFunctionColors(t *testing.T) {
+	raw := []byte{
+		0, 0, 0, 0,
+		0, 100, 0, 255,
+		0, 0, 100, 255,
+	}
+	objs := pageObjs("/Sh1 sh",
+		testkit.Stream(6, "<< /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 100 0 100 0 1] /Function 7 0 R >>", raw),
+		testkit.Raw(7, "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>"),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Shading << /Sh1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, _ := img.At(5, 95).RGBA()
+	if r>>8 == 255 && g>>8 == 255 && b>>8 == 255 {
+		t.Fatalf("mesh function produced white at (5,95)")
+	}
+	if r>>8 <= g>>8 || r>>8 <= b>>8 {
+		t.Fatalf("mesh function colour = %v %v %v", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestRenderTilingPatternReleasesChildLeases(t *testing.T) {
+	objs := pageObjs("/Pattern cs /P1 scn 0 0 100 100 re f",
+		testkit.Stream(6, "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >> >>", []byte("q 0 0 5 5 re W n 1 0 0 rg 0 0 5 5 re f Q")),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	mem := &testMemory{limit: 1 << 20}
+	_, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white", Memory: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mem.used != 0 {
+		t.Fatalf("pattern child lease leaked: %d", mem.used)
+	}
+}
+
+func TestStrokeHalfWidthPolicy(t *testing.T) {
+	cases := []struct {
+		width, scale, min, want float64
+	}{
+		{0.1, 1, 0, 0.5},
+		{0.1, 1, -1, 0.05},
+		{0, 1, -1, 0.5},
+		{2, 1, 1, 1},
+		{0.1, 2, 1, 0.5},
+	}
+	for _, tc := range cases {
+		if got := strokeHalfWidth(tc.width, tc.scale, tc.min); got != tc.want {
+			t.Fatalf("strokeHalfWidth(%v,%v,%v)=%v want %v", tc.width, tc.scale, tc.min, got, tc.want)
+		}
+	}
+}
+
+func TestRenderMeshPattern(t *testing.T) {
+	raw := []byte{
+		0, 0, 0, 255, 0, 0,
+		0, 255, 0, 0, 255, 0,
+		0, 0, 255, 0, 0, 255,
+	}
+	objs := pageObjs("/Pattern cs /P1 scn 0 0 100 100 re f",
+		testkit.Stream(6, "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 100 100] /XStep 100 /YStep 100 /Resources << /Shading << /Sh1 7 0 R >> >> >>", []byte("/Sh1 sh")),
+		testkit.Stream(7, "<< /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 100 0 100 0 1 0 1 0 1] >>", raw),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, _ := img.At(5, 95).RGBA()
+	if r>>8 == 255 && g>>8 == 255 && b>>8 == 255 {
+		t.Fatalf("mesh pattern produced white at (5,95)")
+	}
+}

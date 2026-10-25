@@ -157,6 +157,7 @@ type interp struct {
 	decoded      map[*syntax.Stream][]byte
 	patternCache map[patternKey]*displaylist.Pattern
 	maskCache    map[maskKey]*displaylist.SoftMask
+	cache        *cacheState
 	skipDepth    int
 	marked       []markedEntry
 	result       Result
@@ -164,6 +165,7 @@ type interp struct {
 
 func Interpret(ctx context.Context, pd PageData, emit func(displaylist.Item) error) (*Result, error) {
 	ip := newInterp(ctx, pd, emit)
+	defer ip.releaseCache()
 	if err := ip.run(); err != nil {
 		return nil, err
 	}
@@ -184,6 +186,7 @@ func newInterp(ctx context.Context, pd PageData, emit func(displaylist.Item) err
 		forms: map[*syntax.Stream]bool{}, patterns: map[*syntax.Stream]bool{}, masks: map[*syntax.Stream]bool{},
 		decoded: map[*syntax.Stream][]byte{}, patternCache: map[patternKey]*displaylist.Pattern{},
 		maskCache: map[maskKey]*displaylist.SoftMask{},
+		cache:     &cacheState{},
 	}
 	ip.st = state{
 		ctm: matrix(pd.Matrix), clip: -1, lineWidth: 1, cap: 0, join: 0, miter: 10, hscale: 1,
@@ -804,6 +807,7 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 				})
 				nested.forms, nested.patterns = ip.forms, ip.patterns
 				nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+				nested.cache = ip.cache
 				if paintType == 2 && len(base) > 0 {
 					if sp, paint, ok := basePaint(base); ok {
 						nested.st.fill, nested.st.stroke = paint, paint
@@ -1287,6 +1291,7 @@ func (ip *interp) type3ClipPath(g displaylist.Glyph, f *font.Font) ([]displaylis
 	})
 	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
 	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+	nested.cache = ip.cache
 	nested.st = ip.st.clone()
 	nested.st.ctm = matrix(nestedPD.Matrix)
 	nested.type3Glyphs = ip.type3Glyphs
@@ -1614,6 +1619,7 @@ func (ip *interp) expandType3(c font.Code, trm matrix) error {
 		return ip.emit(item)
 	})
 	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+	nested.cache = ip.cache
 	nested.st.fill = ip.st.fill
 	nested.st.stroke = ip.st.stroke
 	nested.st.lineWidth = ip.st.lineWidth
@@ -1928,6 +1934,7 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 	})
 	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
 	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+	nested.cache = ip.cache
 	nested.st = ip.st.clone()
 	nested.st.ctm = ctm
 	if preserveGroup {
@@ -2328,6 +2335,19 @@ func (ip *interp) doShading() error {
 		return ip.functionShading(dict)
 	}
 	if kind >= 4 && kind <= 7 {
+		if stm, ok := obj.(*syntax.Stream); ok {
+			const maxMeshDecoded = 32 << 20
+			decoded, err := ip.pd.File.DecodeStreamLimit(ip.ctx, stm, maxMeshDecoded)
+			if err != nil {
+				ip.diagOnce(diag.Degraded, "CNT-SHADING-MESH-LIMIT", "mesh stream exceeds decode limit")
+				return nil
+			}
+			raw = decoded
+		}
+		if len(raw) == 0 {
+			ip.diagOnce(diag.Degraded, "CNT-SHADING-MESH-RAW", "mesh stream is empty")
+			return nil
+		}
 		c := ip.common()
 		c.Bounds = ip.pd.CropBox
 		if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
@@ -2352,7 +2372,16 @@ func (ip *interp) doShading() error {
 		if v := dict.Get("ColorSpace"); v != nil {
 			item.ColorSpace = colorSpaceName(v)
 		}
-		ip.diagOnce(diag.Info, "CNT-SHADING-MESH", "mesh shading passed through raw stream")
+		if v := dict.Get("Function"); dict.Has("Function") {
+			fn, err := pdfunction.Load(ip.ctx, ip.pd.File, v, ip.pd.Tracker)
+			if err != nil || fn.Inputs() <= 0 {
+				ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot load mesh function")
+				return nil
+			}
+			item.MeshComponents = fn.Inputs()
+			item.MeshColor = fn.Eval
+		}
+		ip.diagOnce(diag.Info, "CNT-SHADING-MESH", "mesh shading decoded")
 		return ip.emit(item)
 	}
 	if kind != 2 && kind != 3 {
@@ -3036,6 +3065,7 @@ func (ip *interp) buildSoftMask(obj syntax.Object) (*displaylist.SoftMask, error
 	})
 	nested.forms, nested.patterns, nested.masks = ip.forms, ip.patterns, ip.masks
 	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
+	nested.cache = ip.cache
 	ip.masks[stm] = true
 	err = nested.run()
 	delete(ip.masks, stm)

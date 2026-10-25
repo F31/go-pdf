@@ -22,6 +22,9 @@ func (rr *regionRenderer) patchMesh(s *displaylist.Shading) error {
 		return nil
 	}
 	ncomp := space.Components()
+	if s.MeshComponents > 0 {
+		ncomp = s.MeshComponents
+	}
 	if ncomp <= 0 {
 		return nil
 	}
@@ -60,6 +63,13 @@ func (rr *regionRenderer) patchMesh(s *displaylist.Shading) error {
 		for j := 0; j < ncomp; j++ {
 			raw := float64(br.read(s.BitsPerComponent)) / maxg
 			comps[j] = decode[4+2*j] + raw*(decode[5+2*j]-decode[4+2*j])
+		}
+		if s.MeshColor != nil {
+			out, err := s.MeshColor(comps)
+			if err != nil || len(out) != space.Components() {
+				return [4]float64{}, false
+			}
+			comps = out
 		}
 		rgba, _, err := space.RGBA(comps)
 		if err != nil {

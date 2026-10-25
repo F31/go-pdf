@@ -57,6 +57,10 @@ type PageOptions struct {
 	// to charge the owning document's live-memory budget. The returned image is
 	// owned by the caller and is not covered by this lease.
 	Memory MemoryBudget
+	// MinStrokeWidth is the Preview minimum stroke width in device pixels.
+	// Zero uses one pixel, negative disables the minimum for non-zero widths,
+	// and zero-width PDF hairlines still use one pixel.
+	MinStrokeWidth float64
 }
 
 // MemoryBudget accounts transient raster allocations such as path/text
@@ -1019,9 +1023,11 @@ func (rr *regionRenderer) pattern(p *displaylist.Path, mask *image.Alpha) {
 					continue
 				}
 				if err := child.renderItem(it); err != nil {
+					child.releaseAll()
 					return
 				}
 			}
+			child.releaseAll()
 		}
 	}
 }
@@ -1046,10 +1052,7 @@ func (rr *regionRenderer) fill(dst *image.RGBA, seg []displaylist.Segment, rule 
 }
 
 func (rr *regionRenderer) stroke(dst *image.RGBA, seg []displaylist.Segment, paint *displaylist.Paint, alpha float64, offset image.Point, line displaylist.LineStyle, closed bool) {
-	half := line.Width * rr.scale / 2
-	if half < 0.5 {
-		half = 0.5
-	}
+	half := strokeHalfWidth(line.Width, rr.scale, rr.opts.MinStrokeWidth)
 	if paint == nil || paint.Kind != displaylist.PaintSolid || half <= 0 {
 		return
 	}
@@ -1067,6 +1070,23 @@ func (rr *regionRenderer) stroke(dst *image.RGBA, seg []displaylist.Segment, pai
 		strokePoints(&r, pts, half, line, closed)
 	}
 	r.Draw(dst, dst.Bounds(), image.NewUniform(rr.solidColor(paint.RGBA, alpha)), image.Point{})
+}
+
+func strokeHalfWidth(width, scale, minDevicePixels float64) float64 {
+	if width <= 0 {
+		return 0.5
+	}
+	half := width * scale / 2
+	if minDevicePixels < 0 {
+		return half
+	}
+	if minDevicePixels == 0 {
+		minDevicePixels = 1
+	}
+	if minHalf := minDevicePixels / 2; half < minHalf {
+		half = minHalf
+	}
+	return half
 }
 
 func (rr *regionRenderer) composite(src *image.RGBA, at image.Point, clip int, mode string) {
@@ -1511,6 +1531,9 @@ func (rr *regionRenderer) mesh(s *displaylist.Shading) error {
 		return nil
 	}
 	ncomp := space.Components()
+	if s.MeshComponents > 0 {
+		ncomp = s.MeshComponents
+	}
 	if ncomp <= 0 {
 		return nil
 	}
@@ -1551,6 +1574,13 @@ func (rr *regionRenderer) mesh(s *displaylist.Shading) error {
 		for j := 0; j < ncomp; j++ {
 			raw := float64(br.read(s.BitsPerComponent)) / maxg
 			comps[j] = decode[4+2*j] + raw*(decode[5+2*j]-decode[4+2*j])
+		}
+		if s.MeshColor != nil {
+			out, err := s.MeshColor(comps)
+			if err != nil || len(out) != space.Components() {
+				return vertex{}, false
+			}
+			comps = out
 		}
 		rgba, _, err := space.RGBA(comps)
 		if err != nil {
@@ -1623,6 +1653,11 @@ func (rr *regionRenderer) mesh(s *displaylist.Shading) error {
 		if len(tri)%3 != 0 {
 			return nil
 		}
+	}
+	const maxMeshVertices = 1 << 20
+	const maxMeshTriangles = 1 << 21
+	if len(verts) > maxMeshVertices || len(tri)/3 > maxMeshTriangles {
+		return errs.Wrap(errs.ErrBudget, "RND-MESH-BUDGET", "render mesh", -1, 0, -1)
 	}
 	clip := rr.clipMask(s.Clip)
 	for i := 0; i+2 < len(tri); i += 3 {

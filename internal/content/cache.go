@@ -55,13 +55,31 @@ func estimateClips(clips []displaylist.Clip) int64 {
 	return n
 }
 
+type cacheState struct {
+	releases []func()
+}
+
 func (ip *interp) cacheLease(n int64, code string) bool {
 	if n <= 0 || ip.pd.Lease == nil {
 		return true
 	}
-	if _, err := ip.pd.Lease(n); err != nil {
+	release, err := ip.pd.Lease(n)
+	if err != nil {
 		ip.diagOnce(diag.Degraded, code, "cache budget exceeded")
 		return false
 	}
+	if ip.cache != nil && release != nil {
+		ip.cache.releases = append(ip.cache.releases, release)
+	}
 	return true
+}
+
+func (ip *interp) releaseCache() {
+	if ip.cache == nil {
+		return
+	}
+	for i := len(ip.cache.releases) - 1; i >= 0; i-- {
+		ip.cache.releases[i]()
+	}
+	ip.cache.releases = nil
 }
