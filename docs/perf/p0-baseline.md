@@ -26,6 +26,7 @@
   `POPPLER_CORPUS_FONT_DIR` 固定字体目录。
 - 质量指标拆分为 Core/Preview/Extended，见 `docs/perf/quality-layers.md`。
 - CI 增加 macOS/Windows 的 `CGO_ENABLED=0` 构建、vet 与 test；Linux 继续跑 race。
+- 修正跨平台测试：`.gitattributes` 固定 golden 为 LF、PDF/字体/图片为 binary；Windows 跳过 POSIX shell 的 OpenJPEG fake adapter；displaylist signature 使用跨架构稳定的浮点哈希；golden JSON 使用 6 位小数容差。
 
 未改变的能力边界：
 
@@ -79,8 +80,9 @@ POPPLER_CORPUS_FONT_DIR=/usr/share/fonts ... ./scripts/corpus-poppler-full.sh
 - 能力表/README/状态文档与实现一致：通过。
 - 固定字体 57 页样本可重复运行：通过，0 render_error。
 - Core/Preview/Extended 指标分离：`docs/perf/quality-layers.md`。
-- Linux/macOS/Windows CI 基线：已加入 workflow；需远端 runner 验证。
+- Linux/macOS/Windows CI 基线：通过，run 40159890850 全部 10 个 job success。
 - 调试输出/临时文件清理：仓库内无 `println` 调试；已删除本地 `go-pdf.test`。
 - 全量测试：`go test ./...`、`CGO_ENABLED=0 go test ./...`、`go test -race ./...`、
   `go vet ./...`、`staticcheck ./...`：通过。
-- GitHub Actions 语法：`actionlint .github/workflows/ci.yml`：通过；远端 runner 仍需 push 后验证。
+- GitHub Actions 语法：`actionlint .github/workflows/ci.yml`：通过。
+- 远端 CI：https://github.com/F31/go-pdf/actions/runs/40159890850（10/10 success）。
