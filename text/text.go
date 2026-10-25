@@ -172,43 +172,57 @@ func Extract(dl *displaylist.Page, opts Options) *Page {
 		}
 		if tr.ActualText != "" {
 			g := tr.Glyphs[0]
+			size := glyphSize(g.Matrix, tr.Size)
+			if tr.Size > size {
+				size = tr.Size
+			}
 			adv := tr.Bounds.X1 - tr.Bounds.X0
 			if tr.Vertical {
 				adv = tr.Bounds.Y1 - tr.Bounds.Y0
 			}
 			rotation := glyphRotation(g.Matrix)
-			quad := glyphQuad(g.Origin, adv, tr.Size, g.Matrix)
+			quad := glyphQuad(g.Origin, adv, size, g.Matrix)
 			if tr.Vertical {
 				rotation = 90
-				quad = verticalQuad(g.Origin, adv, tr.Size)
+				quad = verticalQuad(g.Origin, adv, size)
 			}
 			out.Chars = append(out.Chars, Char{
 				Text: opts.Normalization.apply(tr.ActualText), Origin: g.Origin, Advance: adv,
-				Size: tr.Size, Bounds: tr.Bounds, Font: tr.Font, UnicodeOK: true,
+				Size: size, Bounds: tr.Bounds, Font: tr.Font, UnicodeOK: true,
 				Vertical: tr.Vertical, ActualText: tr.ActualText, StructRef: tr.StructRef,
 				Rotation: rotation, Quad: quad,
 			})
 			continue
 		}
 		for _, g := range tr.Glyphs {
+			size := glyphSize(g.Matrix, tr.Size)
+			if tr.Size > size {
+				size = tr.Size
+			}
+			scale := 1.0
+			if tr.Size > 0 {
+				scale = size / tr.Size
+			}
+			adv := g.Advance * scale
+			ascent, descent := fontAscentDescent(tr.Font, size)
 			b := displaylist.Rect{
-				X0: g.Origin.X, Y0: g.Origin.Y - tr.Size,
-				X1: g.Origin.X + g.Advance, Y1: g.Origin.Y + tr.Size*0.2,
+				X0: g.Origin.X, Y0: g.Origin.Y - ascent,
+				X1: g.Origin.X + adv, Y1: g.Origin.Y - descent,
 			}
 			if tr.Vertical {
 				b = displaylist.Rect{
-					X0: g.Origin.X - tr.Size*0.5, Y0: g.Origin.Y - tr.Size,
-					X1: g.Origin.X + tr.Size*0.5, Y1: g.Origin.Y + tr.Size*0.2,
+					X0: g.Origin.X - size*0.5, Y0: g.Origin.Y - size,
+					X1: g.Origin.X + size*0.5, Y1: g.Origin.Y + size*0.2,
 				}
 			}
 			rotation := glyphRotation(g.Matrix)
-			quad := glyphQuad(g.Origin, g.Advance, tr.Size, g.Matrix)
+			quad := glyphQuad(g.Origin, adv, size, g.Matrix)
 			if tr.Vertical {
 				rotation = 90
-				quad = verticalQuad(g.Origin, g.Advance, tr.Size)
+				quad = verticalQuad(g.Origin, adv, size)
 			}
 			out.Chars = append(out.Chars, Char{
-				Text: opts.Normalization.apply(g.Text), Origin: g.Origin, Advance: g.Advance, Size: tr.Size,
+				Text: opts.Normalization.apply(g.Text), Origin: g.Origin, Advance: adv, Size: size,
 				Bounds: b, Font: tr.Font, UnicodeOK: g.UnicodeOK, Vertical: tr.Vertical,
 				StructRef: tr.StructRef, Rotation: rotation, Quad: quad,
 			})
@@ -827,6 +841,27 @@ func glyphRotation(m displaylist.Matrix) float64 {
 		return 0
 	}
 	return math.Atan2(m[1], m[0]) * 180 / math.Pi
+}
+
+func fontAscentDescent(font *displaylist.FontInfo, size float64) (ascent, descent float64) {
+	ascent, descent = size, -size*0.2
+	if font == nil {
+		return ascent, descent
+	}
+	if font.Ascent > 0 {
+		ascent = font.Ascent * size / 1000
+	}
+	if font.Descent < 0 {
+		descent = font.Descent * size / 1000
+	}
+	return ascent, descent
+}
+
+func glyphSize(m displaylist.Matrix, fallback float64) float64 {
+	if s := math.Hypot(m[2], m[3]); s > 0 {
+		return s
+	}
+	return fallback
 }
 
 func glyphQuad(origin displaylist.Point, advance, size float64, m displaylist.Matrix) [4]displaylist.Point {

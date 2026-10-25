@@ -352,3 +352,27 @@ func TestRotatedTextMetadata(t *testing.T) {
 		t.Fatalf("search quads = %#v", hits)
 	}
 }
+
+func TestExtractScaledGlyphMetrics(t *testing.T) {
+	font := &displaylist.FontInfo{BaseFont: "Test", Ascent: 1056, Descent: -328}
+	run := &displaylist.TextRun{Size: 1, Font: font, Glyphs: []displaylist.Glyph{{
+		Text: "A", UnicodeOK: true,
+		Origin:  displaylist.Point{X: 10, Y: 50},
+		Advance: 0.5,
+		Matrix:  displaylist.Matrix{20, 0, 0, -20, 10, 50},
+	}}}
+	p := Extract(&displaylist.Page{Width: 100, Height: 100, Items: []displaylist.Item{run}}, Options{})
+	if len(p.Chars) != 1 {
+		t.Fatalf("chars = %#v", p.Chars)
+	}
+	c := p.Chars[0]
+	if math.Abs(c.Size-20) > 0.001 || math.Abs(c.Advance-10) > 0.001 {
+		t.Fatalf("size/advance = %v/%v", c.Size, c.Advance)
+	}
+	if math.Abs(c.Bounds.Y0-(50-21.12)) > 0.001 || math.Abs(c.Bounds.Y1-(50+6.56)) > 0.001 {
+		t.Fatalf("bounds = %+v", c.Bounds)
+	}
+	if math.Abs(c.Bounds.X1-20) > 0.001 {
+		t.Fatalf("x bounds = %+v", c.Bounds)
+	}
+}

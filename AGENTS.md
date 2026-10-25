@@ -14,6 +14,8 @@
 - Licence inventory: `./scripts/check-licenses.sh`
 - Quality metadata: `./scripts/quality-metadata.sh`
 - Cross-engine diagnostic: `./scripts/cross-engine.sh <pdf> [page]`
+- English corpus fetch: `./scripts/fetch-english-corpus.sh /tmp/english-corpus`
+- English text-position P95: `./scripts/english-text-position.sh /tmp/english-corpus`
 - Performance gate: `./scripts/perf-gate.sh`
 - Release checks: `./scripts/release-check.sh`
 - Poppler reference cache: add `POPPLER_CORPUS_REF_CACHE=/tmp/poppler-ref` (cached PNGs; reuses Poppler output between runs)
