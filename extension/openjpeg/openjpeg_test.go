@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/F31/go-pdf/extension"
@@ -57,6 +58,9 @@ func TestPlaneFromImage(t *testing.T) {
 }
 
 func TestDecodeWithFakeBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opj_decompress requires a POSIX shell")
+	}
 	dir := t.TempDir()
 	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
 	img.Set(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
