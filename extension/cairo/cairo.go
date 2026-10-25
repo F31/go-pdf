@@ -8,6 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/F31/go-pdf/extension"
+	"github.com/F31/go-pdf/internal/procutil"
 )
 
 // Renderer invokes pdftocairo. It is safe for concurrent use when its exported
@@ -15,6 +18,8 @@ import (
 type Renderer struct {
 	Binary   string
 	Password string
+	// MaxOutputBytes limits the produced SVG; zero uses 64 MiB.
+	MaxOutputBytes int64
 }
 
 // New returns a renderer using binary (or pdftocairo when empty).
@@ -33,16 +38,12 @@ func (r *Renderer) Version(ctx context.Context) (string, error) {
 	if r == nil {
 		return "", errors.New("cairo: nil renderer")
 	}
-	cmd := exec.CommandContext(ctx, r.Binary, "-v")
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	out, err := procutil.Run(ctx, r.Binary, "-v")
+	text := strings.TrimSpace(out)
 	if text == "" && err != nil {
 		return "", err
 	}
-	if i := strings.IndexByte(text, '\n'); i >= 0 {
-		text = text[:i]
-	}
-	return text, nil
+	return procutil.FirstLine(text), nil
 }
 
 // RenderSVG renders a 0-based page to SVG bytes through pdftocairo. The SVG is
@@ -65,17 +66,40 @@ func (r *Renderer) RenderSVG(ctx context.Context, path string, page int) ([]byte
 		args = append(args, "-upw", r.Password)
 	}
 	args = append(args, path, prefix)
-	cmd := exec.CommandContext(ctx, r.Binary, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := procutil.Run(ctx, r.Binary, args...)
 	if err != nil {
-		return nil, fmt.Errorf("cairo: render page %d: %w: %s", page, err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("cairo: render page %d: %w: %s", page, err, strings.TrimSpace(out))
 	}
-	svg, err := os.ReadFile(prefix)
+	limit := r.MaxOutputBytes
+	if limit <= 0 {
+		limit = 64 << 20
+	}
+	svg, err := procutil.ReadFile(prefix, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cairo: SVG output: %w", err)
 	}
 	if len(svg) == 0 || !strings.Contains(string(svg[:min(len(svg), 256)]), "<svg") {
 		return nil, errors.New("cairo: output is not SVG")
 	}
 	return svg, nil
+}
+
+// ProviderInfo reports the external pdftocairo binary metadata.
+func (r *Renderer) ProviderInfo(ctx context.Context) extension.ProviderInfo {
+	version, _ := r.Version(ctx)
+	if version == "" {
+		version = "unknown"
+	}
+	return extension.ProviderInfo{
+		Name: "poppler-cairo", Version: version, License: "GPL-2.0-or-later",
+		Determinism: extension.PlatformDependent,
+	}
+}
+
+// Features reports the optional SVG path.
+func (r *Renderer) Features() []extension.Feature {
+	return []extension.Feature{{
+		Name: "svg", Status: extension.StatusExternal,
+		Reason: "rendered by the pdftocairo process",
+	}}
 }

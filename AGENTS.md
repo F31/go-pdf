@@ -10,6 +10,7 @@
 - Poppler corpus sample: `POPPLER_CORPUS=1 go test ./render -run TestPopplerCorpusQuality -v -timeout 20m`
 - Poppler full-corpus report: `POPPLER_CORPUS=1 POPPLER_CORPUS_PAGES=0 POPPLER_CORPUS_REPORT=/tmp/poppler-corpus.csv go test ./render -run TestPopplerCorpusQuality -v -timeout 24h`
 - Poppler full corpus: `POPPLER_CORPUS_SHARDS=16 ./scripts/corpus-poppler-full.sh` (page-chunk workers, PPM, writes `/tmp/poppler-corpus/poppler-corpus.csv`)
+- Core/provider separation: `./scripts/check-core-deps.sh`
 - Poppler reference cache: add `POPPLER_CORPUS_REF_CACHE=/tmp/poppler-ref` (cached PNGs; reuses Poppler output between runs)
 - Preview quality fonts: default `render.BuiltinFonts()`; pin CJK fonts with `POPPLER_CORPUS_FONT_DIR=/path1:/path2`
 - Quality layers and report boundaries: `docs/perf/quality-layers.md`
@@ -21,6 +22,7 @@
 - P0 capability/font baseline: `docs/perf/p0-baseline.md`.
 - P1 Core stability baseline: `docs/perf/p1-baseline.md`.
 - P2 Preview semantics baseline: `docs/perf/p2-baseline.md`.
+- P3 Extended provider baseline: `docs/perf/p3-baseline.md`.
 - Poppler 24.02 local baseline: `docs/perf/poppler-24.02-baseline.md`.
   Compare only on the same host, corpus, DPI, background and output format.
 
@@ -28,7 +30,7 @@
 
 - Only the Go standard library and `golang.org/x/*` are allowed. A new
   dependency requires an ADR and a `THIRD_PARTY.md` entry.
-- Public packages are the module root (`pdf`), `displaylist`, `render`, `text`, `extension`, `extension/legacy`, `extension/poppler`, `extension/cairo`, and `extension/openjpeg`. Internal PDF
+- Public packages are the module root (`pdf`), `displaylist`, `render`, `text`, `extension`, `extension/legacy`, `extension/poppler`, `extension/cairo`, `extension/openjpeg`, and `extension/jbig2`. Internal PDF
   objects must not appear in public signatures.
 - Do not silently degrade. Every approximation or unsupported feature must
   return an appropriate error or record a diagnostic.

@@ -10,13 +10,20 @@ import (
 // be shared by concurrent documents; provider sessions are still created per
 // task. A Registry never falls back to an unregistered provider.
 type Registry struct {
-	images  map[ImageEncoding]ImageDecoderFactory
-	colors  map[string]ColorEngine
-	fonts   map[string]FontEngine
-	encs    []ImageEncoding
-	colorsN []string
-	fontsN  []string
-	infos   []ProviderInfo
+	images   map[ImageEncoding]ImageDecoderFactory
+	colors   map[string]ColorEngine
+	fonts    map[string]FontEngine
+	encs     []ImageEncoding
+	colorsN  []string
+	fontsN   []string
+	infos    []ProviderInfo
+	features []ProviderFeature
+}
+
+// ProviderFeature is one advertised feature with its provider attribution.
+type ProviderFeature struct {
+	Provider string
+	Feature  Feature
 }
 
 // RegistryOption configures a Registry before it is frozen.
@@ -38,6 +45,9 @@ func WithImageFactory(f ImageDecoderFactory) RegistryOption {
 		info := f.Info()
 		if err := validateInfo(info); err != nil {
 			return err
+		}
+		if err := validateFeatures(f.Features()); err != nil {
+			return fmt.Errorf("extension: image provider %q: %w", info.Name, err)
 		}
 		encodings := f.Encodings()
 		if len(encodings) == 0 {
@@ -66,6 +76,9 @@ func WithColorEngine(e ColorEngine) RegistryOption {
 		if err := validateInfo(info); err != nil {
 			return err
 		}
+		if err := validateFeatures(e.Features()); err != nil {
+			return fmt.Errorf("extension: colour engine %q: %w", info.Name, err)
+		}
 		if _, ok := c.colors[info.Name]; ok {
 			return fmt.Errorf("extension: colour engine %q already registered", info.Name)
 		}
@@ -83,6 +96,9 @@ func WithFontEngine(e FontEngine) RegistryOption {
 		info := e.Info()
 		if err := validateInfo(info); err != nil {
 			return err
+		}
+		if err := validateFeatures(e.Features()); err != nil {
+			return fmt.Errorf("extension: font engine %q: %w", info.Name, err)
 		}
 		if _, ok := c.fonts[info.Name]; ok {
 			return fmt.Errorf("extension: font engine %q already registered", info.Name)
@@ -133,7 +149,84 @@ func NewRegistry(opts ...RegistryOption) (*Registry, error) {
 		return nil, err
 	}
 	r.infos = infos
+	features, err := collectFeatures(cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.features = features
 	return r, nil
+}
+
+func validateFeatures(features []Feature) error {
+	for _, f := range features {
+		if f.Name == "" {
+			return errors.New("feature has an empty name")
+		}
+		if !validStatus(f.Status) {
+			return fmt.Errorf("feature %q has invalid status %q", f.Name, f.Status)
+		}
+		switch f.Status {
+		case StatusApproximate, StatusExternal, StatusUnsupported, StatusUnknown, StatusNotScanned:
+			if f.Reason == "" {
+				return fmt.Errorf("feature %q status %q requires a reason", f.Name, f.Status)
+			}
+		}
+	}
+	return nil
+}
+
+func validStatus(s Status) bool {
+	switch s {
+	case StatusSupported, StatusApproximate, StatusExternal, StatusUnsupported,
+		StatusUnknown, StatusNotScanned, StatusNotApplicable:
+		return true
+	default:
+		return false
+	}
+}
+
+func collectFeatures(cfg registryConfig) ([]ProviderFeature, error) {
+	seen := map[string]Provider{}
+	add := func(p Provider) error {
+		info := p.Info()
+		for _, f := range p.Features() {
+			key := info.Name + "\x00" + string(f.Status) + "\x00" + f.Name
+			if existing, ok := seen[key]; ok && existing.Info() != info {
+				return fmt.Errorf("extension: feature %q for provider %q has conflicting metadata", f.Name, info.Name)
+			}
+			seen[key] = p
+		}
+		return nil
+	}
+	for _, f := range cfg.images {
+		if err := add(f); err != nil {
+			return nil, err
+		}
+	}
+	for _, e := range cfg.colors {
+		if err := add(e); err != nil {
+			return nil, err
+		}
+	}
+	for _, e := range cfg.fonts {
+		if err := add(e); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]ProviderFeature, 0, len(seen))
+	for _, p := range seen {
+		info := p.Info()
+		for _, f := range p.Features() {
+			out = append(out, ProviderFeature{Provider: info.Name, Feature: f})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider == out[j].Provider {
+			return out[i].Feature.Name < out[j].Feature.Name
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	return out, nil
 }
 
 func validateInfo(info ProviderInfo) error {
@@ -250,4 +343,12 @@ func (r *Registry) Providers() []ProviderInfo {
 		return nil
 	}
 	return append([]ProviderInfo(nil), r.infos...)
+}
+
+// Features returns provider features sorted by provider and feature name.
+func (r *Registry) Features() []ProviderFeature {
+	if r == nil {
+		return nil
+	}
+	return append([]ProviderFeature(nil), r.features...)
 }

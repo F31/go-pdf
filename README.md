@@ -49,6 +49,8 @@
 - `extension/poppler` 通过独立进程调用 pdftoppm，作为可选 Extended 高保真渲染后端；支持 `RenderPage`、连续页 `RenderEach` 与任意页集 `RenderPages`，不链接 GPL 代码
 - `extension/cairo` 通过独立进程调用 pdftocairo 输出单页 SVG，作为可选 Extended 矢量输出
 - `extension/openjpeg` 通过独立进程调用 opj_decompress 解码 JPX，注册为可选图像 provider
+- `extension/jbig2` 通过独立进程调用 jbig2dec 解码 JBIG2，注册为可选图像 provider
+- `extension/poppler`/`cairo`/`openjpeg`/`jbig2` 均提供 `ProviderInfo`/`Features`，外部进程输出、超时和临时目录受控
 - `pdf.WithExtensionRegistry` 接入 `extension.Registry` 图像 provider；`DecodeSamples` 保留源样本，`Decode` 兼容为 image.Image；与旧 `DecoderRegistry` 重复配置返回参数错误
 - `displaylist.FontInfo.Source` 暴露嵌入字体程序，`Paint.Profile` 保留 ICCBased 原始 profile；`render.Options.FontEngine` 可消费字体 provider
 - 活跃文件内存预算 `MaxLiveBytes`；`Document.ResourceUsage` 输出 Live/Peak/Decoded/Objects
@@ -193,6 +195,7 @@ extension/                            可选 provider 接口、不可变注册�
 extension/poppler/                   可选 Extended pdftoppm 进程后端
 extension/cairo/                     可选 Extended pdftocairo SVG 进程后端
 extension/openjpeg/                  可选 Extended opj_decompress JPX provider
+extension/jbig2/                     可选 Extended jbig2dec JBIG2 provider
 cmd/pdf/                              CLI（info[-json]/text/search[-jsonl]/render/svg/links[-jsonl]/annotations[-jsonl]/outlines[-json]/labels[-json]/forms[-json]/tables[-jsonl,-json]/attachments[-json,-extract]/preflight）
 internal/syntax/                      词法、对象、xref、重建
 internal/filter/                      过滤器与 Predictor

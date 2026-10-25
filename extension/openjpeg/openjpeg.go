@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/F31/go-pdf/extension"
+	"github.com/F31/go-pdf/internal/procutil"
 )
 
 // Factory is an image provider backed by the opj_decompress executable. It is
@@ -33,11 +34,8 @@ func New(binary string) (*Factory, error) {
 		return nil, fmt.Errorf("openjpeg: executable %q: %w", binary, err)
 	}
 	f := &Factory{binary: path, version: "unknown"}
-	out, _ := exec.Command(path, "-h").CombinedOutput()
-	if line := strings.TrimSpace(string(out)); line != "" {
-		if i := strings.IndexByte(line, '\n'); i >= 0 {
-			line = line[:i]
-		}
+	out, _ := procutil.Run(context.Background(), path, "-h")
+	if line := procutil.FirstLine(out); line != "" {
 		f.version = line
 	}
 	return f, nil
@@ -97,13 +95,30 @@ func (d *decoder) Decode(ctx context.Context, src io.ReaderAt, size int64, cfg e
 	if err := writeReaderAt(in, src, size); err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, d.factory.binary, "-i", in, "-o", out)
-	msg, err := cmd.CombinedOutput()
+	msg, err := procutil.Run(ctx, d.factory.binary, "-i", in, "-o", out)
 	if err != nil {
-		return nil, fmt.Errorf("openjpeg: decode: %w: %s", err, strings.TrimSpace(string(msg)))
+		return nil, fmt.Errorf("openjpeg: decode: %w: %s", err, strings.TrimSpace(msg))
+	}
+	const maxOutputBytes = 64 << 20
+	const maxOutputPixels = 64_000_000
+	if err := procutil.CheckFileSize(out, maxOutputBytes); err != nil {
+		return nil, fmt.Errorf("openjpeg: output: %w", err)
 	}
 	f, err := os.Open(out)
 	if err != nil {
+		return nil, err
+	}
+	pngCfg, err := png.DecodeConfig(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("openjpeg: decode PNG config: %w", err)
+	}
+	if int64(pngCfg.Width)*int64(pngCfg.Height) > maxOutputPixels {
+		_ = f.Close()
+		return nil, fmt.Errorf("openjpeg: output is %dx%d, over pixel limit", pngCfg.Width, pngCfg.Height)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	img, err := png.Decode(f)

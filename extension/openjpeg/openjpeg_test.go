@@ -3,6 +3,7 @@ package openjpeg
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/F31/go-pdf/extension"
 )
@@ -108,5 +111,56 @@ cp %q "$out"
 	}
 	if plane.Pix[0] != 10 || plane.Pix[2] != 30 || plane.Pix[3] != 40 || plane.Pix[5] != 60 {
 		t.Fatalf("pix = %v", plane.Pix)
+	}
+}
+
+func TestDecodeContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opj_decompress requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "opj_decompress")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then echo fake; exit 0; fi\nsleep 0.2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := New(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := f.NewDecoder(context.Background(), extension.ImageConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := dec.Decode(ctx, bytes.NewReader([]byte("jp2")), 3, extension.ImageConfig{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want deadline exceeded", err)
+	}
+}
+
+func TestDecodeErrorMessageIsBounded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake opj_decompress requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "opj_decompress")
+	body := "#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then echo fake; exit 0; fi\nhead -c 200000 /dev/zero | tr '\\0' x >&2\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := New(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := f.NewDecoder(context.Background(), extension.ImageConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = dec.Decode(context.Background(), bytes.NewReader([]byte("jp2")), 3, extension.ImageConfig{})
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if len(err.Error()) > 70_000 || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("error is not bounded: %d bytes", len(err.Error()))
 	}
 }

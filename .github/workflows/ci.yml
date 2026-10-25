@@ -186,3 +186,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check go.mod
         run: ./scripts/check-deps.sh
+      - name: Check Core/provider separation
+        run: ./scripts/check-core-deps.sh

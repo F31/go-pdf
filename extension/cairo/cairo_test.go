@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/F31/go-pdf/internal/testkit"
@@ -39,5 +40,28 @@ func TestRenderSVG(t *testing.T) {
 	}
 	if _, err := r.RenderSVG(context.Background(), path, -1); err == nil {
 		t.Fatal("expected invalid page error")
+	}
+}
+
+func TestProviderMetadataAndBoundedErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake pdftocairo requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "pdftocairo")
+	body := "#!/bin/sh\nif [ \"$1\" = \"-v\" ]; then echo 'fake cairo 1.0'; exit 0; fi\nhead -c 200000 /dev/zero | tr '\\0' x >&2\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r, err := New(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := r.ProviderInfo(context.Background())
+	if info.Name != "poppler-cairo" || info.License == "" || info.Version == "" {
+		t.Fatalf("info = %#v", info)
+	}
+	if _, err := r.RenderSVG(context.Background(), "dummy.pdf", 0); err == nil || len(err.Error()) > 80_000 {
+		t.Fatalf("error = %v (%d bytes)", err, len(err.Error()))
 	}
 }

@@ -12,6 +12,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/F31/go-pdf/extension"
+	"github.com/F31/go-pdf/internal/procutil"
 )
 
 // Renderer invokes pdftoppm. It is safe for concurrent use when its exported
@@ -20,6 +23,10 @@ type Renderer struct {
 	Binary   string
 	DPI      int
 	Password string
+	// MaxPixels limits decoded output; zero uses 64 million pixels.
+	MaxPixels int64
+	// MaxOutputBytes limits each produced PNG; zero uses 64 MiB.
+	MaxOutputBytes int64
 }
 
 // New returns a renderer using binary (or pdftoppm when empty).
@@ -38,16 +45,12 @@ func (r *Renderer) Version(ctx context.Context) (string, error) {
 	if r == nil {
 		return "", errors.New("poppler: nil renderer")
 	}
-	cmd := exec.CommandContext(ctx, r.Binary, "-v")
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	out, err := procutil.Run(ctx, r.Binary, "-v")
+	text := strings.TrimSpace(out)
 	if text == "" && err != nil {
 		return "", err
 	}
-	if i := strings.IndexByte(text, '\n'); i >= 0 {
-		text = text[:i]
-	}
-	return text, nil
+	return procutil.FirstLine(text), nil
 }
 
 // RenderPage renders a 0-based page through pdftoppm. The returned image is
@@ -74,12 +77,11 @@ func (r *Renderer) RenderPage(ctx context.Context, path string, page int) (image
 		args = append(args, "-upw", r.Password)
 	}
 	args = append(args, path, prefix)
-	cmd := exec.CommandContext(ctx, r.Binary, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := procutil.Run(ctx, r.Binary, args...)
 	if err != nil {
-		return nil, fmt.Errorf("poppler: render page %d: %w: %s", page, err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("poppler: render page %d: %w: %s", page, err, strings.TrimSpace(out))
 	}
-	img, err := readPNG(prefix + ".png")
+	img, err := r.readPNG(prefix + ".png")
 	if err != nil {
 		return nil, fmt.Errorf("poppler: decode PNG: %w", err)
 	}
@@ -114,10 +116,9 @@ func (r *Renderer) RenderEach(ctx context.Context, path string, first, last int,
 		args = append(args, "-upw", r.Password)
 	}
 	args = append(args, path, prefix)
-	cmd := exec.CommandContext(ctx, r.Binary, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := procutil.Run(ctx, r.Binary, args...)
 	if err != nil {
-		return fmt.Errorf("poppler: render pages %d-%d: %w: %s", first, last, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("poppler: render pages %d-%d: %w: %s", first, last, err, strings.TrimSpace(out))
 	}
 	files, err := filepath.Glob(prefix + "-*.png")
 	if err != nil {
@@ -140,7 +141,7 @@ func (r *Renderer) RenderEach(ctx context.Context, path string, first, last int,
 		if name == "" {
 			return fmt.Errorf("poppler: page %d not produced", page)
 		}
-		img, err := readPNG(name)
+		img, err := r.readPNG(name)
 		if err != nil {
 			return fmt.Errorf("poppler: page %d: %w", page, err)
 		}
@@ -197,15 +198,62 @@ func (r *Renderer) dpi() (int, error) {
 	return dpi, nil
 }
 
-func readPNG(name string) (image.Image, error) {
+func (r *Renderer) readPNG(name string) (image.Image, error) {
+	limit := r.MaxOutputBytes
+	if limit <= 0 {
+		limit = 64 << 20
+	}
+	if err := procutil.CheckFileSize(name, limit); err != nil {
+		return nil, fmt.Errorf("poppler: PNG output: %w", err)
+	}
 	f, err := os.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	cfg, err := png.DecodeConfig(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("decode PNG config: %w", err)
+	}
+	maxPixels := r.MaxPixels
+	if maxPixels <= 0 {
+		maxPixels = 64_000_000
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxPixels {
+		_ = f.Close()
+		return nil, fmt.Errorf("poppler: PNG is %dx%d, over pixel limit", cfg.Width, cfg.Height)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	img, err := png.Decode(f)
+	closeErr := f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("decode PNG: %w", err)
 	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	return img, nil
+}
+
+// ProviderInfo reports the external Poppler binary metadata.
+func (r *Renderer) ProviderInfo(ctx context.Context) extension.ProviderInfo {
+	version, _ := r.Version(ctx)
+	if version == "" {
+		version = "unknown"
+	}
+	return extension.ProviderInfo{
+		Name: "poppler", Version: version, License: "GPL-2.0-or-later",
+		Determinism: extension.PlatformDependent,
+	}
+}
+
+// Features reports the optional high-fidelity raster path.
+func (r *Renderer) Features() []extension.Feature {
+	return []extension.Feature{{
+		Name: "raster", Status: extension.StatusExternal,
+		Reason: "rendered by the pdftoppm process",
+	}}
 }

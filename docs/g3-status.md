@@ -180,7 +180,7 @@
 ## 未完成
 
 - CCITT Group 3 2-D（`K > 0`）与无 EOL 的 G3 变体核心尚未支持；`ImageCCITTG32D` provider 路径已验证可接管，需部署方注入实现。
-- JBIG2/JPX 核心不提供解码，仅支持 Factory Registry 注入。
+- JBIG2/JPX 核心不提供解码，仅支持 Factory Registry 注入；`extension/jbig2` 和 `extension/openjpeg` 提供可选进程 provider。
 - Form BBox 与父裁剪已按 clip Intersect 合成；knockout 已按元素 alpha 覆盖并处理非 Normal Blend 的 backdrop 合成；完整外部参考金样仍未建立。
 - 已新增 SMask Alpha/Luminosity 与 knockout 非隔离组的解析期望质量门禁（PSNR ≥45 dB、SSIM ≥0.999）；外部参考图金样与 G8 生产级并行光栅化尚未完成。
 - 完整 `scene` IR 与场景缓存租约仍未完成。文件映射读取已加入 `OpenFile` 与 `Open(*os.File)`（Unix mmap，其他平台回退读取）；大 ReaderAt 的临时文件分块复制支持 context 取消；流式 ReaderAt 解析仍未完成。
