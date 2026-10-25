@@ -58,6 +58,16 @@ jobs:
         run: |
           set -o pipefail
           CGO_ENABLED=0 go test -v -count=1 ./... 2>&1 | tee test-os.log
+      - name: Summarize test failures
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Failed tests"
+            grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:' test-os.log | head -50 || true
+            echo "### Log tail"
+            tail -80 test-os.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
