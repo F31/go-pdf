@@ -132,9 +132,11 @@ jobs:
         run: |
           set -euo pipefail
           log=/tmp/go-pdf-fuzz.log
+          current="none"
           : > "$log"
-          trap 'status=$?; if [ $status -ne 0 ]; then tail -40 "$log" | while IFS= read -r line; do echo "::error title=Fuzz failure::$line"; done; fi' EXIT
+          trap 'status=$?; if [ $status -ne 0 ]; then echo "::error title=Fuzz target::$current"; tail -40 "$log" | while IFS= read -r line; do echo "::error title=Fuzz failure::$line"; done; fi' EXIT
           run_fuzz() {
+            current="$*"
             echo "=== $*" | tee -a "$log"
             "$@" 2>&1 | tee -a "$log"
           }
