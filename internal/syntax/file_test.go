@@ -3,6 +3,7 @@ package syntax
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/F31/go-pdf/internal/budget"
@@ -168,9 +169,26 @@ func BenchmarkResolveObject(b *testing.B) {
 }
 
 func FuzzOpenFile(f *testing.F) {
-	f.Add(testkit.Basic("0 0 200 100"))
+	base := testkit.Basic("0 0 200 100")
+	f.Add(base)
 	f.Add([]byte("%PDF-1.7\n"))
 	f.Add([]byte("not a pdf"))
+	f.Add(testkit.CorruptStartXref(base))
+	f.Add(testkit.SetXRefOffset(base, 3, 5))
+	f.Add(testkit.CorruptStreamLength(base, 3, 99))
+	f.Add(testkit.TruncateObject(base, 2))
+	objects := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.ObjectStream(4, map[int]string{
+			2: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			3: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+		}),
+	}
+	f.Add(testkit.BuildXRefStream(objects, map[int][2]int{2: {4, 0}, 3: {4, 1}}, "/Root 1 0 R"))
+	if encrypted, err := os.ReadFile("../../testdata/encrypted/rc4-128.pdf"); err == nil {
+		f.Add(encrypted)
+	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		b := budget.DefaultBudget
 		file, err := Open(context.Background(), data, Options{Repair: true, Tracker: budget.NewTracker(&b), Diag: diag.New(100)})

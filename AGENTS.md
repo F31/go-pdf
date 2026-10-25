@@ -19,6 +19,7 @@
 ## Performance baseline
 
 - P0 capability/font baseline: `docs/perf/p0-baseline.md`.
+- P1 Core stability baseline: `docs/perf/p1-baseline.md`.
 - Poppler 24.02 local baseline: `docs/perf/poppler-24.02-baseline.md`.
   Compare only on the same host, corpus, DPI, background and output format.
 

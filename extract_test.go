@@ -95,6 +95,62 @@ func TestExtractTextMatchesSinglePage(t *testing.T) {
 	}
 }
 
+func TestExtractTextMatchesSinglePageFailures(t *testing.T) {
+	d := openTest(t, brokenPageData())
+	defer d.Close()
+	res, err := d.ExtractText(context.Background(), ExtractOptions{Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < d.NumPages(); i++ {
+		p, err := d.Page(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		single, singleErr := p.Text(context.Background())
+		batch := res.Pages[i]
+		if (singleErr == nil) != (batch.Err == nil) {
+			t.Fatalf("page %d: batchErr=%v singleErr=%v", i, batch.Err, singleErr)
+		}
+		if singleErr == nil && single.Text != batch.Text.Text {
+			t.Fatalf("page %d: batch=%q single=%q", i, batch.Text.Text, single.Text)
+		}
+	}
+}
+
+func TestPreflightFailurePagesMatchExtract(t *testing.T) {
+	d := openTest(t, brokenPageData())
+	defer d.Close()
+	extract, err := d.ExtractText(context.Background(), ExtractOptions{Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.PreflightWithOptions(context.Background(), PreflightOptions{Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extract.FailedPages) != len(report.FailedPages) || len(report.FailedPages) != 1 || report.FailedPages[0] != extract.FailedPages[0] {
+		t.Fatalf("extract=%v preflight=%v", extract.FailedPages, report.FailedPages)
+	}
+}
+
+func TestExtractTextEachContextCancellation(t *testing.T) {
+	d := batchTextDoc(t)
+	defer d.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	summary, err := d.ExtractTextEach(ctx, ExtractOptions{Workers: 2}, func(PageText) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want canceled", err)
+	}
+	if summary == nil || summary.Processed == 0 {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
 func TestExtractWorkersRespectBudget(t *testing.T) {
 	b := DefaultBudget
 	b.MaxConcurrency = 1

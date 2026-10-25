@@ -81,6 +81,15 @@ func TestEncryptedPublic(t *testing.T) {
 	}
 }
 
+func TestCanceledErrorMatchesContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Open(ctx, bytes.NewReader(testkit.Basic("0 0 10 10")), int64(len(testkit.Basic("0 0 10 10"))))
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrCanceled) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestErrorType(t *testing.T) {
 	_, err := Open(context.Background(), bytes.NewReader([]byte("not a pdf")), 9)
 	if !errors.Is(err, ErrCorrupt) {

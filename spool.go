@@ -54,13 +54,19 @@ func mapReaderAt(ctx context.Context, r io.ReaderAt, size int64) ([]byte, func()
 			}
 			off += int64(read)
 		}
+		if read == 0 {
+			cleanup()
+			if rerr == nil {
+				return nil, nil, io.ErrNoProgress
+			}
+			if errors.Is(rerr, io.EOF) {
+				return nil, nil, io.ErrUnexpectedEOF
+			}
+			return nil, nil, rerr
+		}
 		if rerr != nil && !errors.Is(rerr, io.EOF) {
 			cleanup()
 			return nil, nil, rerr
-		}
-		if read == 0 && rerr == nil {
-			cleanup()
-			return nil, nil, io.ErrNoProgress
 		}
 	}
 	data, unmap, err := mapReadOnly(f, size)

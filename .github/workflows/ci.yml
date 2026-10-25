@@ -132,6 +132,7 @@ jobs:
           set -e
           go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s -parallel=4
           go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s -parallel=4
+          go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime=20s -parallel=4
           go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s -parallel=4
           go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s -parallel=4
           go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime=20s -parallel=4

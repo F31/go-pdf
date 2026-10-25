@@ -4,18 +4,26 @@
 package errs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
 
 var (
-	ErrCorrupt     = errors.New("pdf: corrupt file")
-	ErrPassword    = errors.New("pdf: password required or incorrect")
-	ErrUnsupported = errors.New("pdf: unsupported feature")
-	ErrBudget      = errors.New("pdf: resource budget exceeded")
-	ErrClosed      = errors.New("pdf: document closed")
-	ErrCanceled    = errors.New("pdf: operation canceled")
+	ErrCorrupt           = errors.New("pdf: corrupt file")
+	ErrPassword          = errors.New("pdf: password required or incorrect")
+	ErrUnsupported       = errors.New("pdf: unsupported feature")
+	ErrBudget            = errors.New("pdf: resource budget exceeded")
+	ErrClosed            = errors.New("pdf: document closed")
+	ErrCanceled    error = canceledError{}
 )
+
+type canceledError struct{}
+
+func (canceledError) Error() string { return "pdf: operation canceled" }
+
+// Is lets callers match both pdf.ErrCanceled and context.Canceled.
+func (canceledError) Is(target error) bool { return target == context.Canceled }
 
 // Error is the structured error returned by all public operations.
 //

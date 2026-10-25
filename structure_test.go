@@ -2,12 +2,32 @@ package pdf
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/F31/go-pdf/internal/testkit"
 )
 
 func numberValue(v float64) StructValue { return StructValue{Kind: "number", Number: v} }
+
+func TestStructureTreeCycleTerminates(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+		testkit.Raw(5, "<< /Type /StructTreeRoot /K [6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /StructElem /S /Document /K [6 0 R] >>"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	tree, err := d.StructureTree(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree) != 1 || tree[0].Type != "Document" || len(tree[0].Children) != 0 {
+		t.Fatalf("cycle tree = %#v", tree)
+	}
+}
 
 func TestAsTable(t *testing.T) {
 	table := StructElement{
@@ -86,6 +106,10 @@ func TestPageTables(t *testing.T) {
 	all, err := d.Tables(context.Background())
 	if err != nil || len(all) != 1 || all[0].Page != 0 {
 		t.Fatalf("document tables = %#v err=%v", all, err)
+	}
+	again, err := d.Tables(context.Background())
+	if err != nil || !reflect.DeepEqual(all, again) {
+		t.Fatalf("tables are not deterministic: %#v / %#v err=%v", all, again, err)
 	}
 }
 
