@@ -80,6 +80,19 @@ P4 本机结果：
 - 静态 strip 二进制：约 13.1 MB，`CGO_ENABLED=0`，无外部 C 库
 - `go version -m` 仅含 `golang.org/x/image`、`golang.org/x/text`
 
+P4 远端 CI：https://github.com/F31/go-pdf/actions/runs/40174716220（10/10 success）。
+
+## P4 验收
+
+- 可复现元数据/字体/DPI/背景/ICC/注释策略：通过。
+- Core/Preview/Extended 分层报告：通过。
+- Poppler 跨引擎页面数/加密/文本诊断：通过；PDFium 作为后续可选参考。
+- 合成语料覆盖与私有语料策略：`docs/release.md`。
+- fuzz/安全/取消/错误审计：CI 与 `verify.sh`。
+- Core P50/P95 与 10% 同机门禁：通过。
+- README/Capabilities/status/SLO/已知限制：已更新。
+- 静态构建、体积、依赖/许可证、Core/provider 分离：通过。
+
 ## 已知限制
 
 见 `docs/release.md`。发布前必须确认这些限制没有通过“supported”能力声明被误解。
