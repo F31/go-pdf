@@ -1,7 +1,7 @@
 package displaylist
 
 import (
-	"math"
+	"strconv"
 )
 
 const (
@@ -217,7 +217,9 @@ func (w *sigWriter) f(v float64) {
 	if v == 0 {
 		v = 0
 	}
-	w.u(math.Float64bits(v))
+	// Hash a rounded decimal representation so signatures are stable across
+	// architectures where fused operations may differ in the low bits.
+	w.s(strconv.FormatFloat(v, 'g', 12, 64))
 }
 
 func (w *sigWriter) s(v string) {
