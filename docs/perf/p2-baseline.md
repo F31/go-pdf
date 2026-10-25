@@ -78,3 +78,13 @@ P2 关键测试：
 - `TestStrokeHalfWidthPolicy`
 - 既有 `TestRenderMeshShading`、`TestRenderFreeFormMesh`、`TestRenderPatchMesh`、
   `TestTextStrokeMode`、Type3/透明/SMask 测试保持通过
+
+P2 远端 CI：https://github.com/F31/go-pdf/actions/runs/40169003143（10/10 success）。
+
+## P2 验收
+
+- mesh type 4–7 与 Function 颜色：通过。
+- mesh/function pattern 与 pattern 子租约：通过。
+- 细线策略显式化：通过。
+- 全量 system-font：0 render_error，fallback 6,837（较 final8 减少 13）。
+- Linux/macOS/Windows、race、vet、staticcheck、fuzz、交叉编译：通过。
