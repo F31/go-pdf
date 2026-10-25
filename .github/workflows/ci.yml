@@ -68,7 +68,7 @@ jobs:
             echo "### Log tail"
             tail -80 test-os.log || true
           } >> "$GITHUB_STEP_SUMMARY"
-          grep -A20 -E '^--- FAIL:' test-os.log | head -10 | while IFS= read -r line; do
+          grep -B12 -E '^--- FAIL:' test-os.log | head -15 | while IFS= read -r line; do
             echo "::error title=Test failure::$line"
           done
       - name: Upload test log on failure
