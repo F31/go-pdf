@@ -164,3 +164,57 @@ func TestDecodeErrorMessageIsBounded(t *testing.T) {
 		t.Fatalf("error is not bounded: %d bytes", len(err.Error()))
 	}
 }
+
+func TestRealOpenJPEGRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("opj_compress"); err != nil {
+		t.Skip("opj_compress not installed")
+	}
+	if _, err := exec.LookPath("opj_decompress"); err != nil {
+		t.Skip("opj_decompress not installed")
+	}
+	dir := t.TempDir()
+	src := image.NewRGBA(image.Rect(0, 0, 4, 2))
+	for y := 0; y < 2; y++ {
+		for x := 0; x < 4; x++ {
+			src.Set(x, y, color.RGBA{R: uint8(20 * x), G: uint8(30 * y), B: 40, A: 255})
+		}
+	}
+	pngPath := filepath.Join(dir, "src.png")
+	f, err := os.Create(pngPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, src); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	jp2Path := filepath.Join(dir, "src.jp2")
+	if out, err := exec.Command("opj_compress", "-n", "1", "-i", pngPath, "-o", jp2Path).CombinedOutput(); err != nil {
+		t.Fatalf("opj_compress: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(jp2Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := factory.NewDecoder(context.Background(), extension.ImageConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane, err := dec.Decode(context.Background(), bytes.NewReader(data), int64(len(data)), extension.ImageConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plane.Width != 4 || plane.Height != 2 || plane.Components != 3 {
+		t.Fatalf("plane = %#v", plane)
+	}
+	if plane.Pix[2] < 30 || plane.Pix[2] > 50 || plane.Pix[3] < 10 || plane.Pix[3] > 30 {
+		t.Fatalf("pixels = %v", plane.Pix[:8])
+	}
+}

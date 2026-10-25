@@ -33,7 +33,8 @@
 ## Codec 边界
 
 - `extension/openjpeg`：JPX 外部进程 provider；fake e2e 覆盖命令构造、版本、
-  像素转换、超时和错误截断；真实 `opj_decompress` 作为可选集成。
+  像素转换、超时和错误截断；新增 `TestRealOpenJPEGRoundTrip`，在安装
+  `opj_compress`/`opj_decompress` 时生成 JP2 并真实解码；CI 无工具时跳过。
 - `extension/jbig2`：新增可选 `jbig2dec` 进程 provider，输出 PNG 转
   `ImagePlane`；fake e2e 覆盖 Gray 平面。真实二进制仍需部署方安装。
 - `CCITTG32D`：Registry 已支持该 encoding；核心没有内置 G3 2-D 解码，
@@ -60,5 +61,12 @@ staticcheck ./...
 ./scripts/check-core-deps.sh
 ```
 
-结果待本轮 CI 完成后更新。P3 不改变 Core/Preview 默认行为，也不新增 Core
-第三方依赖。
+本地结果：
+
+- `go test ./...`、`CGO_ENABLED=0 go test ./...`、`go test -race ./...`、
+  `go vet ./...`、`staticcheck ./...`：通过。
+- `./scripts/check-core-deps.sh`：通过。
+- 本机安装 OpenJPEG 2.5 后，真实 JP2 round-trip 通过；CI 无工具时该测试跳过。
+- `jbig2dec` fake e2e 通过；真实 JBIG2 样本仍需部署方提供。
+
+P3 不改变 Core/Preview 默认行为，也不新增 Core 第三方依赖。
