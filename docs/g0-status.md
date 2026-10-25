@@ -25,9 +25,30 @@
 
 首次回归发现并修复：对象流头部多条目空白、xref 偏移前导空白。对应的合成回归用例已入库。
 
-## 验证结果
+## G0 退出验收（2026-10-25）
 
-`FUZZTIME=3s ./scripts/verify.sh` 通过：无 CGO 构建、`go vet`、`go test -race`、六目标交叉编译、四个 fuzz 目标冒烟、依赖白名单与 `staticcheck`。`govulncheck` 已安装但当前环境无法访问漏洞数据库（代理连接失败），因此尚未纳入通过结果；CI 环境需补跑。benchstat 对比在 CI 生成报告，5% 硬门禁待受控 runner 稳定后启用。
+执行：
+
+```bash
+GOTOOLCHAIN=go1.26.10 FUZZTIME=10s ./scripts/verify.sh
+./scripts/release-check.sh
+./scripts/check-licenses.sh
+```
+
+结果：
+
+- 六目标交叉编译：linux/darwin/windows × amd64/arm64 通过。
+- `go test -race`、`CGO_ENABLED=0` 构建/测试：通过。
+- fuzz 冒烟：全部 target 通过。
+- `govulncheck`（Go 1.26.10）：0 vulnerabilities。
+- 许可清单：`golang.org/x/image`、`golang.org/x/text` 均登记并检测到许可证。
+- 静态发布构建：`CGO_ENABLED=0`，strip 约 13.1 MB。
+- benchstat：旧 G0 5% 硬门禁已由 P4 的同机 P95 10% 门禁取代
+  （`scripts/perf-gate.sh`，P4 样本通过）。历史 `docs/perf/g0-bench.txt`
+  继续保留作趋势参考；其与当前机器/工具链的绝对耗时不可直接作为阻断条件。
+
+G0 的 display-list 规范文本冻结在 1.0；当前实现已演进到 2.0。归档时保留历史
+delta specs，不回写主 specs，以免用过期 1.0 文本覆盖 2.0 现状。
 
 ## 已知限制
 

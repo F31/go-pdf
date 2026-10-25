@@ -26,6 +26,7 @@ fi
 echo "== dependency and provider boundaries =="
 ./scripts/check-deps.sh
 ./scripts/check-core-deps.sh
+./scripts/check-licenses.sh
 test -f THIRD_PARTY.md
 
 echo "== static binary =="

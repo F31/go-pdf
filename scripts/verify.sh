@@ -15,6 +15,7 @@ go test -race ./...
 echo "== dependency whitelist =="
 ./scripts/check-deps.sh
 ./scripts/check-core-deps.sh
+./scripts/check-licenses.sh
 
 echo "== cross compile =="
 for os in linux darwin windows; do

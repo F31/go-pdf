@@ -190,3 +190,5 @@ jobs:
         run: ./scripts/check-deps.sh
       - name: Check Core/provider separation
         run: ./scripts/check-core-deps.sh
+      - name: Check licence inventory
+        run: ./scripts/check-licenses.sh
