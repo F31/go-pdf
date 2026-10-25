@@ -1,10 +1,12 @@
 package font
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"math"
 	"sort"
+	"strings"
 
 	xfont "golang.org/x/image/font"
 	"golang.org/x/image/font/sfnt"
@@ -84,6 +86,12 @@ func (f *Font) loadFontProgram(ctx context.Context, file *syntax.File, fd syntax
 		}
 		avgWidth, _ := os2AvgWidth(data)
 		f.program = &fontProgram{face: face, upem: upem, avgWidth: avgWidth, size: int64(len(data))}
+		f.outlineOK = true
+		if !strings.HasPrefix(info.Kind, "CIDFontType") && !hasUnicodeCMap(data) {
+			f.outlineOK = false
+			dc.Addf(diag.Degraded, "FNT-OUTLINE-CMAP", "font program has no Unicode cmap; outlines are unavailable", -1, 0, -1)
+		}
+		info.Source = fontProgramSource{data: data}
 		info.Embedded = true
 		return
 	}
@@ -233,6 +241,37 @@ var emptyCMap = []byte{
 	0, 2, 0, 2, 0, 0, 0, 0, // segCountX2, searchRange, entrySelector, rangeShift
 	0xFF, 0xFF, 0, 0, // endCode, reservedPad
 	0xFF, 0xFF, 0, 1, 0, 0, // startCode, idDelta, idRangeOffset
+}
+
+func hasUnicodeCMap(data []byte) bool {
+	records, ok := readSFNTRecords(data)
+	if !ok {
+		return false
+	}
+	var off, length uint32
+	for _, r := range records {
+		if r.tag == 0x636d6170 { // "cmap"
+			off, length = r.offset, r.length
+			break
+		}
+	}
+	if length < 4 || int(off)+int(length) > len(data) {
+		return false
+	}
+	cmap := data[off : off+length]
+	count := int(binary.BigEndian.Uint16(cmap[2:4]))
+	if count <= 0 || 4+8*count > len(cmap) {
+		return false
+	}
+	for i := 0; i < count; i++ {
+		rec := cmap[4+8*i : 12+8*i]
+		platform := binary.BigEndian.Uint16(rec[0:2])
+		encoding := binary.BigEndian.Uint16(rec[2:4])
+		if platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10)) {
+			return true
+		}
+	}
+	return false
 }
 
 func os2AvgWidth(data []byte) (int, bool) {
@@ -463,3 +502,11 @@ func safeSFNTParse(data []byte) (face *sfnt.Font, err error) {
 	}()
 	return sfnt.Parse(data)
 }
+
+type fontProgramSource struct{ data []byte }
+
+func (s fontProgramSource) ReadAt(p []byte, off int64) (int, error) {
+	return bytes.NewReader(s.data).ReadAt(p, off)
+}
+
+func (s fontProgramSource) Size() int64 { return int64(len(s.data)) }

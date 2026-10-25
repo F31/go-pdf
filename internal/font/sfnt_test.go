@@ -1,6 +1,7 @@
 package font
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"os"
@@ -53,6 +54,13 @@ func TestSimpleFontMetrics(t *testing.T) {
 	}
 	if f.Info.Ascent != 905 || f.Info.Descent != -212 {
 		t.Fatalf("descriptor ascent %v descent %v", f.Info.Ascent, f.Info.Descent)
+	}
+	if f.Info.Source == nil || f.Info.Source.Size() != int64(len(fontData)) {
+		t.Fatalf("font source = %v", f.Info.Source)
+	}
+	buf := make([]byte, 4)
+	if _, err := f.Info.Source.ReadAt(buf, 0); err != nil || !bytes.Equal(buf, fontData[:4]) {
+		t.Fatalf("font source header = %x, %v", buf, err)
 	}
 	if hasDiag(dc, "FNT-SFNT-PARSE") {
 		t.Fatalf("unexpected diagnostics: %v", diagCodes(dc))
@@ -214,4 +222,31 @@ func FuzzSFNTRepair(f *testing.F) {
 			_, _ = safeSFNTParse(repaired)
 		}
 	})
+}
+
+func TestHasUnicodeCMap(t *testing.T) {
+	data := testFontData(t)
+	if !hasUnicodeCMap(data) {
+		t.Fatal("test font has no Unicode cmap")
+	}
+	patched := append([]byte(nil), data...)
+	records, ok := readSFNTRecords(patched)
+	if !ok {
+		t.Fatal("read records")
+	}
+	for _, rec := range records {
+		if rec.tag != 0x636d6170 {
+			continue
+		}
+		cmap := patched[rec.offset : rec.offset+rec.length]
+		count := int(binary.BigEndian.Uint16(cmap[2:4]))
+		for i := 0; i < count; i++ {
+			entry := cmap[4+8*i : 12+8*i]
+			binary.BigEndian.PutUint16(entry[0:2], 1)
+			binary.BigEndian.PutUint16(entry[2:4], 0)
+		}
+	}
+	if hasUnicodeCMap(patched) {
+		t.Fatal("Mac-only cmap accepted as Unicode")
+	}
 }

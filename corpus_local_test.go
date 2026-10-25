@@ -12,11 +12,8 @@ import (
 	"github.com/F31/go-pdf/displaylist"
 )
 
-// TestLocalCorpus exercises a private corpus when docs/pdf is present. The
-// directory is git-ignored; CI skips this test. It reports a summary rather
-// than failing on expected encrypted/corrupt inputs so that the corpus can be
-// used to triage coverage.
-func TestLocalCorpus(t *testing.T) {
+func localCorpusFiles(t *testing.T) []string {
+	t.Helper()
 	root := filepath.Join("docs", "pdf")
 	if _, err := os.Stat(root); err != nil {
 		t.Skip("local corpus not present")
@@ -34,6 +31,19 @@ func TestLocalCorpus(t *testing.T) {
 	if len(files) == 0 {
 		t.Skip("no PDFs in local corpus")
 	}
+	return files
+}
+
+// TestLocalCorpus exercises a private corpus when docs/pdf is present. The
+// directory is git-ignored; CI skips this test. It reports a summary rather
+// than failing on expected encrypted/corrupt inputs so that the corpus can be
+// used to triage coverage.
+func TestLocalCorpus(t *testing.T) {
+	root := filepath.Join("docs", "pdf")
+	if _, err := os.Stat(root); err != nil {
+		t.Skip("local corpus not present")
+	}
+	files := localCorpusFiles(t)
 	var ok, encrypted, corrupt, unsupported, budget, other int
 	var totalPages, textRuns, glyphs, glyphsOK, paths, patterns, images, shadings, scanned, dlErrors int
 	var fonts, fontsMetrics, fontsAdvances int
@@ -124,4 +134,54 @@ func TestLocalCorpus(t *testing.T) {
 	}
 	t.Logf("corpus: files=%d ok=%d encrypted=%d corrupt=%d unsupported=%d budget=%d other=%d pages=%d textruns=%d glyphs=%d glyphsok=%d paths=%d patterns=%d images=%d shadings=%d scanned=%d fonts=%d fontsmetrics=%d fontsadvances=%d dlerrors=%d elapsed=%s",
 		len(files), ok, encrypted, corrupt, unsupported, budget, other, totalPages, textRuns, glyphs, glyphsOK, paths, patterns, images, shadings, scanned, fonts, fontsMetrics, fontsAdvances, dlErrors, time.Since(start).Round(time.Millisecond))
+}
+
+func TestLocalCorpusBatchConsistency(t *testing.T) {
+	if os.Getenv("CORPUS_CONSISTENCY") != "1" {
+		t.Skip("set CORPUS_CONSISTENCY=1 to compare batch and per-page text")
+	}
+	files := localCorpusFiles(t)
+	var docs, pages, mismatches int
+	for _, path := range files {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		doc, err := OpenFile(ctx, path)
+		if err != nil {
+			cancel()
+			continue
+		}
+		res, err := doc.ExtractText(ctx, ExtractOptions{Workers: 4})
+		if err != nil {
+			t.Logf("EXTRACT %s: %v", filepath.Base(path), err)
+			cancel()
+			_ = doc.Close()
+			continue
+		}
+		docs++
+		for i := range res.Pages {
+			pt, err := doc.Page(i)
+			if err != nil {
+				t.Logf("PAGE %s #%d: %v", filepath.Base(path), i, err)
+				mismatches++
+				continue
+			}
+			single, err := pt.Text(ctx)
+			batch := res.Pages[i]
+			if (batch.Err == nil) != (err == nil) {
+				t.Logf("MISMATCH %s #%d: batchErr=%v singleErr=%v", filepath.Base(path), i, batch.Err, err)
+				mismatches++
+				continue
+			}
+			if err == nil && batch.Text.Text != single.Text {
+				t.Logf("MISMATCH %s #%d:batch=%q single=%q", filepath.Base(path), i, batch.Text.Text, single.Text)
+				mismatches++
+			}
+			pages++
+		}
+		cancel()
+		_ = doc.Close()
+	}
+	t.Logf("batch consistency: docs=%d pages=%d mismatches=%d", docs, pages, mismatches)
+	if mismatches != 0 {
+		t.Fatalf("batch consistency mismatches = %d", mismatches)
+	}
 }

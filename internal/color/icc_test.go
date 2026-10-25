@@ -1,6 +1,7 @@
 package color
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"math"
@@ -85,14 +86,6 @@ func TestICCMatrixTRC(t *testing.T) {
 	if err != nil || rgba[0] < 0.9 || rgba[1] > 0.1 || rgba[2] > 0.1 {
 		t.Fatalf("red %v err=%v", rgba, err)
 	}
-	tr, err := NewTransform(profile, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pcs, err := tr.ToLabPCS([]float64{1, 1, 1})
-	if err != nil || math.Abs(pcs[0]-1) > 0.01 || math.Abs(pcs[1]-0.5) > 0.02 || math.Abs(pcs[2]-0.5) > 0.02 {
-		t.Fatalf("matrix PCS %v err=%v", pcs, err)
-	}
 }
 
 func TestICCGray(t *testing.T) {
@@ -141,6 +134,9 @@ func TestICCStreamLoad(t *testing.T) {
 	}
 	if sp.Name() != "ICCBased" || sp.Approx() || sp.Components() != 3 {
 		t.Fatalf("space %s approx=%v n=%d", sp.Name(), sp.Approx(), sp.Components())
+	}
+	if got, ok := sp.(interface{ ICCProfile() []byte }); !ok || !bytes.Equal(got.ICCProfile(), profile) {
+		t.Fatalf("ICC profile not exposed")
 	}
 	rgba, approx, err := sp.RGBA([]float64{1, 1, 1})
 	if err != nil || approx || math.Abs(rgba[0]-1) > 2e-3 {
@@ -273,69 +269,106 @@ func TestICCCMYKMAB(t *testing.T) {
 	}
 }
 
-func makeCMYKMBA() []byte {
-	b := make([]byte, 32+16+8*4*2)
-	copy(b, "mBA ")
-	b[8], b[9] = 3, 4
-	binary.BigEndian.PutUint32(b[24:], 32)
-	for i := 0; i < 3; i++ {
-		b[32+i] = 2
-	}
-	return b
-}
-
-func TestICCMBA(t *testing.T) {
-	l, err := parseBToA(makeCMYKMBA())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if l.in != 3 || l.out != 4 || len(l.grids) != 3 || len(l.clut) != 8*4 {
-		t.Fatalf("btoa %#v", l)
-	}
-	out, err := l.eval([]float64{0, 0, 0})
-	if err != nil || len(out) != 4 || out[0] != 0 {
-		t.Fatalf("eval %v %v", out, err)
-	}
-}
-
-func TestICCTransform(t *testing.T) {
-	profile := iccProfileBytes("CMYK", [][2]interface{}{
-		{"wtpt", iccXYZ([3]float64{0.9642, 1, 0.8249})},
-		{"A2B0", makeCMYKLUT16()},
-		{"B2A0", makeCMYKMBA()},
+func TestICCMatrixD65MediaWhite(t *testing.T) {
+	profile := iccProfileBytes("RGB ", [][2]interface{}{
+		{"wtpt", iccXYZ([3]float64{0.95047, 1, 1.08883})},
+		{"rXYZ", iccXYZ([3]float64{0.4361, 0.2225, 0.0139})},
+		{"gXYZ", iccXYZ([3]float64{0.3851, 0.7169, 0.0971})},
+		{"bXYZ", iccXYZ([3]float64{0.1431, 0.0606, 0.7141})},
+		{"rTRC", iccCurveBytes(1)},
+		{"gTRC", iccCurveBytes(1)},
+		{"bTRC", iccCurveBytes(1)},
 	})
-	copy(profile[20:24], "Lab ")
-	tr, err := NewTransform(profile, 4)
+	p, err := parseICCProfile(profile, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev, err := tr.FromSRGB([4]float64{1, 0, 0, 1})
-	if err != nil || len(dev) != 4 {
-		t.Fatalf("from %v %v", dev, err)
+	rgba, _, err := p.rgba([]float64{1, 1, 1})
+	if err != nil {
+		t.Fatal(err)
 	}
-	rgba, _, err := tr.ToSRGB(dev)
-	if err != nil || rgba[0] < 0.9 {
-		t.Fatalf("to %v %v", rgba, err)
+	for _, v := range rgba[:3] {
+		if math.Abs(v-1) > 2e-3 {
+			t.Fatalf("D65 media white produced %v", rgba)
+		}
 	}
 }
 
-func TestICCDirectLabPCS(t *testing.T) {
-	profile := iccProfileBytes("CMYK", [][2]interface{}{
-		{"wtpt", iccXYZ([3]float64{0.9642, 1, 0.8249})},
-		{"A2B0", makeCMYKLUT16()},
-		{"B2A0", makeCMYKMBA()},
+func TestICCMatrixSRGBIdentity(t *testing.T) {
+	profile := iccProfileBytes("RGB ", [][2]interface{}{
+		{"wtpt", iccXYZ([3]float64{0.95047, 1, 1.08883})},
+		{"rXYZ", iccXYZ([3]float64{0.4361, 0.2225, 0.0139})},
+		{"gXYZ", iccXYZ([3]float64{0.3851, 0.7169, 0.0971})},
+		{"bXYZ", iccXYZ([3]float64{0.1431, 0.0606, 0.7141})},
+		{"rTRC", iccCurveBytes(1)},
+		{"gTRC", iccCurveBytes(1)},
+		{"bTRC", iccCurveBytes(1)},
 	})
-	copy(profile[20:24], "Lab ")
-	tr, err := NewTransform(profile, 4)
+	p, err := parseICCProfile(profile, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pcs, err := tr.ToLabPCS([]float64{0, 0, 0, 0})
-	if err != nil || len(pcs) != 3 || pcs[0] < 0.9 {
-		t.Fatalf("pcs %v err=%v", pcs, err)
+	for _, tc := range []struct {
+		in   [3]float64
+		want [3]float64
+	}{
+		{[3]float64{1, 0, 0}, [3]float64{1, 0, 0}},
+		{[3]float64{0, 1, 0}, [3]float64{0, 1, 0}},
+		{[3]float64{0, 0, 1}, [3]float64{0, 0, 1}},
+	} {
+		rgba, _, err := p.rgba(tc.in[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range tc.want {
+			if math.Abs(rgba[i]-tc.want[i]) > 0.01 {
+				t.Fatalf("sRGB %v -> %v", tc.in, rgba)
+			}
+		}
 	}
-	dev, err := tr.FromLabPCS(pcs)
-	if err != nil || len(dev) != 4 {
-		t.Fatalf("device %v err=%v", dev, err)
+}
+
+func TestICCCacheReuse(t *testing.T) {
+	profile := iccProfileBytes("RGB ", [][2]interface{}{
+		{"rXYZ", iccXYZ([3]float64{0.4361, 0.2225, 0.0139})},
+		{"gXYZ", iccXYZ([3]float64{0.3851, 0.7169, 0.0971})},
+		{"bXYZ", iccXYZ([3]float64{0.1431, 0.0606, 0.7141})},
+		{"rTRC", iccCurveBytes(1)},
+		{"gTRC", iccCurveBytes(1)},
+		{"bTRC", iccCurveBytes(1)},
+	})
+	p1, err := parseICCProfileCached(profile, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := parseICCProfileCached(profile, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 != p2 {
+		t.Fatal("ICC profile cache did not reuse parsed profile")
+	}
+}
+
+func TestICCParaEval(t *testing.T) {
+	// Display P3-style parametric curve: g, a, b, c, d.
+	p3 := &iccPara{typ: 3, vals: [7]float64{2.4, 0.948, 0.052, 0.077, 0.04045}}
+	for _, tc := range []struct{ x, want float64 }{
+		{0.01, 0.0007739},
+		{0.05, 0.0039366},
+		{0.1, 0.0100239},
+		{0.5, 0.2140452},
+		{1, 1},
+	} {
+		if got := p3.eval(tc.x); math.Abs(got-tc.want) > 1e-4 {
+			t.Fatalf("para3(%v) = %v, want %v", tc.x, got, tc.want)
+		}
+	}
+	p4 := &iccPara{typ: 4, vals: [7]float64{2, 1, 0, 0, 0.1, 0.05, 0.01}}
+	if got := p4.eval(0.05); math.Abs(got-0.01) > 1e-9 {
+		t.Fatalf("para4 low = %v", got)
+	}
+	if got := p4.eval(0.5); math.Abs(got-0.3) > 1e-9 {
+		t.Fatalf("para4 high = %v", got)
 	}
 }

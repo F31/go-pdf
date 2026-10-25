@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"context"
+	"io"
 
 	"github.com/F31/go-pdf/internal/doc"
 )
@@ -22,6 +23,14 @@ func (a *Attachment) Data(ctx context.Context) ([]byte, error) {
 		return nil, nil
 	}
 	return a.inner.Data(ctx)
+}
+
+// WriteTo decodes the embedded file into w without retaining it in memory.
+func (a *Attachment) WriteTo(ctx context.Context, w io.Writer) (int64, error) {
+	if a == nil || a.inner == nil {
+		return 0, nil
+	}
+	return a.inner.WriteTo(ctx, w)
 }
 
 // Attachments returns files in the EmbeddedFiles name tree.

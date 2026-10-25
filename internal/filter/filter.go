@@ -41,6 +41,14 @@ func (p Params) Bool(key string, def bool) bool {
 // DecodeChain applies filters in order. names and parms must be the same
 // length; parms may contain nil entries.
 func DecodeChain(ctx context.Context, r io.Reader, names []string, parms []Params, t *budget.Tracker, encodedLen int64) (io.Reader, error) {
+	return DecodeChainLimit(ctx, r, names, parms, t, encodedLen, 0)
+}
+
+// DecodeChainLimit is DecodeChain with a caller-supplied decoded byte limit.
+// When decodedLimit is positive it replaces the generic inflate-ratio check for
+// the final filter. This is used for image streams, where a legitimate solid
+// image can compress far beyond the stream-level ratio guard.
+func DecodeChainLimit(ctx context.Context, r io.Reader, names []string, parms []Params, t *budget.Tracker, encodedLen, decodedLimit int64) (io.Reader, error) {
 	cur := r
 	for i, name := range names {
 		var p Params
@@ -55,7 +63,11 @@ func DecodeChain(ctx context.Context, r io.Reader, names []string, parms []Param
 		if i == 0 {
 			enc = encodedLen
 		}
-		cur = newLimitedReader(ctx, dec, t, enc)
+		limit := int64(0)
+		if decodedLimit > 0 && i == len(names)-1 {
+			limit = decodedLimit
+		}
+		cur = newLimitedReader(ctx, dec, t, enc, limit)
 	}
 	return cur, nil
 }
@@ -105,16 +117,17 @@ func applyPredictor(r io.Reader, p Params) (io.Reader, error) {
 }
 
 type limitedReader struct {
-	ctx context.Context
-	r   io.Reader
-	t   *budget.Tracker
-	out int64
-	enc int64
-	err error
+	ctx   context.Context
+	r     io.Reader
+	t     *budget.Tracker
+	out   int64
+	enc   int64
+	limit int64
+	err   error
 }
 
-func newLimitedReader(ctx context.Context, r io.Reader, t *budget.Tracker, encoded int64) *limitedReader {
-	return &limitedReader{ctx: ctx, r: r, t: t, enc: encoded}
+func newLimitedReader(ctx context.Context, r io.Reader, t *budget.Tracker, encoded, limit int64) *limitedReader {
+	return &limitedReader{ctx: ctx, r: r, t: t, enc: encoded, limit: limit}
 }
 
 func (l *limitedReader) Read(p []byte) (int, error) {
@@ -128,6 +141,10 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	if n > 0 {
 		l.out += int64(n)
+		if l.limit > 0 && l.out > l.limit {
+			l.err = errs.Wrap(errs.ErrBudget, "BUD-STREAM-BYTES", "decode stream", -1, 0, -1)
+			return 0, l.err
+		}
 		if l.t != nil {
 			if e := l.t.CheckStreamLen(l.out); e != nil {
 				l.err = e
@@ -139,7 +156,7 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 			}
 		}
 	}
-	if err == io.EOF && l.t != nil && l.enc > 0 {
+	if err == io.EOF && l.t != nil && l.enc > 0 && l.limit <= 0 {
 		if e := l.t.CheckInflateRatio(l.enc, l.out); e != nil {
 			l.err = e
 			return n, e

@@ -1,11 +1,12 @@
 // Package displaylist defines the stable contract between go-pdf and its
 // consumers. G0 froze the type skeleton at Version 1.0; field additions since
-// then increment the minor version (currently 1.14).
+// then increment the minor version (currently 2.0).
 package displaylist
 
 import (
 	"context"
 	"image"
+	"io"
 	"sync"
 )
 
@@ -48,6 +49,7 @@ type Paint struct {
 	RGBA    [4]float64
 	Space   string
 	Raw     []float64
+	Profile []byte `json:",omitempty"`
 	Pattern *Pattern
 	Approx  bool
 }
@@ -67,6 +69,7 @@ type Pattern struct {
 	Content    []byte
 	Items      []Item
 	Clips      []Clip
+	Shading    *Shading
 }
 
 type FillRule int
@@ -224,6 +227,13 @@ type GlyphSource interface {
 	GlyphOutline(code, cid uint32) ([]Segment, bool)
 }
 
+// FontSource exposes the decoded embedded font program for providers that need
+// to load their own font engine. It is not serialized in display-list JSON.
+type FontSource interface {
+	io.ReaderAt
+	Size() int64
+}
+
 type FontInfo struct {
 	BaseFont    string
 	Family      string
@@ -239,6 +249,7 @@ type FontInfo struct {
 	ItalicAngle float64
 	Metrics     FontMetrics
 	GlyphSource GlyphSource `json:"-"`
+	Source      FontSource  `json:"-"`
 }
 
 type Glyph struct {
@@ -260,16 +271,12 @@ type SoftMask struct {
 	HasBackdrop bool
 }
 
-// PaintState preserves fill/stroke alpha and print-related graphics state that
-// a single effective Alpha cannot represent. Consumers that only understand
-// Alpha may continue to use it as the conservative composite value.
+// PaintState preserves separate fill/stroke alpha when a single effective
+// Alpha cannot represent both. Consumers that only understand Alpha may use it
+// as the conservative composite value.
 type PaintState struct {
-	FillAlpha       float64
-	StrokeAlpha     float64
-	FillOverprint   bool
-	StrokeOverprint bool
-	OverprintMode   int
-	RenderingIntent string
+	FillAlpha   float64
+	StrokeAlpha float64
 }
 
 // TextSpan maps a Unicode substitution (usually ActualText) to a glyph range.
@@ -386,8 +393,6 @@ type Group struct {
 	Knockout        bool
 	ColorSpace      string
 	BlendColorSpace string
-	BlendN          int
-	BlendProfile    []byte
 	Backdrop        *Backdrop
 }
 

@@ -151,10 +151,7 @@ func decodeTextString(o syntax.Object) string {
 	if !ok {
 		return ""
 	}
-	if len(s) >= 2 && s[0] == 0xFE && s[1] == 0xFF {
-		return utf16BE(s[2:])
-	}
-	return string(s)
+	return decodeString([]byte(s))
 }
 
 func utf16BE(b []byte) string {
@@ -163,6 +160,20 @@ func utf16BE(b []byte) string {
 		r := rune(b[i])<<8 | rune(b[i+1])
 		if r >= 0xD800 && r <= 0xDBFF && i+3 < len(b) {
 			r2 := rune(b[i+2])<<8 | rune(b[i+3])
+			r = 0x10000 + (r-0xD800)<<10 + (r2 - 0xDC00)
+			i += 2
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+func utf16LE(b []byte) string {
+	var sb strings.Builder
+	for i := 0; i+1 < len(b); i += 2 {
+		r := rune(b[i+1])<<8 | rune(b[i])
+		if r >= 0xD800 && r <= 0xDBFF && i+3 < len(b) {
+			r2 := rune(b[i+3])<<8 | rune(b[i+2])
 			r = 0x10000 + (r-0xD800)<<10 + (r2 - 0xDC00)
 			i += 2
 		}

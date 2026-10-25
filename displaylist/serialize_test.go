@@ -3,13 +3,13 @@ package displaylist
 import "testing"
 
 func TestVersion(t *testing.T) {
-	if Version.Major != 1 || Version.Minor != 18 {
+	if Version.Major != 2 || Version.Minor != 0 {
 		t.Fatalf("version = %v", Version)
 	}
-	if !Compatible(1) || Compatible(0) || Compatible(2) {
+	if !Compatible(2) || Compatible(1) || Compatible(0) {
 		t.Fatal("compatibility")
 	}
-	if Version.String() != "1.18" {
+	if Version.String() != "2.0" {
 		t.Fatalf("string = %s", Version.String())
 	}
 }

@@ -15,9 +15,11 @@ type SearchOptions struct {
 
 // Hit is one search match with its page-space bounds.
 type Hit struct {
-	Text   string
-	Bounds displaylist.Rect
-	Chars  []Char
+	Text      string
+	Bounds    displaylist.Rect
+	Quads     []displaylist.Rect
+	CharQuads [][4]displaylist.Point
+	Chars     []Char
 }
 
 // Search finds query occurrences in the page text, including whitespace gaps
@@ -26,7 +28,8 @@ func (p *Page) Search(query string, opts SearchOptions) []Hit {
 	if p == nil || query == "" {
 		return nil
 	}
-	runes, chars, positions := p.searchRunes()
+	query = p.Normalization.apply(query)
+	runes, chars, positions, charLine := p.searchRunes()
 	q := []rune(query)
 	match := runes
 	if !opts.CaseSensitive {
@@ -48,22 +51,41 @@ func (p *Page) Search(query string, opts SearchOptions) []Hit {
 		}
 		seen := make(map[int]bool)
 		var hitChars []Char
+		lineQuads := map[int]displaylist.Rect{}
+		var lineOrder []int
 		for k := i; k < i+len(q); k++ {
 			pos := positions[k]
 			if pos < 0 || seen[pos] {
 				continue
 			}
 			seen[pos] = true
-			hitChars = append(hitChars, chars[pos])
+			c := chars[pos]
+			hitChars = append(hitChars, c)
+			if li := charLine[pos]; li >= 0 {
+				q, ok := lineQuads[li]
+				if !ok {
+					lineOrder = append(lineOrder, li)
+					lineQuads[li] = c.Bounds
+				} else {
+					lineQuads[li] = union(q, c.Bounds)
+				}
+			}
 		}
 		if len(hitChars) == 0 {
 			continue
 		}
-		hits = append(hits, Hit{
+		hit := Hit{
 			Text:   strings.TrimSpace(string(runes[i : i+len(q)])),
 			Bounds: unionBounds(hitChars),
 			Chars:  hitChars,
-		})
+		}
+		for _, c := range hitChars {
+			hit.CharQuads = append(hit.CharQuads, c.Quad)
+		}
+		for _, li := range lineOrder {
+			hit.Quads = append(hit.Quads, lineQuads[li])
+		}
+		hits = append(hits, hit)
 	}
 	return hits
 }
@@ -91,13 +113,14 @@ func isWordRune(r rune) bool {
 	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
-func (p *Page) searchRunes() ([]rune, []Char, []int) {
+func (p *Page) searchRunes() ([]rune, []Char, []int, []int) {
 	var out []rune
 	var chars []Char
-	var positions []int
-	appendChar := func(c Char) {
+	var positions, charLine []int
+	appendChar := func(c Char, line int) {
 		pos := len(chars)
 		chars = append(chars, c)
+		charLine = append(charLine, line)
 		for _, r := range c.Text {
 			out = append(out, r)
 			positions = append(positions, pos)
@@ -112,9 +135,9 @@ func (p *Page) searchRunes() ([]rune, []Char, []int) {
 	}
 	if len(p.Lines) == 0 {
 		for _, c := range p.Chars {
-			appendChar(c)
+			appendChar(c, -1)
 		}
-		return out, chars, positions
+		return out, chars, positions, charLine
 	}
 	for li, line := range p.Lines {
 		if li > 0 {
@@ -125,9 +148,9 @@ func (p *Page) searchRunes() ([]rune, []Char, []int) {
 				appendSpace()
 			}
 			for _, c := range word.Chars {
-				appendChar(c)
+				appendChar(c, li)
 			}
 		}
 	}
-	return out, chars, positions
+	return out, chars, positions, charLine
 }

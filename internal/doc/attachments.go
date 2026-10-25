@@ -2,6 +2,7 @@ package doc
 
 import (
 	"context"
+	"io"
 
 	"github.com/F31/go-pdf/internal/errs"
 	"github.com/F31/go-pdf/internal/syntax"
@@ -24,6 +25,14 @@ func (a *Attachment) Data(ctx context.Context) ([]byte, error) {
 		return nil, errs.Wrap(errs.ErrCorrupt, "DOC-ATTACHMENT", "read attachment", -1, 0, -1)
 	}
 	return a.doc.file.DecodeStream(ctx, a.stream)
+}
+
+// WriteTo decodes the embedded file stream directly into w.
+func (a *Attachment) WriteTo(ctx context.Context, w io.Writer) (int64, error) {
+	if a == nil || a.stream == nil || a.doc == nil {
+		return 0, errs.Wrap(errs.ErrCorrupt, "DOC-ATTACHMENT", "read attachment", -1, 0, -1)
+	}
+	return a.doc.file.DecodeStreamTo(ctx, a.stream, w)
 }
 
 // Attachments returns the EmbeddedFiles name tree.

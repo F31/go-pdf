@@ -33,8 +33,8 @@
 
 - 当前实现把输入完整读入内存；`io.ReaderAt` 已作为公共入口，但尚未实现分块/零拷贝读取。
 - Repair 为扫描式恢复，未覆盖设计文档 4.4 的全部畸形变体。
-- 页面树 `Count` 仅作提示，尚未产生与实际页数不一致的诊断。
-- Info 的 PDFDocEncoding 仅覆盖常用子集；XMP 仅透传原始字节，字段解析与优先级回退属 DOC-03。
+- 页面树各 `Pages` 节点的 `Count` 与子树实际页数不一致时产生 `DOC-PAGE-COUNT` 警告诊断；页数仍以实际遍历为准。
+- PDFDocEncoding 与 UTF-16 BOM 解码已统一用于 Info、Outline、表单、附件、OC 名称和页标签；UTF-16 支持代理对；PDFDocEncoding 的 0x7F/0x9F 未定义码位替换为 U+FFFD。XMP 同时保留原始字节；常用字段通过 XML tokenizer 解析，支持多值 creator/subject 与 x-default Alt。
 - 加密文件仅识别并返回 `ErrPassword`/`ErrUnsupported`，解密在 G4/G2 末实现。
 - DCT/CCITT 已在 G3 解码；JBIG2/JPX 通过外部解码器注册，核心不做解码。
 - 显示列表解释、字体、颜色、图像与区域渲染在 G0 时未实现；G1 已补齐基础内容解释，见 `docs/g1-status.md`。

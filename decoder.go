@@ -67,6 +67,14 @@ func (r *DecoderRegistry) WithOverride(enc displaylist.ImageEncoding, factory De
 	return next, nil
 }
 
+func (r *DecoderRegistry) hasEncoding(enc displaylist.ImageEncoding) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.factories[enc]
+	return ok
+}
+
 func (r *DecoderRegistry) decoder(ctx context.Context, enc displaylist.ImageEncoding, info displaylist.ImageInfo) (ExternalDecoder, error) {
 	if r == nil {
 		return nil, nil

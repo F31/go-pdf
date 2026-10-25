@@ -243,3 +243,27 @@ func BenchmarkASCIIHexDecode(b *testing.B) {
 		_, _ = io.Copy(io.Discard, r)
 	}
 }
+
+func TestDecodeChainLimitSkipsRatioButEnforcesBytes(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	_, _ = zw.Write(bytes.Repeat([]byte{0}, 4096))
+	_ = zw.Close()
+	tr := budget.NewTracker(&budget.DefaultBudget)
+	// The ratio is far above the default guard, but the explicit limit permits it.
+	r, err := DecodeChainLimit(context.Background(), bytes.NewReader(buf.Bytes()), []string{"FlateDecode"}, nil, tr, int64(buf.Len()), 4097)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, r); err != nil || n != 4096 {
+		t.Fatalf("read = %d, %v", n, err)
+	}
+	r, err = DecodeChainLimit(context.Background(), bytes.NewReader(buf.Bytes()), []string{"FlateDecode"}, nil, tr, int64(buf.Len()), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(io.Discard, r)
+	if !errors.Is(err, errs.ErrBudget) {
+		t.Fatalf("expected ErrBudget, got %v", err)
+	}
+}

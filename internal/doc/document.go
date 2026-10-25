@@ -349,12 +349,16 @@ func decodeText(o syntax.Object) string {
 	default:
 		return ""
 	}
+	return decodeString(b)
+}
+
+func decodeString(b []byte) string {
 	if len(b) >= 2 {
 		if b[0] == 0xFE && b[1] == 0xFF {
-			return decodeUTF16BE(b[2:])
+			return utf16BE(b[2:])
 		}
 		if b[0] == 0xFF && b[1] == 0xFE {
-			return decodeUTF16LE(b[2:])
+			return utf16LE(b[2:])
 		}
 	}
 	var sb strings.Builder
@@ -364,25 +368,8 @@ func decodeText(o syntax.Object) string {
 	return sb.String()
 }
 
-func decodeUTF16BE(b []byte) string {
-	var sb strings.Builder
-	for i := 0; i+1 < len(b); i += 2 {
-		sb.WriteRune(rune(b[i])<<8 | rune(b[i+1]))
-	}
-	return sb.String()
-}
-
-func decodeUTF16LE(b []byte) string {
-	var sb strings.Builder
-	for i := 0; i+1 < len(b); i += 2 {
-		sb.WriteRune(rune(b[i+1])<<8 | rune(b[i]))
-	}
-	return sb.String()
-}
-
-// pdfDocRune implements the ASCII/Latin-1 subset of PDFDocEncoding. The
-// remaining control-range mappings are rare in metadata and are treated as
-// Latin-1 until corpus evidence justifies a full table.
+// pdfDocRune maps PDFDocEncoding bytes, including the 0x18-0x1F accents and
+// the 0x80-0xA0 punctuation/ligature range. Remaining bytes are Latin-1.
 func pdfDocRune(c byte) rune {
 	switch c {
 	case 0x18:
@@ -465,6 +452,8 @@ func pdfDocRune(c byte) rune {
 		return '\u017e'
 	case 0xa0:
 		return '\u20ac'
+	case 0x7f, 0x9f:
+		return '\ufffd'
 	}
 	return rune(c)
 }

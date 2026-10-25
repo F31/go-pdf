@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"github.com/F31/go-pdf/extension"
 	"github.com/F31/go-pdf/internal/budget"
 	pdfcolor "github.com/F31/go-pdf/internal/color"
 )
@@ -71,6 +72,7 @@ type options struct {
 	hidden       bool
 	forms        bool
 	decoders     *DecoderRegistry
+	extensions   *extension.Registry
 	colorManager pdfcolor.Manager
 }
 
@@ -123,6 +125,9 @@ func parseOptions(opts []Option) (options, error) {
 		if err := fn(&o); err != nil {
 			return o, err
 		}
+	}
+	if err := o.validateExtensions(); err != nil {
+		return o, err
 	}
 	return o, nil
 }

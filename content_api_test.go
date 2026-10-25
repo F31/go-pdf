@@ -7,12 +7,14 @@ import (
 	stdimage "image"
 	stdcolor "image/color"
 	"image/jpeg"
+	"io"
 	"math"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/F31/go-pdf/displaylist"
+	"github.com/F31/go-pdf/extension"
 	"github.com/F31/go-pdf/internal/testkit"
 	pdftext "github.com/F31/go-pdf/text"
 )
@@ -649,6 +651,45 @@ func TestFormXObject(t *testing.T) {
 	}
 	if b := dl.Clips[0].Bounds; math.Abs(b.X0-20) > 0.001 || math.Abs(b.Y0-20) > 0.001 || math.Abs(b.X1-70) > 0.001 || math.Abs(b.Y1-70) > 0.001 {
 		t.Fatalf("clip bounds %#v", b)
+	}
+}
+
+func TestFormXObjectClipIntersection(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("q 0 0 50 50 re W n /Fm1 Do Q")),
+		testkit.Stream(5, "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << >> >>", []byte("q 0 0 20 20 re W n 0 0 10 10 re f Q")),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, err := d.Page(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range dl.Items {
+		path, ok := item.(*displaylist.Path)
+		if !ok || path.Clip < 0 || path.Clip >= len(dl.Clips) {
+			continue
+		}
+		found = true
+		if len(dl.Clips[path.Clip].Intersect) == 0 {
+			t.Fatalf("form clip was not intersected: %#v", dl.Clips[path.Clip])
+		}
+	}
+	if !found {
+		t.Fatal("form path not found")
+	}
+	for _, item := range d.Diagnostics() {
+		if item.Code == "CNT-FORM-CLIP-INTERSECT" {
+			t.Fatalf("unexpected approximate clip diagnostic: %#v", item)
+		}
 	}
 }
 
@@ -1448,6 +1489,31 @@ func TestTilingPattern(t *testing.T) {
 	}
 }
 
+func TestIndirectPatternColorSpace(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /ColorSpace << /CS0 8 0 R >> /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/CS0 cs /P1 scn 0 0 10 10 re f")),
+		testkit.Stream(6, "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >> >>", []byte("0 0 5 5 re f")),
+		testkit.Raw(8, "[/Pattern]"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.Items) != 1 {
+		t.Fatalf("items %d", len(dl.Items))
+	}
+	path := dl.Items[0].(*displaylist.Path)
+	if path.Fill == nil || path.Fill.Kind != displaylist.PaintPattern || path.Fill.Pattern == nil {
+		t.Fatalf("fill %#v", path.Fill)
+	}
+}
+
 func TestMeshShadingPassthrough(t *testing.T) {
 	raw := []byte{0, 1, 2, 3, 4, 5, 6, 7}
 	objs := []testkit.Obj{
@@ -1618,6 +1684,11 @@ func TestPageLabels(t *testing.T) {
 			t.Fatalf("display label %q err %v", dl.Label, err)
 		}
 	}
+	ranges, err := d.PageLabelRanges(context.Background())
+	if err != nil || len(ranges) != 2 || ranges[0].Start != 0 || ranges[0].Style != "r" ||
+		ranges[1].Start != 2 || ranges[1].Prefix != "A-" {
+		t.Fatalf("ranges = %#v err=%v", ranges, err)
+	}
 }
 
 func TestPageAnnotations(t *testing.T) {
@@ -1678,9 +1749,10 @@ func TestStructureTree(t *testing.T) {
 		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>"),
 		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
 		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
-		testkit.Raw(5, "<< /Type /StructTreeRoot /K [6 0 R] >>"),
-		testkit.Raw(6, "<< /Type /StructElem /S /P /T (Para) /Pg 3 0 R /K [0 1 7 0 R] >>"),
+		testkit.Raw(5, "<< /Type /StructTreeRoot /RoleMap << /MyPara /P >> /ClassMap << /Body 8 0 R >> /K [6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /StructElem /S /MyPara /C [/Body /Important] /A << /O /Layout /BBox [0 0 10 20] /Placement /Block /Width 5 >> /T (Para) /Alt (Alt para) /Lang (en-US) /ID (elem-1) /Pg 3 0 R /K [0 1 7 0 R] >>"),
 		testkit.Raw(7, "<< /Type /StructElem /S /Span /Pg 3 0 R /K 2 >>"),
+		testkit.Raw(8, "<< /O /Table /ColSpan 2 /Scope /Column >>"),
 	}
 	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
 	defer d.Close()
@@ -1690,6 +1762,40 @@ func TestStructureTree(t *testing.T) {
 	}
 	if len(tree) != 1 || tree[0].Type != "P" || tree[0].Title != "Para" || tree[0].Page != 0 {
 		t.Fatalf("tree %#v", tree)
+	}
+	if tree[0].RawType != "MyPara" || tree[0].Alt != "Alt para" || tree[0].Lang != "en-US" || tree[0].IDName != "elem-1" {
+		t.Fatalf("metadata %#v", tree[0])
+	}
+	if len(tree[0].Classes) != 2 || tree[0].Classes[0] != "Body" || tree[0].Classes[1] != "Important" {
+		t.Fatalf("classes %#v", tree[0])
+	}
+	if len(tree[0].Attributes) != 1 || tree[0].Attributes[0].Owner != "Layout" {
+		t.Fatalf("attributes %#v", tree[0].Attributes)
+	}
+	attrs := tree[0].Attributes[0].Values
+	if attrs["Placement"].Kind != "name" || attrs["Placement"].Text != "Block" {
+		t.Fatalf("placement %#v", attrs["Placement"])
+	}
+	if attrs["Width"].Kind != "number" || attrs["Width"].Number != 5 {
+		t.Fatalf("width %#v", attrs["Width"])
+	}
+	if attrs["BBox"].Kind != "array" || len(attrs["BBox"].Items) != 4 || attrs["BBox"].Items[3].Number != 20 {
+		t.Fatalf("bbox %#v", attrs["BBox"])
+	}
+	if len(tree[0].ClassAttributes) != 1 || tree[0].ClassAttributes[0].Owner != "Table" || tree[0].ClassAttributes[0].Values["ColSpan"].Number != 2 {
+		t.Fatalf("class attributes %#v", tree[0].ClassAttributes)
+	}
+	if bbox, ok := tree[0].BBox(); !ok || bbox.X0 != 0 || bbox.Y1 != 20 {
+		t.Fatalf("bbox %#v", bbox)
+	}
+	if placement, ok := tree[0].Placement(); !ok || placement != "Block" {
+		t.Fatalf("placement %q", placement)
+	}
+	if span, ok := tree[0].ColSpan(); !ok || span != 2 {
+		t.Fatalf("colspan %d", span)
+	}
+	if scope, ok := tree[0].Scope(); !ok || scope != "Column" {
+		t.Fatalf("scope %q", scope)
 	}
 	if len(tree[0].MCIDs) != 2 || len(tree[0].Children) != 1 || tree[0].Children[0].Type != "Span" || tree[0].Children[0].MCIDs[0] != 2 {
 		t.Fatalf("tree %#v", tree)
@@ -1707,6 +1813,35 @@ func TestMarkedContentMCID(t *testing.T) {
 	tr := dl.Items[0].(*displaylist.TextRun)
 	if tr.MCID != 7 {
 		t.Fatalf("MCID %d", tr.MCID)
+	}
+}
+
+func TestPageTextTaggedOrder(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 5 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 8 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/P << /MCID 1 >> BDC BT /F1 12 Tf 10 70 Td (Alpha) Tj ET EMC /P << /MCID 2 >> BDC BT /F1 12 Tf 10 50 Td (Beta) Tj ET EMC")),
+		testkit.Raw(5, "<< /Type /StructTreeRoot /K [7 0 R 6 0 R] >>"),
+		testkit.Raw(6, "<< /Type /StructElem /S /P /T (First title) /Alt (First alt) /Lang (he-IL) /Pg 3 0 R /K 1 >>"),
+		testkit.Raw(7, "<< /Type /StructElem /S /H1 /T (Second title) /Alt (Second alt) /Lang (en-US) /Pg 3 0 R /K 2 >>"),
+		testkit.Raw(8, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
+	defer d.Close()
+	p, _ := d.Page(0)
+	tx, err := p.Text(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Text != "Beta\nAlpha" {
+		t.Fatalf("tagged text = %q", tx.Text)
+	}
+	if len(tx.Blocks) != 2 || tx.Blocks[0].Type != "H1" || tx.Blocks[0].Alt != "Second alt" || tx.Blocks[0].Lang != "en-US" {
+		t.Fatalf("blocks = %#v", tx.Blocks)
+	}
+	if tx.Blocks[1].Type != "P" || tx.Blocks[1].Title != "First title" || tx.Blocks[1].Lang != "he-IL" {
+		t.Fatalf("blocks = %#v", tx.Blocks)
 	}
 }
 
@@ -1755,6 +1890,11 @@ func TestAttachments(t *testing.T) {
 	if err != nil || string(data) != "hello" {
 		t.Fatalf("data %q %v", data, err)
 	}
+	var buf bytes.Buffer
+	n, err := atts[0].WriteTo(context.Background(), &buf)
+	if err != nil || n != 5 || buf.String() != "hello" {
+		t.Fatalf("writeTo n=%d data=%q err=%v", n, buf.String(), err)
+	}
 }
 
 func TestXMPMetadata(t *testing.T) {
@@ -1763,7 +1903,9 @@ func TestXMPMetadata(t *testing.T) {
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:pdf="http://ns.adobe.com/pdf/1.3/" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
    <dc:title><rdf:Alt><rdf:li xml:lang="x-default">XMP Title</rdf:li></rdf:Alt></dc:title>
-   <dc:creator><rdf:Seq><rdf:li>XMP Author</rdf:li></rdf:Seq></dc:creator>
+   <dc:creator><rdf:Seq><rdf:li>XMP Author</rdf:li><rdf:li>Second Author</rdf:li></rdf:Seq></dc:creator>
+   <dc:description><rdf:Alt><rdf:li xml:lang="x-default">XMP Subject</rdf:li></rdf:Alt></dc:description>
+   <dc:subject><rdf:Bag><rdf:li>one</rdf:li><rdf:li>two</rdf:li></rdf:Bag></dc:subject>
    <pdf:Producer>XMP Producer</pdf:Producer>
    <xmp:CreateDate>2026-01-02T03:04:05Z</xmp:CreateDate>
   </rdf:Description>
@@ -1778,7 +1920,9 @@ func TestXMPMetadata(t *testing.T) {
 	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"))
 	defer d.Close()
 	info := d.Info()
-	if info.Title != "XMP Title" || info.Author != "XMP Author" || info.Producer != "XMP Producer" || info.CreationDate != "2026-01-02T03:04:05Z" {
+	if info.Title != "XMP Title" || info.Author != "XMP Author; Second Author" ||
+		info.Subject != "XMP Subject" || info.Keywords != "one, two" ||
+		info.Producer != "XMP Producer" || info.CreationDate != "2026-01-02T03:04:05Z" {
 		t.Fatalf("info %#v", info)
 	}
 }
@@ -1860,7 +2004,7 @@ func TestTextSpanAndPaintState(t *testing.T) {
 	}
 	path := dl.Items[1].(*displaylist.Path)
 	ps = path.PaintState
-	if ps == nil || !ps.StrokeOverprint || ps.FillOverprint || ps.OverprintMode != 1 || ps.RenderingIntent != "Perceptual" {
+	if ps == nil || math.Abs(ps.FillAlpha-0.5) > 1e-9 || math.Abs(ps.StrokeAlpha-0.25) > 1e-9 {
 		t.Fatalf("path paint state %#v", ps)
 	}
 }
@@ -2074,7 +2218,7 @@ func TestSoftMaskBackdrop(t *testing.T) {
 	}
 }
 
-func TestGroupICCBlendProfile(t *testing.T) {
+func TestGroupICCBlendSpaceName(t *testing.T) {
 	objs := []testkit.Obj{
 		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
 		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
@@ -2091,7 +2235,182 @@ func TestGroupICCBlendProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	g, ok := dl.Items[0].(*displaylist.Group)
-	if !ok || g.BlendColorSpace != "ICCBased" || g.BlendN != 4 || string(g.BlendProfile) != "profile" {
+	if !ok || g.BlendColorSpace != "ICCBased" {
 		t.Fatalf("group %#v", g)
+	}
+}
+
+type fakeExtensionFactory struct{}
+
+func (fakeExtensionFactory) Info() extension.ProviderInfo {
+	return extension.ProviderInfo{Name: "test-extension", Version: "1", License: "MIT", Determinism: extension.Deterministic}
+}
+func (fakeExtensionFactory) Features() []extension.Feature { return nil }
+func (fakeExtensionFactory) Encodings() []extension.ImageEncoding {
+	return []extension.ImageEncoding{extension.ImageJBIG2}
+}
+func (fakeExtensionFactory) NewDecoder(context.Context, extension.ImageConfig) (extension.ImageDecoder, error) {
+	return fakeExtensionDecoder{}, nil
+}
+
+type fakeExtensionDecoder struct{}
+
+func (fakeExtensionDecoder) Decode(context.Context, io.ReaderAt, int64, extension.ImageConfig) (*extension.ImagePlane, error) {
+	return &extension.ImagePlane{
+		Pix: []byte{77}, Stride: 1, Width: 1, Height: 1,
+		Components: 1, BitsPerComponent: 8, ColorSpace: "DeviceGray",
+	}, nil
+}
+func (fakeExtensionDecoder) Close() error { return nil }
+
+func TestExternalCCITTG32D(t *testing.T) {
+	dec := &fakeJBIG2Decoder{}
+	factory := fakeEncodingFactory{dec: dec, enc: "CCITTFaxDecode"}
+	reg, err := NewDecoderRegistry(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte{1, 2, 3}
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/Im1 Do")),
+		testkit.Stream(5, "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /CCITTFaxDecode /DecodeParms << /K 1 /Columns 1 /Rows 1 >> >>", raw),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"), WithDecoderRegistry(reg))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	im := dl.Items[0].(*displaylist.Image)
+	if _, err := im.Data.Decode(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(dec.raw, raw) {
+		t.Fatalf("provider raw = %v", dec.raw)
+	}
+}
+
+type fakeEncodingFactory struct {
+	dec *fakeJBIG2Decoder
+	enc displaylist.ImageEncoding
+}
+
+func (f fakeEncodingFactory) Encodings() []displaylist.ImageEncoding {
+	return []displaylist.ImageEncoding{f.enc}
+}
+func (f fakeEncodingFactory) NewDecoder(context.Context, displaylist.ImageInfo) (ExternalDecoder, error) {
+	return f.dec, nil
+}
+
+func TestExtensionImageDecoder(t *testing.T) {
+	extReg, err := extension.NewRegistry(extension.WithImageFactory(fakeExtensionFactory{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/Im1 Do")),
+		testkit.Stream(5, "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode >>", []byte{9, 8, 7}),
+	}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"), WithExtensionRegistry(extReg))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	im := dl.Items[0].(*displaylist.Image)
+	img, err := im.Data.Decode(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gray, ok := img.(*stdimage.Gray)
+	if !ok || gray.GrayAt(0, 0).Y != 77 {
+		t.Fatalf("extension pixel = %#v", img)
+	}
+	sampler, ok := im.Data.(displaylist.ImageSampleRef)
+	if !ok {
+		t.Fatal("image does not expose source samples")
+	}
+	samples, err := sampler.DecodeSamples(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer samples.Close()
+	if samples.Width != 1 || samples.Height != 1 || samples.Components != 1 || samples.ColorSpace != "DeviceGray" {
+		t.Fatalf("samples = %#v", samples)
+	}
+	if got := samples.Data[0]; got < 0.301 || got > 0.303 {
+		t.Fatalf("sample = %v", got)
+	}
+}
+
+func TestExtensionImageDecoderConflict(t *testing.T) {
+	extReg, err := extension.NewRegistry(extension.WithImageFactory(fakeExtensionFactory{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := NewDecoderRegistry(fakeJBIG2Factory{dec: &fakeJBIG2Decoder{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := testkit.Build([]testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>"),
+	}, "/Root 1 0 R")
+	if _, err := Open(context.Background(), bytes.NewReader(data), int64(len(data)), WithDecoderRegistry(legacy), WithExtensionRegistry(extReg)); err == nil {
+		t.Fatal("expected duplicate provider error")
+	}
+}
+
+func TestImagePlaneToImageCMYK(t *testing.T) {
+	img, err := imagePlaneToImage(&extension.ImagePlane{
+		Pix: []byte{0, 255, 0, 0}, Stride: 4, Width: 1, Height: 1,
+		Components: 4, BitsPerComponent: 8, ColorSpace: "DeviceCMYK",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmyk, ok := img.(*stdimage.CMYK)
+	if !ok || cmyk.CMYKAt(0, 0).M != 255 {
+		t.Fatalf("cmyk = %#v", img)
+	}
+}
+
+func TestColorManagerIndexedAndTintSpaces(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /IDX [/Indexed /DeviceCMYK 0 <00000000>] /SEP [/Separation /Spot /DeviceCMYK 5 0 R] /DEV [/DeviceN [/A /B] /DeviceCMYK 6 0 R] >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/IDX cs 0 scn 0 0 10 10 re f /SEP cs 0.5 scn 10 0 10 10 re f /DEV cs 0.5 0.5 scn 20 0 10 10 re f")),
+		testkit.Stream(5, "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [1 1 1 1] /N 1 >>", nil),
+		testkit.Stream(6, "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1 0 1] >>", []byte("{ pop pop 0 0 0 0 }")),
+	}
+	m := &testColorManager{}
+	d := openTest(t, testkit.Build(objs, "/Root 1 0 R"), WithColorManager(m))
+	defer d.Close()
+	p, _ := d.Page(0)
+	dl, err := p.DisplayList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dl.Items) != 3 {
+		t.Fatalf("items = %d", len(dl.Items))
+	}
+	for _, it := range dl.Items {
+		path := it.(*displaylist.Path)
+		if path.Fill.RGBA != [4]float64{0, 1, 0, 1} {
+			t.Fatalf("fill = %v", path.Fill.RGBA)
+		}
+	}
+	if m.space != "DeviceCMYK" {
+		t.Fatalf("manager space = %q", m.space)
 	}
 }

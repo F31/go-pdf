@@ -367,7 +367,7 @@ func (f *File) parseXrefStream(ctx context.Context, stm *Stream) (map[int]XRefEn
 	if len(index)%2 != 0 {
 		return nil, errs.Wrap(errs.ErrCorrupt, "SYN-XREF-INDEX", "parse xref stream", stm.Offset, 0, -1)
 	}
-	data, err := f.decodeStream(ctx, stm)
+	data, err := f.decodeStream(ctx, stm, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -525,7 +525,7 @@ func (f *File) objStmObjects(ctx context.Context, stm *Stream) (map[Ref]Object, 
 	if !ok1 || !ok2 || n < 0 || n > 10_000_000 || first < 0 {
 		return nil, errs.Wrap(errs.ErrCorrupt, "SYN-OBJSTM-HEADER", "read object stream", stm.Offset, 0, -1)
 	}
-	data, err := f.decodeStream(ctx, stm)
+	data, err := f.decodeStream(ctx, stm, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +567,19 @@ func (f *File) objStmObjects(ctx context.Context, stm *Stream) (map[Ref]Object, 
 }
 
 // decodeStream applies the stream's filter chain.
-func (f *File) decodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
+func (f *File) decodeStream(ctx context.Context, stm *Stream, decodedLimit int64) ([]byte, error) {
+	r, err := f.streamReader(ctx, stm, decodedLimit)
+	if err != nil {
+		return nil, err
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return nil, errs.Wrap(err, "FLT-DECODE", "read decoded stream", stm.Offset, 0, -1)
+	}
+	return out, nil
+}
+
+func (f *File) streamReader(ctx context.Context, stm *Stream, decodedLimit int64) (io.Reader, error) {
 	raw := stm.Raw
 	if f.crypt != nil && stm.Ref.Num != 0 {
 		typ, _ := stm.Dict.NameValue("Type")
@@ -584,17 +596,9 @@ func (f *File) decodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
 		return nil, err
 	}
 	if len(names) == 0 {
-		return raw, nil
+		return bytes.NewReader(raw), nil
 	}
-	r, err := filter.DecodeChain(ctx, bytes.NewReader(raw), names, parms, f.tracker, int64(len(raw)))
-	if err != nil {
-		return nil, err
-	}
-	out, err := io.ReadAll(r)
-	if err != nil {
-		return nil, errs.Wrap(errs.ErrCorrupt, "FLT-DECODE", "read decoded stream", stm.Offset, 0, -1)
-	}
-	return out, nil
+	return filter.DecodeChainLimit(ctx, bytes.NewReader(raw), names, parms, f.tracker, int64(len(raw)), decodedLimit)
 }
 
 func (f *File) filterSpec(ctx context.Context, d Dict) ([]string, []filter.Params, error) {
@@ -946,12 +950,38 @@ func (f *File) Rebuild(ctx context.Context) error {
 
 // DecodeStream exposes stream decoding to the document layer.
 func (f *File) DecodeStream(ctx context.Context, stm *Stream) ([]byte, error) {
+	return f.DecodeStreamLimit(ctx, stm, 0)
+}
+
+// DecodeStreamLimit decodes a stream with an optional decoded byte limit. A
+// positive limit is used instead of the generic inflate-ratio guard.
+func (f *File) DecodeStreamLimit(ctx context.Context, stm *Stream, decodedLimit int64) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
 		return nil, errs.Wrap(errs.ErrClosed, "SYN-CLOSED", "decode stream", stm.Offset, 0, -1)
 	}
-	return f.decodeStream(ctx, stm)
+	return f.decodeStream(ctx, stm, decodedLimit)
+}
+
+// DecodeStreamTo decodes a stream directly into w without materializing the
+// decoded bytes. The encoded stream itself is still read from the in-memory or
+// mapped file view.
+func (f *File) DecodeStreamTo(ctx context.Context, stm *Stream, w io.Writer) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, errs.Wrap(errs.ErrClosed, "SYN-CLOSED", "decode stream", stm.Offset, 0, -1)
+	}
+	r, err := f.streamReader(ctx, stm, 0)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(w, r)
+	if err != nil {
+		return n, errs.Wrap(err, "FLT-DECODE", "read decoded stream", stm.Offset, 0, -1)
+	}
+	return n, nil
 }
 
 func (f *File) initSecurity(ctx context.Context, password string) error {

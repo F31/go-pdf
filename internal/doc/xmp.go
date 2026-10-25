@@ -2,6 +2,7 @@ package doc
 
 import (
 	"bytes"
+	"encoding/xml"
 	"strconv"
 	"strings"
 )
@@ -42,9 +43,99 @@ func applyXMP(info *Info, data []byte) {
 }
 
 func parseXMP(data []byte) xmpFields {
-	title := xmpField(data, "title")
+	f, complete := parseXMPXML(data)
+	if complete || f != (xmpFields{}) {
+		return f
+	}
+	return parseXMPLight(data)
+}
+
+// parseXMPXML reads the common XMP fields through a real XML tokenizer. It
+// keeps the last complete value for scalar fields and joins repeated RDF list
+// items for creator/subject-like fields.
+func parseXMPXML(data []byte) (xmpFields, bool) {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	var stack []string
+	values := map[string][]string{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return finishXMP(values), err == nil
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			stack = append(stack, t.Name.Local)
+		case xml.EndElement:
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		case xml.CharData:
+			key := xmpKey(stack)
+			if key == "" {
+				continue
+			}
+			if text := strings.TrimSpace(string(t)); text != "" {
+				values[key] = append(values[key], text)
+			}
+		}
+	}
+}
+
+func xmpKey(stack []string) string {
+	for i := len(stack) - 1; i >= 0; i-- {
+		switch strings.ToLower(stack[i]) {
+		case "title":
+			return "title"
+		case "creator":
+			return "creator"
+		case "description":
+			return "description"
+		case "subject":
+			return "subject"
+		case "keywords":
+			return "keywords"
+		case "creatortool":
+			return "creatortool"
+		case "producer":
+			return "producer"
+		case "createdate":
+			return "createdate"
+		case "modifydate":
+			return "modifydate"
+		}
+	}
+	return ""
+}
+
+func finishXMP(values map[string][]string) xmpFields {
+	first := func(key string) string {
+		if vs := values[key]; len(vs) > 0 {
+			return vs[0]
+		}
+		return ""
+	}
+	join := func(key, sep string) string {
+		return strings.Join(values[key], sep)
+	}
+	keywords := join("keywords", ", ")
+	if keywords == "" {
+		keywords = join("subject", ", ")
+	}
 	return xmpFields{
-		Title:      title,
+		Title:      first("title"),
+		Author:     join("creator", "; "),
+		Subject:    join("description", "; "),
+		Keywords:   keywords,
+		Creator:    first("creatortool"),
+		Producer:   first("producer"),
+		CreateDate: first("createdate"),
+		ModifyDate: first("modifydate"),
+	}
+}
+
+func parseXMPLight(data []byte) xmpFields {
+	return xmpFields{
+		Title:      xmpField(data, "title"),
 		Author:     xmpField(data, "creator"),
 		Subject:    xmpField(data, "description"),
 		Keywords:   firstNonEmpty(xmpField(data, "Keywords"), xmpField(data, "subject")),

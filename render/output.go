@@ -44,11 +44,8 @@ func RenderPageLease(ctx context.Context, page *pdf.Page, opts PageOptions) (*Ra
 	if page == nil {
 		return nil, errs.Wrap(errs.ErrClosed, "RND-PAGE", "render page", -1, 0, -1)
 	}
-	info := page.Info()
-	return RenderRegionLease(ctx, page, displaylist.Rect{
-		X0: info.CropBox.X0, Y0: info.CropBox.Y0,
-		X1: info.CropBox.X1, Y1: info.CropBox.Y1,
-	}, opts)
+	w, h := page.Size()
+	return RenderRegionLease(ctx, page, displaylist.Rect{X1: w, Y1: h}, opts)
 }
 
 // RenderPage renders the page CropBox using RenderRegion.
@@ -56,11 +53,8 @@ func RenderPage(ctx context.Context, page *pdf.Page, opts PageOptions) (stdimage
 	if page == nil {
 		return nil, errs.Wrap(errs.ErrClosed, "RND-PAGE", "render page", -1, 0, -1)
 	}
-	info := page.Info()
-	return RenderRegion(ctx, page, displaylist.Rect{
-		X0: info.CropBox.X0, Y0: info.CropBox.Y0,
-		X1: info.CropBox.X1, Y1: info.CropBox.Y1,
-	}, opts)
+	w, h := page.Size()
+	return RenderRegion(ctx, page, displaylist.Rect{X1: w, Y1: h}, opts)
 }
 
 // EncodePNG writes img as a PNG stream.

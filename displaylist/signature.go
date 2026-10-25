@@ -22,10 +22,6 @@ func Signature(it Item) uint64 {
 		w.s("paint-state")
 		w.f(c.PaintState.FillAlpha)
 		w.f(c.PaintState.StrokeAlpha)
-		w.b(c.PaintState.FillOverprint)
-		w.b(c.PaintState.StrokeOverprint)
-		w.i(c.PaintState.OverprintMode)
-		w.s(c.PaintState.RenderingIntent)
 	} else {
 		w.s("no-paint-state")
 	}

@@ -2,18 +2,24 @@ package render
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"io"
+	"math"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/F31/go-pdf"
 	"github.com/F31/go-pdf/displaylist"
+	"github.com/F31/go-pdf/extension"
 	"github.com/F31/go-pdf/internal/testkit"
 )
 
@@ -430,6 +436,18 @@ func TestRenderTransparencyGroup(t *testing.T) {
 	}
 }
 
+type fakeGlyphs struct{}
+
+func (fakeGlyphs) GlyphOutline(code, cid uint32) ([]displaylist.Segment, bool) {
+	return []displaylist.Segment{
+		{Kind: displaylist.SegmentMove, P0: displaylist.Point{X: 0, Y: 0}},
+		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 0, Y: 0}, P3: displaylist.Point{X: 500, Y: 0}},
+		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 500, Y: 0}, P3: displaylist.Point{X: 500, Y: 700}},
+		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 500, Y: 700}, P3: displaylist.Point{X: 0, Y: 700}},
+		{Kind: displaylist.SegmentClose, P0: displaylist.Point{X: 0, Y: 700}, P3: displaylist.Point{X: 0, Y: 0}},
+	}, true
+}
+
 type rectangleFontProvider struct{}
 
 func (rectangleFontProvider) GlyphOutline(info *displaylist.FontInfo, glyph displaylist.Glyph) ([]displaylist.Segment, bool, error) {
@@ -538,11 +556,10 @@ func TestAnnotationVisibility(t *testing.T) {
 	}{
 		{0, AnnotationView, true},
 		{2, AnnotationView, false},
-		{1, AnnotationPrint, false},
-		{4, AnnotationPrint, true},
-		{0, AnnotationPrint, false},
+		{1, AnnotationView, false},
+		{4, AnnotationView, true},
 		{32, AnnotationView, false},
-		{36, AnnotationPrint, true},
+		{36, AnnotationView, false},
 	}
 	for _, tt := range tests {
 		if got := annotationVisible(displaylist.Annotation{Flags: tt.flags}, tt.mode); got != tt.want {
@@ -820,31 +837,6 @@ func TestRenderKnockoutGroup(t *testing.T) {
 	}
 }
 
-func TestRenderNonIsolatedDeviceCMYKGroup(t *testing.T) {
-	objs := []testkit.Obj{
-		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>"),
-		testkit.Stream(4, "", []byte("/Fm1 Do")),
-		testkit.Stream(5, "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /I false /CS /DeviceCMYK >> >>", []byte("1 0 0 rg 0 0 100 100 re f")),
-	}
-	data := testkit.Build(objs, "/Root 1 0 R")
-	d, err := pdf.Open(context.Background(), bytes.NewReader(data), int64(len(data)), pdf.WithPreserveForms(true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
-	p, _ := d.Page(0)
-	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, g, b, _ := img.At(50, 50).RGBA()
-	if r>>8 < 240 || g>>8 > 15 || b>>8 > 15 {
-		t.Fatalf("cmyk group pixel %v %v %v", r>>8, g>>8, b>>8)
-	}
-}
-
 func TestGrayImageAlpha(t *testing.T) {
 	src := image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	src.SetNRGBA(0, 0, color.NRGBA{R: 255, A: 128})
@@ -852,124 +844,6 @@ func TestGrayImageAlpha(t *testing.T) {
 	if c.A != 128 || c.R < 70 || c.R > 82 || c.R != c.G || c.G != c.B {
 		t.Fatalf("gray %#v", c)
 	}
-}
-
-type sampleImageRef struct{ s *displaylist.ImageSamples }
-
-func (s sampleImageRef) Raw() ([]byte, error) { return nil, nil }
-func (s sampleImageRef) Decode(context.Context) (image.Image, error) {
-	return image.NewRGBA(image.Rect(0, 0, 1, 1)), nil
-}
-func (s sampleImageRef) DecodeSamples(context.Context) (*displaylist.ImageSamples, error) {
-	return s.s, nil
-}
-
-func TestGroupImageSamplesUseSourceCMYK(t *testing.T) {
-	ref := sampleImageRef{s: displaylist.NewImageSamples(1, 1, 4, "DeviceCMYK", nil, []float32{0, 1, 0, 0}, nil)}
-	im := &displaylist.Image{
-		Common: displaylist.Common{Alpha: 1, Clip: -1},
-		Matrix: displaylist.Matrix{1, 0, 0, 1, 0, 0},
-		Info:   displaylist.ImageInfo{Width: 1, Height: 1, ColorSpace: "DeviceCMYK"},
-		Data:   ref,
-	}
-	rr := &regionRenderer{
-		ctx: context.Background(), out: image.NewRGBA(image.Rect(0, 0, 2, 2)),
-		box: displaylist.Rect{X0: 0, Y0: 0, X1: 2, Y1: 2}, scale: 1,
-		pageToPx: displaylist.Matrix{1, 0, 0, 1, 0, 0}, clips: map[int]*image.Alpha{},
-		softMasks: map[*displaylist.SoftMask]*image.Alpha{}, memory: noMemory{},
-	}
-	acc, alpha, release, ok, err := rr.groupImageSamples(im, cmykConverter{}, image.Rect(0, 0, 2, 2), 4, 2, 2)
-	if err != nil || !ok || release == nil {
-		t.Fatalf("ok=%v err=%v", ok, err)
-	}
-	defer release()
-	if alpha[0] != 1 {
-		t.Fatalf("alpha = %v", alpha[0])
-	}
-	got := []float32{acc[0], acc[1], acc[2], acc[3]}
-	want := []float32{0, 1, 0, 0}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("acc = %v", got)
-		}
-	}
-}
-
-func TestGroupDeviceUsesImageSourceSamples(t *testing.T) {
-	ref := sampleImageRef{s: displaylist.NewImageSamples(1, 1, 4, "DeviceCMYK", nil, []float32{0, 1, 1, 0}, nil)}
-	im := &displaylist.Image{
-		Common: displaylist.Common{Alpha: 1, Clip: -1},
-		Matrix: displaylist.Matrix{1, 0, 0, 1, 0, 0},
-		Info:   displaylist.ImageInfo{Width: 1, Height: 1, ColorSpace: "DeviceCMYK"},
-		Data:   ref,
-	}
-	g := &displaylist.Group{Common: displaylist.Common{Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 2, Y1: 2}}, ColorSpace: "DeviceCMYK", BlendColorSpace: "DeviceCMYK", Items: []displaylist.Item{im}}
-	rr := &regionRenderer{
-		ctx: context.Background(), out: image.NewRGBA(image.Rect(0, 0, 2, 2)),
-		box: displaylist.Rect{X0: 0, Y0: 0, X1: 2, Y1: 2}, scale: 1,
-		pageToPx: displaylist.Matrix{1, 0, 0, 1, 0, 0}, clips: map[int]*image.Alpha{},
-		softMasks: map[*displaylist.SoftMask]*image.Alpha{}, memory: noMemory{},
-	}
-	done, err := rr.groupDevice(g, cmykConverter{})
-	if err != nil || !done {
-		t.Fatalf("done=%v err=%v", done, err)
-	}
-	if got := rr.out.RGBAAt(0, 0); got != (color.RGBA{R: 255, A: 255}) {
-		t.Fatalf("pixel = %#v", got)
-	}
-}
-
-type countConverter struct{ calls int }
-
-func (c *countConverter) components() int { return 1 }
-func (c *countConverter) fromSRGB(rgba [4]float64) ([]float64, error) {
-	c.calls++
-	return []float64{(rgba[0] + rgba[1] + rgba[2]) / 3}, nil
-}
-func (c *countConverter) toSRGB(vals []float64) ([4]float64, error) {
-	return [4]float64{vals[0], vals[0], vals[0], 1}, nil
-}
-
-func TestGroupDeviceSplitsPathFillAndStroke(t *testing.T) {
-	seg := []displaylist.Segment{
-		{Kind: displaylist.SegmentMove, P0: displaylist.Point{X: 0, Y: 0}},
-		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 1, Y: 0}, P3: displaylist.Point{X: 1, Y: 1}},
-		{Kind: displaylist.SegmentClose},
-	}
-	p := &displaylist.Path{
-		Common:   displaylist.Common{Alpha: 1, Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 1, Y1: 1}},
-		Segments: seg,
-		Fill:     &displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 1, 0, 1}},
-		Stroke:   &displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0, 0, 1, 1}},
-		Line:     displaylist.LineStyle{Width: 1},
-	}
-	g := &displaylist.Group{Common: displaylist.Common{Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 2, Y1: 2}}, Isolated: true, Items: []displaylist.Item{p}}
-	rr := &regionRenderer{
-		ctx: context.Background(), out: image.NewRGBA(image.Rect(0, 0, 2, 2)),
-		box: displaylist.Rect{X0: 0, Y0: 0, X1: 2, Y1: 2}, scale: 1,
-		pageToPx: displaylist.Matrix{1, 0, 0, 1, 0, 0}, clips: map[int]*image.Alpha{},
-		softMasks: map[*displaylist.SoftMask]*image.Alpha{}, memory: noMemory{},
-		opts: PageOptions{IncludeText: true},
-	}
-	conv := &countConverter{}
-	done, err := rr.groupDevice(g, conv)
-	if err != nil || !done {
-		t.Fatalf("done=%v err=%v", done, err)
-	}
-	if conv.calls < 2 {
-		t.Fatalf("fromSRGB calls = %d", conv.calls)
-	}
-}
-
-type fakeGlyphs struct{}
-
-func (fakeGlyphs) GlyphOutline(code, cid uint32) ([]displaylist.Segment, bool) {
-	return []displaylist.Segment{
-		{Kind: displaylist.SegmentMove, P0: displaylist.Point{X: 0, Y: 0}},
-		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 1000, Y: 0}, P3: displaylist.Point{X: 1000, Y: 1000}},
-		{Kind: displaylist.SegmentLine, P0: displaylist.Point{X: 1000, Y: 1000}, P3: displaylist.Point{X: 0, Y: 1000}},
-		{Kind: displaylist.SegmentClose},
-	}, true
 }
 
 func TestTextStrokeMode(t *testing.T) {
@@ -1005,61 +879,6 @@ func TestTextStrokeMode(t *testing.T) {
 	if !found {
 		t.Fatal("text stroke produced no pixels")
 	}
-}
-
-func TestGroupDeviceRendersTextPerGlyph(t *testing.T) {
-	tr := &displaylist.TextRun{
-		Common:     displaylist.Common{Alpha: 1, Clip: -1, Bounds: displaylist.Rect{X0: 10, Y0: 40, X1: 50, Y1: 60}},
-		Font:       &displaylist.FontInfo{GlyphSource: fakeGlyphs{}},
-		Size:       10,
-		RenderMode: 0,
-		Fill:       displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{1, 1, 1, 1}},
-		Glyphs: []displaylist.Glyph{
-			{Code: 1, Matrix: displaylist.Matrix{10, 0, 0, -10, 20, 50}},
-			{Code: 2, Matrix: displaylist.Matrix{10, 0, 0, -10, 40, 50}},
-		},
-	}
-	g := &displaylist.Group{Common: displaylist.Common{Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 80, Y1: 80}}, Isolated: true, Items: []displaylist.Item{tr}}
-	rr := &regionRenderer{
-		ctx: context.Background(), out: image.NewRGBA(image.Rect(0, 0, 80, 80)),
-		box: displaylist.Rect{X0: 0, Y0: 0, X1: 80, Y1: 80}, scale: 1,
-		pageToPx: displaylist.Matrix{1, 0, 0, 1, 0, 0}, clips: map[int]*image.Alpha{},
-		softMasks: map[*displaylist.SoftMask]*image.Alpha{}, memory: noMemory{},
-		opts: PageOptions{IncludeText: true},
-	}
-	conv := &countConverter{}
-	done, err := rr.groupDevice(g, conv)
-	if err != nil || !done {
-		t.Fatalf("done=%v err=%v", done, err)
-	}
-	if conv.calls == 0 {
-		t.Fatal("no device-space glyph conversion")
-	}
-	count := 0
-	minX, minY, maxX, maxY := 1000, 1000, -1, -1
-	for y := 0; y < 80; y++ {
-		for x := 0; x < 80; x++ {
-			if rr.out.RGBAAt(x, y).A != 0 {
-				count++
-				if x < minX {
-					minX = x
-				}
-				if y < minY {
-					minY = y
-				}
-				if x > maxX {
-					maxX = x
-				}
-				if y > maxY {
-					maxY = y
-				}
-			}
-		}
-	}
-	if count == 0 {
-		t.Fatal("no glyph pixels rendered")
-	}
-	t.Logf("glyph pixels=%d bounds=(%d,%d)-(%d,%d)", count, minX, minY, maxX, maxY)
 }
 
 func TestClipIntersection(t *testing.T) {
@@ -1110,7 +929,7 @@ func TestKnockoutPreservesTransparentHoles(t *testing.T) {
 		FillRule: displaylist.EvenOdd, Closed: true,
 	}
 	g := &displaylist.Group{
-		Common:   displaylist.Common{Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 20, Y1: 20}},
+		Common:   displaylist.Common{Alpha: 1, Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 20, Y1: 20}},
 		Isolated: true, Knockout: true, Items: []displaylist.Item{first, second},
 	}
 	rr := &regionRenderer{
@@ -1143,7 +962,7 @@ func TestKnockoutNonNormalBlendUsesBackdrop(t *testing.T) {
 		Fill: &displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: [4]float64{0.5, 0.5, 0.5, 1}}, Closed: true,
 	}
 	g := &displaylist.Group{
-		Common:   displaylist.Common{Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 10, Y1: 10}},
+		Common:   displaylist.Common{Alpha: 1, Clip: -1, Bounds: displaylist.Rect{X0: 0, Y0: 0, X1: 10, Y1: 10}},
 		Knockout: true, Items: []displaylist.Item{p},
 	}
 	rr := &regionRenderer{
@@ -1198,10 +1017,7 @@ func TestRendererCapabilitiesMissingOutlines(t *testing.T) {
 	)
 	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>")
 	p := openPage(t, objs)
-	r, err := NewRenderer(Options{Profile: ProfilePreview})
-	if err != nil {
-		t.Fatal(err)
-	}
+	r := &Renderer{opts: Options{Profile: ProfilePreview}}
 	caps, err := r.Capabilities(context.Background(), p)
 	if err != nil {
 		t.Fatal(err)
@@ -1217,5 +1033,508 @@ func TestRendererCapabilitiesMissingOutlines(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("issues = %#v", caps.Issues)
+	}
+}
+
+type testFontSource []byte
+
+func (s testFontSource) ReadAt(p []byte, off int64) (int, error) {
+	return bytes.NewReader(s).ReadAt(p, off)
+}
+func (s testFontSource) Size() int64 { return int64(len(s)) }
+
+type testFontEngine struct {
+	loads int
+	opens int
+}
+
+func (e *testFontEngine) Info() extension.ProviderInfo {
+	return extension.ProviderInfo{Name: "test-font", Version: "1", License: "MIT", Determinism: extension.Deterministic}
+}
+func (*testFontEngine) Features() []extension.Feature { return nil }
+func (e *testFontEngine) Load(_ context.Context, src io.ReaderAt, size int64, spec extension.FontSpec) (extension.FontFace, error) {
+	e.loads++
+	if src == nil || size == 0 || spec.BaseFont != "Test" {
+		return nil, errors.New("bad font load")
+	}
+	return &testFontFace{engine: e}, nil
+}
+
+type testFontFace struct{ engine *testFontEngine }
+
+func (*testFontFace) Metrics() extension.FontMetrics { return extension.FontMetrics{} }
+func (*testFontFace) Glyph(context.Context, uint32, uint32) (extension.Glyph, bool, error) {
+	return extension.Glyph{Outline: []extension.OutlineSegment{{
+		Op: extension.OutlineCubic,
+		P0: extension.Point{X: 1, Y: 2},
+		P1: extension.Point{X: 3, Y: 4},
+		P2: extension.Point{X: 5, Y: 6},
+		P3: extension.Point{X: 7, Y: 8},
+	}}}, true, nil
+}
+func (f *testFontFace) Close() error { f.engine.opens++; return nil }
+
+func TestExtensionFontProvider(t *testing.T) {
+	engine := &testFontEngine{}
+	p := newExtensionFontProvider(context.Background(), engine)
+	info := &displaylist.FontInfo{BaseFont: "Test", Kind: "TrueType", Embedded: true, Source: testFontSource("font")}
+	seg, ok, err := p.GlyphOutline(info, displaylist.Glyph{Code: 1, CID: 2})
+	if err != nil || !ok || len(seg) != 1 {
+		t.Fatalf("outline = %v %v %v", seg, ok, err)
+	}
+	if seg[0].Kind != displaylist.SegmentCubic || seg[0].P3.X != 7 || seg[0].P3.Y != 8 {
+		t.Fatalf("outline = %#v", seg[0])
+	}
+	if _, _, err := p.GlyphOutline(info, displaylist.Glyph{Code: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if engine.loads != 1 {
+		t.Fatalf("loads = %d", engine.loads)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if engine.opens != 1 {
+		t.Fatalf("opens = %d", engine.opens)
+	}
+}
+
+func TestExtensionFontProviderRequiresSource(t *testing.T) {
+	p := newExtensionFontProvider(context.Background(), &testFontEngine{})
+	if _, ok, err := p.GlyphOutline(&displaylist.FontInfo{BaseFont: "Test"}, displaylist.Glyph{}); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRenderHighlyCompressibleImage(t *testing.T) {
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	row := make([]byte, 256*256*3)
+	for i := 0; i < len(row); i += 3 {
+		row[i] = 255
+	}
+	if _, err := zw.Write(row); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("q 100 0 0 100 0 0 cm /Im1 Do Q")),
+		testkit.Stream(5, fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 256 /Height 256 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length %d >>", z.Len()), z.Bytes()),
+	}
+	data := testkit.Build(objs, "/Root 1 0 R")
+	d, err := pdf.Open(context.Background(), bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	p, _ := d.Page(0)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, g, b, _ := img.At(50, 50).RGBA(); r>>8 != 255 || g>>8 != 0 || b>>8 != 0 {
+		t.Fatalf("solid image pixel %v", img.At(50, 50))
+	}
+}
+
+func TestRenderIndexedImage(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("q 10 0 0 10 0 0 cm /Im1 Do Q")),
+		testkit.Stream(5, "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace 6 0 R /BitsPerComponent 8 /Length 4 >>", []byte{0, 1, 1, 0}),
+		testkit.Raw(6, "[/Indexed /DeviceRGB 1 <FF000000FF00>]"),
+	}
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 10, Y1: 10}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, g, b, _ := img.At(2, 2).RGBA(); r>>8 != 255 || g>>8 != 0 || b>>8 != 0 {
+		t.Fatalf("indexed red = %v", img.At(2, 2))
+	}
+	if r, g, b, _ := img.At(7, 2).RGBA(); r>>8 != 0 || g>>8 != 255 || b>>8 != 0 {
+		t.Fatalf("indexed green = %v", img.At(7, 2))
+	}
+	if r, g, b, _ := img.At(2, 7).RGBA(); r>>8 != 0 || g>>8 != 255 || b>>8 != 0 {
+		t.Fatalf("indexed green = %v", img.At(2, 7))
+	}
+	if r, g, b, _ := img.At(7, 7).RGBA(); r>>8 != 255 || g>>8 != 0 || b>>8 != 0 {
+		t.Fatalf("indexed red = %v", img.At(7, 7))
+	}
+}
+
+func TestRenderPageUsesRotatedPageSpace(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /CropBox [10 20 190 80] /Rotate 90 /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("10 20 180 60 re f")),
+	}
+	p := openPage(t, objs)
+	img, err := RenderPage(context.Background(), p, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := img.Bounds(); b.Dx() != 60 || b.Dy() != 180 {
+		t.Fatalf("rotated page bounds = %v", b)
+	}
+	if r, g, b, _ := img.At(30, 90).RGBA(); r>>8 != 0 || g>>8 != 0 || b>>8 != 0 {
+		t.Fatalf("crop/rotation fill = %v", img.At(30, 90))
+	}
+}
+
+func TestBuiltinFontFallback(t *testing.T) {
+	objs := pageObjs("BT /F1 50 Tf 10 20 Td (Hi) Tj ET")
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>")
+	objs = append(objs, testkit.Raw(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{
+		DPI: 72, Background: "white", IncludeText: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ink := 0
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			if r>>8 < 250 || g>>8 < 250 || b>>8 < 250 {
+				ink++
+			}
+		}
+	}
+	if ink == 0 {
+		t.Fatal("builtin fallback produced no text pixels")
+	}
+	if _, ok, err := BuiltinFonts().GlyphOutline(&displaylist.FontInfo{BaseFont: "Helvetica"}, displaylist.Glyph{Text: "H"}); err != nil || !ok {
+		t.Fatalf("builtin H outline = %v, %v", ok, err)
+	}
+}
+
+type emptyFontProvider struct{}
+
+func (emptyFontProvider) GlyphOutline(*displaylist.FontInfo, displaylist.Glyph) ([]displaylist.Segment, bool, error) {
+	return nil, false, nil
+}
+
+type errorFontProvider struct{}
+
+func (errorFontProvider) GlyphOutline(*displaylist.FontInfo, displaylist.Glyph) ([]displaylist.Segment, bool, error) {
+	return nil, false, errors.New("font failure")
+}
+
+func TestBuiltinFontVariantsAndChain(t *testing.T) {
+	for _, info := range []displaylist.FontInfo{
+		{BaseFont: "Helvetica"},
+		{BaseFont: "Helvetica-Bold", Bold: true},
+		{BaseFont: "Helvetica-Oblique", Italic: true},
+		{BaseFont: "Helvetica-BoldOblique", Bold: true, Italic: true},
+		{BaseFont: "Courier", Mono: true},
+		{BaseFont: "Courier-Bold", Mono: true, Bold: true},
+		{BaseFont: "Courier-Oblique", Mono: true, Italic: true},
+		{BaseFont: "Courier-BoldOblique", Mono: true, Bold: true, Italic: true},
+	} {
+		if seg, ok, err := BuiltinFonts().GlyphOutline(&info, displaylist.Glyph{Text: "H"}); err != nil || !ok || len(seg) == 0 {
+			t.Fatalf("variant %s: %v, %v, %d", info.BaseFont, ok, err, len(seg))
+		}
+	}
+	chain := ChainFonts(nil, emptyFontProvider{}, rectangleFontProvider{})
+	if seg, ok, err := chain.GlyphOutline(&displaylist.FontInfo{}, displaylist.Glyph{Text: "H"}); err != nil || !ok || len(seg) == 0 {
+		t.Fatalf("chain fallback = %v, %v, %d", ok, err, len(seg))
+	}
+	chain = ChainFonts(emptyFontProvider{}, errorFontProvider{}, rectangleFontProvider{})
+	if _, ok, err := chain.GlyphOutline(&displaylist.FontInfo{}, displaylist.Glyph{Text: "H"}); err == nil || ok {
+		t.Fatalf("chain error = %v, %v", ok, err)
+	}
+}
+
+func TestRenderPagesEach(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R >>"),
+		testkit.Raw(4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 7 0 R >>"),
+		testkit.Raw(5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 8 0 R >>"),
+		testkit.Stream(6, "", []byte("1 0 0 rg 0 0 100 100 re f")),
+		testkit.Stream(7, "", []byte("0 1 0 rg 0 0 100 100 re f")),
+		testkit.Stream(8, "", []byte("0 0 1 rg 0 0 100 100 re f")),
+	}
+	data := testkit.Build(objs, "/Root 1 0 R")
+	d, err := pdf.Open(context.Background(), bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	base := d.ResourceUsage().LiveBytes
+	seen := map[int]bool{}
+	var mu sync.Mutex
+	err = RenderPagesEach(context.Background(), d, nil, PageOptions{DPI: 72}, 3, func(res PageResult) error {
+		if res.Err != nil || res.Raster == nil || res.Raster.Image.Bounds().Dx() != 100 {
+			t.Errorf("result %#v", res)
+		}
+		mu.Lock()
+		seen[res.Index] = true
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 3 || !seen[0] || !seen[1] || !seen[2] {
+		t.Fatalf("seen %v", seen)
+	}
+	if got := d.ResourceUsage().LiveBytes; got != base {
+		t.Fatalf("lease leaked: got %d want %d", got, base)
+	}
+}
+
+func TestRenderPagesEachCallbackError(t *testing.T) {
+	data := testkit.Build(pageObjs("1 0 0 rg 0 0 100 100 re f"), "/Root 1 0 R")
+	d, err := pdf.Open(context.Background(), bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	boom := errors.New("stop")
+	calls := 0
+	err = RenderPagesEach(context.Background(), d, []int{0}, PageOptions{DPI: 72}, 1, func(PageResult) error {
+		calls++
+		return boom
+	})
+	if !errors.Is(err, boom) || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestRenderPageTilesRotated(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /CropBox [10 20 190 80] /Rotate 90 /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("10 20 180 60 re f")),
+	}
+	p := openPage(t, objs)
+	dst := image.NewRGBA(image.Rect(0, 0, 60, 180))
+	if err := RenderPageTilesTo(context.Background(), p, PageOptions{DPI: 72, Background: "white"}, 32, dst); err != nil {
+		t.Fatal(err)
+	}
+	if r, g, b, _ := dst.At(30, 90).RGBA(); r>>8 != 0 || g>>8 != 0 || b>>8 != 0 {
+		t.Fatalf("rotated tile fill = %v", dst.At(30, 90))
+	}
+	count := 0
+	if err := RenderPageTiles(context.Background(), p, PageOptions{DPI: 72}, 32, func(tile Tile) error {
+		count++
+		if tile.X < 0 || tile.Y < 0 || tile.X >= 60 || tile.Y >= 180 {
+			t.Fatalf("tile origin %d,%d", tile.X, tile.Y)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 12 {
+		t.Fatalf("tiles = %d", count)
+	}
+}
+
+func TestRotatedTextAdvanceAndTd(t *testing.T) {
+	objs := pageObjs("BT /F1 36 Tf 0 1 -1 0 50 50 Tm (A) Tj 0 -10 Td (B) Tj ET")
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>")
+	objs = append(objs, testkit.Raw(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+	p := openPage(t, objs)
+	var run *displaylist.TextRun
+	_ = p.Walk(context.Background(), func(it displaylist.Item) error {
+		if tr, ok := it.(*displaylist.TextRun); ok {
+			run = tr
+		}
+		return nil
+	})
+	if run == nil || len(run.Glyphs) != 2 {
+		t.Fatalf("run = %#v", run)
+	}
+	dx := run.Glyphs[1].Origin.X - run.Glyphs[0].Origin.X
+	dy := run.Glyphs[1].Origin.Y - run.Glyphs[0].Origin.Y
+	if math.Abs(dx-10) > 0.01 || math.Abs(dy) > 0.01 {
+		t.Fatalf("rotated Td delta = %.3f,%.3f", dx, dy)
+	}
+}
+
+func TestRotate90CornerMapping(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Rotate 90 /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("1 0 0 rg 0 0 20 20 re f 0 1 0 rg 180 0 20 20 re f 0 0 1 rg 0 80 20 20 re f 1 1 0 rg 180 80 20 20 re f")),
+	}
+	p := openPage(t, objs)
+	img, err := RenderPage(context.Background(), p, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		x, y int
+		want color.RGBA
+	}{
+		{10, 10, color.RGBA{R: 255, A: 255}},
+		{90, 10, color.RGBA{B: 255, A: 255}},
+		{10, 190, color.RGBA{G: 255, A: 255}},
+		{90, 190, color.RGBA{R: 255, G: 255, A: 255}},
+	}
+	for _, tc := range cases {
+		if got := img.At(tc.x, tc.y).(color.RGBA); got != tc.want {
+			t.Fatalf("pixel %d,%d = %v, want %v", tc.x, tc.y, got, tc.want)
+		}
+	}
+}
+
+func TestRenderShadingPattern(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/Pattern cs /P1 scn 0 0 100 100 re f")),
+		testkit.Raw(5, "<< /Type /Pattern /PatternType 2 /Shading 6 0 R >>"),
+		testkit.Raw(6, "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] /Function 7 0 R /Extend [true true] >>"),
+		testkit.Raw(7, "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1 >>"),
+	}
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, _, _, _ := img.At(10, 50).RGBA()
+	r, _, _, _ := img.At(90, 95).RGBA()
+	if l>>8 > 40 || r>>8 < 200 {
+		t.Fatalf("shading pattern endpoints = %d, %d", l>>8, r>>8)
+	}
+}
+
+func TestRenderRadialShadingPattern(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>"),
+		testkit.Stream(4, "", []byte("/Pattern cs /P1 scn 0 0 100 100 re f")),
+		testkit.Raw(5, "<< /Type /Pattern /PatternType 2 /Shading 6 0 R >>"),
+		testkit.Raw(6, "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [50 50 0 50 50 40] /Function 7 0 R /Extend [true true] >>"),
+		testkit.Raw(7, "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1 >>"),
+	}
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	center, _, _, _ := img.At(50, 50).RGBA()
+	edge, _, _, _ := img.At(95, 50).RGBA()
+	if center>>8 > 40 || edge>>8 < 180 {
+		t.Fatalf("radial pattern endpoints = %d, %d", center>>8, edge>>8)
+	}
+}
+
+func TestRenderShadingPatternSoftMask(t *testing.T) {
+	objs := pageObjs("/GS1 gs /Pattern cs /P1 scn 0 0 100 100 re f",
+		testkit.Raw(5, "<< /Type /ExtGState /SMask 8 0 R >>"),
+		testkit.Raw(6, "<< /Type /Pattern /PatternType 2 /Shading 7 0 R >>"),
+		testkit.Raw(7, "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] /Function 9 0 R /Extend [true true] >>"),
+		testkit.Stream(8, "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /CS /DeviceGray >> >>", []byte("1 1 1 rg 0 0 50 100 re f")),
+		testkit.Raw(9, "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [1 0 0] /N 1 >>"),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS1 5 0 R >> /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, _ := img.At(10, 50).RGBA()
+	if r>>8 < 200 || g>>8 > 160 || b>>8 > 160 {
+		t.Fatalf("soft-masked pattern inside = %d,%d,%d", r>>8, g>>8, b>>8)
+	}
+	if r, g, b, _ := img.At(90, 95).RGBA(); r>>8 != 255 || g>>8 != 255 || b>>8 != 255 {
+		t.Fatalf("soft-masked pattern outside = %d,%d,%d", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestRenderTilingPatternSoftMask(t *testing.T) {
+	objs := pageObjs("/GS1 gs /Pattern cs /P1 scn 0 0 100 100 re f",
+		testkit.Raw(5, "<< /Type /ExtGState /SMask 8 0 R >>"),
+		testkit.Stream(6, "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >> >>", []byte("1 0 0 rg 0 0 10 10 re f")),
+		testkit.Stream(8, "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /CS /DeviceGray >> >>", []byte("1 1 1 rg 0 0 50 100 re f")),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS1 5 0 R >> /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, _ := img.At(25, 50).RGBA()
+	if r>>8 < 200 || g>>8 > 160 || b>>8 > 160 {
+		t.Fatalf("soft-masked tiling pattern inside = %d,%d,%d", r>>8, g>>8, b>>8)
+	}
+	if r, g, b, _ := img.At(90, 95).RGBA(); r>>8 != 255 || g>>8 != 255 || b>>8 != 255 {
+		t.Fatalf("soft-masked tiling pattern outside = %d,%d,%d", r>>8, g>>8, b>>8)
+	}
+}
+
+func TestRenderTilingPatternRepeats(t *testing.T) {
+	objs := pageObjs("/Pattern cs /P1 scn 0 0 100 100 re f",
+		testkit.Stream(6, "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >> >>", []byte("1 0 0 rg 0 0 5 5 re f")),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 6 0 R >> >> /Contents 4 0 R >>")
+	p := openPage(t, objs)
+	img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pt := range []image.Point{{X: 2, Y: 98}, {X: 22, Y: 98}, {X: 2, Y: 78}, {X: 22, Y: 78}} {
+		if r, g, b, _ := img.At(pt.X, pt.Y).RGBA(); r>>8 != 255 || g>>8 != 0 || b>>8 != 0 {
+			t.Fatalf("tile paint at %v = %d,%d,%d", pt, r>>8, g>>8, b>>8)
+		}
+	}
+}
+
+func TestRenderTransparencyGroupAlpha(t *testing.T) {
+	objs := pageObjs("/GS1 gs /Fm1 Do",
+		testkit.Raw(5, "<< /Type /ExtGState /ca 0.5 /CA 0.5 >>"),
+		testkit.Stream(6, "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group 7 0 R >>", []byte("1 0 0 rg 0 0 100 100 re f")),
+		testkit.Raw(7, "<< /S /Transparency /I false >>"),
+	)
+	objs[2] = testkit.Raw(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS1 5 0 R >> /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>")
+	data := testkit.Build(objs, "/Root 1 0 R")
+	for _, preserve := range []bool{false, true} {
+		d, err := pdf.Open(context.Background(), bytes.NewReader(data), int64(len(data)), pdf.WithPreserveForms(preserve))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := d.Page(0)
+		img, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+		_ = d.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, g, b, _ := img.At(50, 50).RGBA()
+		if r>>8 < 240 || g>>8 < 100 || g>>8 > 160 || b>>8 < 100 || b>>8 > 160 {
+			t.Fatalf("group alpha pixel (preserve=%v) = %d,%d,%d", preserve, r>>8, g>>8, b>>8)
+		}
+	}
+}
+
+func TestBlendPremultipliedAlpha(t *testing.T) {
+	out := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	out.SetRGBA(0, 0, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	rr := &regionRenderer{out: out}
+	rr.blendRGBA(0, 0, color.RGBA{R: 255, G: 255, B: 255, A: 235}, "Normal")
+	got := out.RGBAAt(0, 0)
+	if got.A < 254 || got.R > got.A || got.G > got.A || got.B > got.A {
+		t.Fatalf("premultiplied pixel = %v", got)
+	}
+	drawPixel(out, 0, 0, color.RGBA{R: 255, G: 255, B: 255, A: 128})
+	if got = out.RGBAAt(0, 0); got.A == 0 {
+		t.Fatalf("drawPixel produced empty pixel")
 	}
 }

@@ -99,13 +99,9 @@ type state struct {
 	rise      float64
 	render    int
 
-	fillAlpha       float64
-	strokeAlpha     float64
-	blend           string
-	fillOverprint   bool
-	strokeOverprint bool
-	overprintMode   int
-	renderingIntent string
+	fillAlpha   float64
+	strokeAlpha float64
+	blend       string
 }
 
 func (s state) clone() state {
@@ -522,12 +518,6 @@ func (ip *interp) dispatch(t token) error {
 		ip.beginMarkedContent(true)
 	case "EMC":
 		return ip.endMarkedContent()
-	case "ri":
-		if ops, ok := ip.take(1); ok {
-			if n, ok := name(ops[0]); ok {
-				ip.st.renderingIntent = n
-			}
-		}
 	case "i", "MP", "DP", "d0", "d1":
 		ip.stack = nil
 	default:
@@ -651,7 +641,11 @@ func (ip *interp) setComponents(stroke bool) {
 		ip.diagOnce(diag.Degraded, "CLR-CONVERT", "cannot convert color")
 		return
 	}
-	ip.setPaint(stroke, space.Name(), vals[:space.Components()], rgba, approx || space.Approx())
+	var profile []byte
+	if p, ok := space.(interface{ ICCProfile() []byte }); ok {
+		profile = append([]byte(nil), p.ICCProfile()...)
+	}
+	ip.setPaintProfile(stroke, space.Name(), vals[:space.Components()], rgba, approx || space.Approx(), profile)
 }
 
 func (ip *interp) setSpace(stroke bool, space pdfcolor.Space) {
@@ -674,6 +668,7 @@ func (ip *interp) setColorSpace(stroke bool, name string) {
 			obj = v
 		}
 	}
+	obj, _ = ip.resolveObject(obj)
 	if arr, ok := obj.(syntax.Array); ok && len(arr) > 0 {
 		if family, ok := arr[0].(syntax.Name); ok && family == "Pattern" {
 			ip.setPatternFlag(stroke, true)
@@ -750,6 +745,15 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 		return nil, errs.Wrap(errs.ErrCorrupt, "CLR-PATTERN", "pattern is not a dictionary", -1, 0, -1)
 	}
 	typ, _ := dict.IntValue("PatternType")
+	pm := matrix{1, 0, 0, 1, 0, 0}
+	if v := dict.Get("Matrix"); v != nil {
+		if m, ok := ip.matrixValue(v); ok {
+			pm = m
+		}
+	}
+	if typ == 2 {
+		return ip.shadingPattern(name, dict, pm, base)
+	}
 	if typ != 1 {
 		return &displaylist.Pattern{Name: name, Type: int(typ), Base: append([]float64(nil), base...)}, nil
 	}
@@ -763,12 +767,6 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 	}
 	xstep, _ := num(dict.Get("XStep"))
 	ystep, _ := num(dict.Get("YStep"))
-	pm := matrix{1, 0, 0, 1, 0, 0}
-	if v := dict.Get("Matrix"); v != nil {
-		if m, ok := ip.matrixValue(v); ok {
-			pm = m
-		}
-	}
 	var content []byte
 	var items []displaylist.Item
 	var clips []displaylist.Clip
@@ -835,6 +833,104 @@ func (ip *interp) patternFrom(name string, obj syntax.Object, base []float64) (*
 	return pat, nil
 }
 
+func (ip *interp) shadingPattern(name string, dict syntax.Dict, pm matrix, base []float64) (*displaylist.Pattern, error) {
+	obj, ok := ip.resolveObject(dict.Get("Shading"))
+	if !ok {
+		ip.diagOnce(diag.Degraded, "CLR-PATTERN-SHADING", "shading pattern has no shading")
+		return &displaylist.Pattern{Name: name, Type: 2, Base: append([]float64(nil), base...)}, nil
+	}
+	var sd syntax.Dict
+	var raw []byte
+	switch v := obj.(type) {
+	case syntax.Dict:
+		sd = v
+	case *syntax.Stream:
+		sd, raw = v.Dict, v.Raw
+	default:
+		return nil, errs.Wrap(errs.ErrCorrupt, "CLR-PATTERN-SHADING", "shading is not a dictionary", -1, 0, -1)
+	}
+	item := ip.shadingFromDict(sd, raw, mmul(ip.st.ctm, pm))
+	if item == nil {
+		return &displaylist.Pattern{Name: name, Type: 2, Base: append([]float64(nil), base...)}, nil
+	}
+	return &displaylist.Pattern{
+		Name: name, Type: 2, Matrix: [6]float64(mmul(ip.st.ctm, pm)),
+		Base: append([]float64(nil), base...), Shading: item,
+	}, nil
+}
+
+func (ip *interp) shadingFromDict(dict syntax.Dict, raw []byte, ctm matrix) *displaylist.Shading {
+	kind, ok := dict.IntValue("ShadingType")
+	if !ok || (kind != 2 && kind != 3) {
+		ip.diagOnce(diag.Degraded, "CNT-SHADING-UNSUPPORTED", "unsupported pattern shading type")
+		return nil
+	}
+	coords, ok := ip.numberArray(dict.Get("Coords"), 4)
+	if kind == 3 {
+		coords, ok = ip.numberArray(dict.Get("Coords"), 6)
+	}
+	if !ok {
+		ip.diagOnce(diag.Warn, "CNT-SHADING-COORDS", "invalid shading coordinates")
+		return nil
+	}
+	fn, err := pdfunction.Load(ip.ctx, ip.pd.File, dict.Get("Function"), ip.pd.Tracker)
+	if err != nil || fn.Inputs() != 1 {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-FUNCTION", "cannot load shading function")
+		return nil
+	}
+	spaceObj := dict.Get("ColorSpace")
+	if _, null := spaceObj.(syntax.Null); null {
+		switch fn.Outputs() {
+		case 1:
+			spaceObj = syntax.Name("DeviceGray")
+		case 3:
+			spaceObj = syntax.Name("DeviceRGB")
+		case 4:
+			spaceObj = syntax.Name("DeviceCMYK")
+		}
+	}
+	space, err := pdfcolor.Load(ip.ctx, ip.pd.File, spaceObj, ip.pd.Tracker, ip.pd.ColorManager)
+	if err != nil || space.Components() != fn.Outputs() {
+		ip.diagOnce(diag.Degraded, "CLR-SHADING-CS", "invalid shading color space")
+		return nil
+	}
+	stops, delta, ok := ip.shadingStops(fn, space)
+	if !ok {
+		return nil
+	}
+	extend := [2]bool{}
+	if arr, ok := dict.Get("Extend").(syntax.Array); ok && len(arr) >= 2 {
+		for i := 0; i < 2; i++ {
+			if b, ok := arr[i].(syntax.Bool); ok {
+				extend[i] = bool(b)
+			}
+		}
+	}
+	c := ip.common()
+	c.Clip = -1
+	c.Bounds = ip.pd.CropBox
+	if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
+		c.Bounds = ip.clips[ip.curClip].Bounds
+	}
+	item := &displaylist.Shading{Common: c, Kind: displaylist.ShadingAxial, Stops: stops, Extend: extend, MaxDeltaE: delta, Matrix: [6]float64(ctm)}
+	if kind == 2 {
+		p0 := pointAt(ctm, coords[0], coords[1])
+		p1 := pointAt(ctm, coords[2], coords[3])
+		item.Geometry = displaylist.ShadingGeometry{X0: p0.X, Y0: p0.Y, X1: p1.X, Y1: p1.Y}
+	} else {
+		sx := math.Hypot(ctm[0], ctm[1])
+		sy := math.Hypot(ctm[2], ctm[3])
+		if math.Abs(sx-sy) > 1e-6 {
+			ip.diagOnce(diag.Degraded, "CLR-SHADING-CTM", "non-uniform radial shading is approximated by a circle")
+		}
+		p0 := pointAt(ctm, coords[0], coords[1])
+		p1 := pointAt(ctm, coords[3], coords[4])
+		item.Kind = displaylist.ShadingRadial
+		item.Geometry = displaylist.ShadingGeometry{X0: p0.X, Y0: p0.Y, X1: p1.X, Y1: p1.Y, R0: coords[2] * sx, R1: coords[5] * sx}
+	}
+	return item
+}
+
 func (ip *interp) setPaintPattern(stroke bool, p *displaylist.Pattern, base []float64) {
 	paint := displaylist.Paint{
 		Kind: displaylist.PaintPattern, Space: "Pattern", Raw: append([]float64(nil), base...),
@@ -848,7 +944,11 @@ func (ip *interp) setPaintPattern(stroke bool, p *displaylist.Pattern, base []fl
 }
 
 func (ip *interp) setPaint(stroke bool, space string, raw []float64, rgba [4]float64, approx bool) {
-	p := displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: rgba, Space: space, Raw: append([]float64(nil), raw...), Approx: approx}
+	ip.setPaintProfile(stroke, space, raw, rgba, approx, nil)
+}
+
+func (ip *interp) setPaintProfile(stroke bool, space string, raw []float64, rgba [4]float64, approx bool, profile []byte) {
+	p := displaylist.Paint{Kind: displaylist.PaintSolid, RGBA: rgba, Space: space, Raw: append([]float64(nil), raw...), Profile: profile, Approx: approx}
 	if stroke {
 		ip.st.stroke = p
 	} else {
@@ -1098,8 +1198,6 @@ func (ip *interp) common() displaylist.Common {
 		MCID: ip.activeMCID(), StructRef: -1, SoftMask: ip.st.softMask, Layer: ip.activeLayer(),
 		PaintState: &displaylist.PaintState{
 			FillAlpha: ip.st.fillAlpha, StrokeAlpha: ip.st.strokeAlpha,
-			FillOverprint: ip.st.fillOverprint, StrokeOverprint: ip.st.strokeOverprint,
-			OverprintMode: ip.st.overprintMode, RenderingIntent: ip.st.renderingIntent,
 		},
 		Source: displaylist.SrcRef{OpIndex: ip.ops},
 	}
@@ -1348,7 +1446,7 @@ func (ip *interp) td() error {
 	if !ok1 || !ok2 {
 		return nil
 	}
-	ip.tlm = mmul(translate(tx, ty), ip.tlm)
+	ip.tlm = mmul(ip.tlm, translate(tx, ty))
 	ip.tm = ip.tlm
 	return nil
 }
@@ -1364,7 +1462,7 @@ func (ip *interp) tdLeading() error {
 		return nil
 	}
 	ip.st.leading = -ty
-	ip.tlm = mmul(translate(tx, ty), ip.tlm)
+	ip.tlm = mmul(ip.tlm, translate(tx, ty))
 	ip.tm = ip.tlm
 	return nil
 }
@@ -1387,7 +1485,7 @@ func (ip *interp) setTM() error {
 }
 
 func (ip *interp) nextLine() error {
-	ip.tlm = mmul(translate(0, -ip.st.leading), ip.tlm)
+	ip.tlm = mmul(ip.tlm, translate(0, -ip.st.leading))
 	ip.tm = ip.tlm
 	return nil
 }
@@ -1478,9 +1576,9 @@ func (ip *interp) show(s syntax.String, _ float64) error {
 		ip.tr.Glyphs = append(ip.tr.Glyphs, g)
 		ip.growTextBounds(g)
 		if vertical {
-			ip.tm = mmul(translate(0, -adv), ip.tm)
+			ip.tm = mmul(ip.tm, translate(0, -adv))
 		} else {
-			ip.tm = mmul(translate(adv, 0), ip.tm)
+			ip.tm = mmul(ip.tm, translate(adv, 0))
 		}
 	}
 	return nil
@@ -1568,15 +1666,34 @@ func (ip *interp) textMatrix() matrix {
 	return mmul(ip.st.ctm, mmul(ip.tm, s))
 }
 
-func (ip *interp) growTextBounds(g displaylist.Glyph) {
-	r := displaylist.Rect{X0: g.Origin.X, Y0: g.Origin.Y - ip.st.fontSize, X1: g.Origin.X + g.Advance, Y1: g.Origin.Y + ip.st.fontSize*0.2}
-	if ip.tr != nil && ip.tr.Vertical {
-		half := ip.st.fontSize * 0.5
-		r = displaylist.Rect{
-			X0: g.Origin.X - half, Y0: g.Origin.Y - ip.st.fontSize,
-			X1: g.Origin.X + half, Y1: g.Origin.Y + ip.st.fontSize*0.2,
+func glyphPageBounds(g displaylist.Glyph) displaylist.Rect {
+	m := g.Matrix
+	if m[0] == 0 && m[1] == 0 && m[2] == 0 && m[3] == 0 {
+		return displaylist.Rect{X0: g.Origin.X, Y0: g.Origin.Y - 1, X1: g.Origin.X + math.Abs(g.Advance), Y1: g.Origin.Y + 0.2}
+	}
+	x0, y0 := math.Inf(1), math.Inf(1)
+	x1, y1 := math.Inf(-1), math.Inf(-1)
+	for _, p := range [][2]float64{{0, -200}, {1000, -200}, {1000, 800}, {0, 800}} {
+		x := g.Origin.X + 0.001*(p[0]*m[0]+p[1]*m[2])
+		y := g.Origin.Y + 0.001*(p[0]*m[1]+p[1]*m[3])
+		if x < x0 {
+			x0 = x
+		}
+		if x > x1 {
+			x1 = x
+		}
+		if y < y0 {
+			y0 = y
+		}
+		if y > y1 {
+			y1 = y
 		}
 	}
+	return displaylist.Rect{X0: x0, Y0: y0, X1: x1, Y1: y1}
+}
+
+func (ip *interp) growTextBounds(g displaylist.Glyph) {
+	r := glyphPageBounds(g)
 	if !ip.trHasBounds {
 		ip.trBounds = r
 		ip.trHasBounds = true
@@ -1614,9 +1731,9 @@ func (ip *interp) showTJ() error {
 		default:
 			if n, ok := num(o); ok {
 				if ip.tr != nil && ip.tr.Vertical {
-					ip.tm = mmul(translate(0, -n*ip.st.fontSize/1000), ip.tm)
+					ip.tm = mmul(ip.tm, translate(0, -n*ip.st.fontSize/1000))
 				} else {
-					ip.tm = mmul(translate(-n*ip.st.fontSize*ip.st.hscale/1000, 0), ip.tm)
+					ip.tm = mmul(ip.tm, translate(-n*ip.st.fontSize*ip.st.hscale/1000, 0))
 				}
 			}
 		}
@@ -1765,12 +1882,20 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 	}
 	ctm := mmul(ip.st.ctm, formMatrix)
 	clipBase := len(ip.clips)
-	groupDict, hasGroup := stm.Dict.DictValue("Group")
-	preserveGroup := hasGroup && ip.pd.PreserveForms
+	var groupDict syntax.Dict
+	hasGroup := false
+	if v := stm.Dict.Get("Group"); v != nil {
+		if d, ok := ip.resolveDict(v); ok {
+			groupDict, hasGroup = d, true
+		}
+	}
+	preserveGroup := hasGroup && (ip.pd.PreserveForms || ip.st.fillAlpha < 1 || ip.st.strokeAlpha < 1 || ip.st.blend != "" || ip.st.softMask != nil)
 	var groupItems []displaylist.Item
 	nestedPD := ip.pd
 	nestedPD.Content, nestedPD.Resources, nestedPD.Matrix = data, res, [6]float64(ctm)
-	nested := newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
+	intersected := make(map[int]bool)
+	var nested *interp
+	nested = newInterp(ip.ctx, nestedPD, func(item displaylist.Item) error {
 		c := item.Base()
 		if preserveGroup {
 			c.Source.OpIndex += ip.ops
@@ -1782,15 +1907,21 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 			groupItems = append(groupItems, item)
 			return nil
 		}
-		if c.Clip >= 0 {
+		localClip := c.Clip
+		if localClip >= 0 {
 			c.Clip += clipBase
 		}
-		if ip.curClip >= 0 {
-			if c.Clip >= 0 {
-				ip.diagOnce(diag.Degraded, "CNT-FORM-CLIP-INTERSECT", "form clip intersection is approximate")
-			} else {
+		if ip.curClip >= 0 && ip.curClip < len(ip.clips) {
+			if localClip >= 0 && localClip < len(nested.clips) {
+				if !intersected[localClip] {
+					intersected[localClip] = true
+					nested.clips[localClip].Intersect = append(nested.clips[localClip].Intersect, ip.clips[ip.curClip])
+				}
+			} else if localClip < 0 {
 				c.Clip = ip.curClip
 			}
+		} else if localClip >= len(nested.clips) {
+			c.Clip = -1
 		}
 		c.Source.OpIndex += ip.ops
 		return ip.emit(item)
@@ -1799,6 +1930,12 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 	nested.decoded, nested.patternCache, nested.maskCache = ip.decoded, ip.patternCache, ip.maskCache
 	nested.st = ip.st.clone()
 	nested.st.ctm = ctm
+	if preserveGroup {
+		nested.st.fillAlpha = 1
+		nested.st.strokeAlpha = 1
+		nested.st.blend = ""
+		nested.st.softMask = nil
+	}
 	nested.suppress = ip.suppress
 	if stm.Dict.Has("BBox") {
 		if r, ok := ip.rectValue(stm.Dict.Get("BBox")); ok {
@@ -1828,9 +1965,9 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 	if preserveGroup {
 		c := ip.common()
 		c.Clip = ip.curClip
-		c.Alpha = 1
-		c.Blend = ""
-		c.SoftMask = nil
+		c.Alpha = ip.st.fillAlpha
+		c.Blend = ip.st.blend
+		c.SoftMask = ip.st.softMask
 		if stm.Dict.Has("BBox") {
 			if r, ok := ip.rectValue(stm.Dict.Get("BBox")); ok {
 				p0 := pointAt(ctm, r.X0, r.Y0)
@@ -1842,7 +1979,7 @@ func (ip *interp) runForm(stm *syntax.Stream, formName string) error {
 			Common: c, Name: formName, Items: groupItems, Clips: nested.clips,
 			Isolated: boolValue(groupDict, "I"), Knockout: boolValue(groupDict, "K"),
 		}
-		g.BlendColorSpace, g.BlendN, g.BlendProfile = ip.groupBlendInfo(groupDict)
+		g.BlendColorSpace = ip.groupBlendName(groupDict)
 		g.ColorSpace = g.BlendColorSpace
 		if bc, ok := ip.backdropColor(groupDict); ok {
 			g.Backdrop = &displaylist.Backdrop{Color: bc, Bounds: c.Bounds}
@@ -2074,22 +2211,6 @@ func (ip *interp) applyGStateDict(gs syntax.Dict) {
 		ip.st.strokeAlpha = clamp01(float64(v))
 	} else if v, ok := gs.Get("CA").(syntax.Int); ok {
 		ip.st.strokeAlpha = clamp01(float64(v))
-	}
-	if v, ok := gs.Get("RI").(syntax.Name); ok {
-		ip.st.renderingIntent = string(v)
-	} else if v, ok := gs.Get("RI").(syntax.Array); ok && len(v) > 0 {
-		if n, ok := v[0].(syntax.Name); ok {
-			ip.st.renderingIntent = string(n)
-		}
-	}
-	if v, ok := gs.Get("OP").(syntax.Bool); ok {
-		ip.st.strokeOverprint = bool(v)
-	}
-	if v, ok := gs.Get("op").(syntax.Bool); ok {
-		ip.st.fillOverprint = bool(v)
-	}
-	if v, ok := gs.Get("OPM").(syntax.Int); ok {
-		ip.st.overprintMode = int(v)
 	}
 	if v := gs.Get("BM"); v != nil {
 		switch bm := v.(type) {
@@ -2530,41 +2651,20 @@ func (ip *interp) layerName(props syntax.Object) string {
 	return ""
 }
 
-func (ip *interp) groupBlendInfo(d syntax.Dict) (string, int, []byte) {
+func (ip *interp) groupBlendName(d syntax.Dict) string {
 	obj := d.Get("CS")
 	obj, _ = ip.resolveObject(obj)
 	switch v := obj.(type) {
 	case syntax.Name:
-		n := 3
-		switch string(v) {
-		case "DeviceGray", "G":
-			n = 1
-		case "DeviceCMYK", "CMYK":
-			n = 4
-		}
-		return string(v), n, nil
+		return string(v)
 	case syntax.Array:
-		if len(v) < 2 {
-			return "", 0, nil
-		}
-		if family, ok := v[0].(syntax.Name); ok && family == "ICCBased" {
-			stm, ok := ip.resolveObject(v[1])
-			if !ok {
-				return "ICCBased", 0, nil
+		if len(v) > 0 {
+			if family, ok := v[0].(syntax.Name); ok {
+				return string(family)
 			}
-			s, ok := stm.(*syntax.Stream)
-			if !ok || ip.pd.File == nil {
-				return "ICCBased", 0, nil
-			}
-			data, err := ip.pd.File.DecodeStream(ip.ctx, s)
-			if err != nil {
-				return "ICCBased", 0, nil
-			}
-			n, _ := s.Dict.IntValue("N")
-			return "ICCBased", int(n), data
 		}
 	}
-	return "", 0, nil
+	return ""
 }
 
 func (ip *interp) backdropColor(dict syntax.Dict) ([4]float64, bool) {

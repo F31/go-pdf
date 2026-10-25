@@ -95,7 +95,48 @@ func (d *Document) loadPages(ctx context.Context) error {
 	if len(d.pages) == 0 {
 		d.file.Diag().Add(diag.Diagnostic{Level: diag.Warn, Code: "DOC-NO-PAGES", Msg: "page tree contains no pages", Page: -1, Offset: -1})
 	}
+	d.validatePageCounts(ctx, root)
 	return nil
+}
+
+// validatePageCounts checks /Count on every Pages node against the number of
+// leaf pages below it. Count is only a hint; traversal remains authoritative.
+func (d *Document) validatePageCounts(ctx context.Context, root syntax.Object) {
+	visited := map[syntax.Ref]bool{}
+	var walk func(syntax.Object, int) int
+	walk = func(o syntax.Object, depth int) int {
+		if depth > d.budget().MaxPageTreeDepth {
+			return 0
+		}
+		dict, ref, err := d.resolveNode(ctx, o)
+		if err != nil {
+			return 0
+		}
+		if ref.Num != 0 {
+			if visited[ref] {
+				return 0
+			}
+			visited[ref] = true
+		}
+		typ, _ := dict.NameValue("Type")
+		kids, hasKids := dict.ArrayValue("Kids")
+		if typ == "Page" || (typ == "" && !hasKids) {
+			return 1
+		}
+		total := 0
+		for _, kid := range kids {
+			total += walk(kid, depth+1)
+		}
+		if count, ok := dict.IntValue("Count"); ok && count != int64(total) {
+			d.file.Diag().Add(diag.Diagnostic{
+				Level: diag.Warn, Code: "DOC-PAGE-COUNT",
+				Msg:  "page tree Count does not match the number of descendant pages",
+				Page: -1, Obj: ref.Num, Offset: -1,
+			})
+		}
+		return total
+	}
+	walk(root, 0)
 }
 
 func (d *Document) budget() *budget.Budget {

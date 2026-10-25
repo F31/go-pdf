@@ -102,16 +102,13 @@ func RenderTiles(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts
 	return nil
 }
 
-// RenderPageTiles is RenderTiles using the page CropBox.
+// RenderPageTiles is RenderTiles using the rotated page space.
 func RenderPageTiles(ctx context.Context, page *pdf.Page, opts PageOptions, tilePixels int, fn func(Tile) error) error {
 	if page == nil {
 		return errs.Wrap(errs.ErrClosed, "RND-PAGE", "render page tiles", -1, 0, -1)
 	}
-	info := page.Info()
-	return RenderTiles(ctx, page, displaylist.Rect{
-		X0: info.CropBox.X0, Y0: info.CropBox.Y0,
-		X1: info.CropBox.X1, Y1: info.CropBox.Y1,
-	}, opts, tilePixels, fn)
+	w, h := page.Size()
+	return RenderTiles(ctx, page, displaylist.Rect{X1: w, Y1: h}, opts, tilePixels, fn)
 }
 
 // PlanTilesAdaptive chooses tilePixels from a target RGBA tile byte budget.
@@ -153,14 +150,11 @@ func RenderTilesTo(ctx context.Context, page *pdf.Page, box displaylist.Rect, op
 	})
 }
 
-// RenderPageTilesTo is RenderTilesTo using the page CropBox.
+// RenderPageTilesTo is RenderTilesTo using the rotated page space.
 func RenderPageTilesTo(ctx context.Context, page *pdf.Page, opts PageOptions, tilePixels int, dst draw.Image) error {
 	if page == nil {
 		return errs.Wrap(errs.ErrClosed, "RND-PAGE", "render page tiles to destination", -1, 0, -1)
 	}
-	info := page.Info()
-	return RenderTilesTo(ctx, page, displaylist.Rect{
-		X0: info.CropBox.X0, Y0: info.CropBox.Y0,
-		X1: info.CropBox.X1, Y1: info.CropBox.Y1,
-	}, opts, tilePixels, dst)
+	w, h := page.Size()
+	return RenderTilesTo(ctx, page, displaylist.Rect{X1: w, Y1: h}, opts, tilePixels, dst)
 }

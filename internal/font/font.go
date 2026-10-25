@@ -28,6 +28,7 @@ type Font struct {
 	Type string
 
 	isCID         bool
+	outlineOK     bool
 	identity      bool
 	codeLen       int
 	predefined    *predefinedCMap

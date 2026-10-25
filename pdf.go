@@ -4,9 +4,11 @@ package pdf
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/budget"
@@ -34,6 +36,7 @@ type Document struct {
 	releaseOnce sync.Once
 	dataRelease func()
 	dataOnce    sync.Once
+	closed      atomic.Bool
 }
 
 // ResourceUsage is a point-in-time view of document resource accounting.
@@ -105,11 +108,20 @@ func Open(ctx context.Context, r io.ReaderAt, size int64, opts ...Option) (*Docu
 		doc.dataRelease = release
 		return doc, nil
 	}
-	data, err := readAll(r, size)
+	data, release, err := mapReaderAt(ctx, r, size)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, errs.Wrap(errs.ErrCanceled, "SYN-CANCELED", "read reader", -1, 0, -1)
+		}
 		return nil, errs.Wrap(err, "SYN-READ", "read reader", -1, 0, -1)
 	}
-	return openData(ctx, data, o)
+	doc, err := openData(ctx, data, o)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	doc.dataRelease = release
+	return doc, nil
 }
 
 func readAll(r io.ReaderAt, size int64) ([]byte, error) {
@@ -122,6 +134,37 @@ func readAll(r io.ReaderAt, size int64) ([]byte, error) {
 	buf := make([]byte, int(size))
 	if _, err := io.ReadFull(io.NewSectionReader(r, 0, size), buf); err != nil {
 		return nil, err
+	}
+	return buf, nil
+}
+
+func readAllContext(ctx context.Context, r io.ReaderAt, size int64) ([]byte, error) {
+	if size == 0 {
+		return []byte{}, nil
+	}
+	if size > int64(int(^uint(0)>>1)) {
+		return nil, errs.Wrap(errs.ErrBudget, "BUD-FILE-SIZE", "read input", -1, 0, -1)
+	}
+	buf := make([]byte, int(size))
+	for off := 0; off < len(buf); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n := len(buf) - off
+		if n > 1<<20 {
+			n = 1 << 20
+		}
+		read, err := r.ReadAt(buf[off:off+n], int64(off))
+		off += read
+		if err != nil {
+			if errors.Is(err, io.EOF) && off == len(buf) {
+				break
+			}
+			return nil, err
+		}
+		if read == 0 {
+			return nil, io.ErrNoProgress
+		}
 	}
 	return buf, nil
 }
@@ -151,6 +194,7 @@ func openData(ctx context.Context, data []byte, o options) (*Document, error) {
 			return reg.decoder(ctx, enc, info)
 		}
 	}
+	decoders = chainDecoderLookups(decoders, extensionDecoderLookup(o.extensions))
 	inner, err := doc.Open(ctx, file, doc.Options{
 		Repair: o.repair, IncludeHidden: o.hidden, PreserveForms: o.forms,
 		Decoders: decoders, ColorManager: o.colorManager, Tracker: tracker, Diag: collector,
@@ -214,6 +258,28 @@ func (d *Document) Repaired() bool {
 	return d.inner.Repaired()
 }
 
+// PageLabelRange is one decoded page label range. Start is zero-based.
+type PageLabelRange struct {
+	Start  int
+	Style  string
+	Prefix string
+	First  int
+}
+
+// PageLabelRanges returns decoded /PageLabels ranges in start order. An empty
+// result means the document uses the default decimal labels.
+func (d *Document) PageLabelRanges(ctx context.Context) ([]PageLabelRange, error) {
+	if d == nil || d.inner == nil {
+		return nil, nil
+	}
+	src := d.inner.PageLabelRanges(ctx)
+	out := make([]PageLabelRange, len(src))
+	for i, r := range src {
+		out[i] = PageLabelRange{Start: r.Start, Style: r.Style, Prefix: r.Prefix, First: r.First}
+	}
+	return out, nil
+}
+
 // PageLabel returns the label for a zero-based page index.
 func (d *Document) PageLabel(ctx context.Context, index int) (string, error) {
 	if d == nil || d.inner == nil {
@@ -245,6 +311,7 @@ func (d *Document) Close() error {
 	if d == nil || d.inner == nil {
 		return nil
 	}
+	d.closed.Store(true)
 	err := d.inner.Close()
 	d.releaseOnce.Do(func() {
 		if d.release != nil {

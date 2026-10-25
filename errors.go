@@ -31,10 +31,10 @@ const (
 func (l Level) String() string { return diag.Level(l).String() }
 
 type Diagnostic struct {
-	Level  Level
-	Code   string
-	Msg    string
-	Page   int
-	Obj    int
-	Offset int64
+	Level  Level  `json:"level"`
+	Code   string `json:"code"`
+	Msg    string `json:"msg"`
+	Page   int    `json:"page,omitempty"`
+	Obj    int    `json:"obj,omitempty"`
+	Offset int64  `json:"offset,omitempty"`
 }

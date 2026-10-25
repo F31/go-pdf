@@ -96,10 +96,10 @@ func TestErrorType(t *testing.T) {
 }
 
 func TestDisplayListVersion(t *testing.T) {
-	if displaylist.Version.Major != 1 {
+	if displaylist.Version.Major != 2 {
 		t.Fatalf("version %v", displaylist.Version)
 	}
-	if !displaylist.Compatible(1) || displaylist.Compatible(2) {
+	if !displaylist.Compatible(2) || displaylist.Compatible(1) {
 		t.Fatal("compatibility check")
 	}
 }
@@ -202,9 +202,6 @@ func TestPreflight(t *testing.T) {
 	if rep.Domains[DomainRender].Status != CapabilityApproximate {
 		t.Fatalf("render %#v", rep.Domains[DomainRender])
 	}
-	if rep.Domains[DomainEdit].Status != CapabilityUnsupported {
-		t.Fatalf("edit %#v", rep.Domains[DomainEdit])
-	}
 }
 
 func TestPageMemoryLease(t *testing.T) {
@@ -249,5 +246,19 @@ func TestOpenFileMappedAndReleased(t *testing.T) {
 	}
 	if got := d.ResourceUsage().LiveBytes; got != 0 {
 		t.Fatalf("live after close %d", got)
+	}
+}
+
+func TestMapReaderAtLarge(t *testing.T) {
+	size := spoolThreshold + 1024
+	src := make([]byte, size)
+	copy(src, "%PDF-1.7\n")
+	data, release, err := mapReaderAt(context.Background(), bytes.NewReader(src), int64(size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if len(data) != size || string(data[:8]) != "%PDF-1.7" {
+		t.Fatalf("mapped data len=%d header=%q", len(data), data[:8])
 	}
 }

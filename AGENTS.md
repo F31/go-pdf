@@ -6,6 +6,11 @@
 - Test: `go test ./...` and `go test -race ./...`
 - Vet: `go vet ./...`
 - Fuzz smoke: `go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s`
+- Poppler synthetic reference: `POPPLER_QUALITY=1 go test ./render -run TestPopplerReferenceQuality -v`
+- Poppler corpus sample: `POPPLER_CORPUS=1 go test ./render -run TestPopplerCorpusQuality -v -timeout 20m`
+- Poppler full-corpus report: `POPPLER_CORPUS=1 POPPLER_CORPUS_PAGES=0 POPPLER_CORPUS_REPORT=/tmp/poppler-corpus.csv go test ./render -run TestPopplerCorpusQuality -v -timeout 24h`
+- Poppler full corpus: `POPPLER_CORPUS_SHARDS=16 ./scripts/corpus-poppler-full.sh` (page-chunk workers, PPM, writes `/tmp/poppler-corpus/poppler-corpus.csv`)
+- Poppler reference cache: add `POPPLER_CORPUS_REF_CACHE=/tmp/poppler-ref` (cached PNGs; reuses Poppler output between runs)
 - Benchmarks: `go test ./... -run=^$ -bench=. -benchmem`
 - Dependency policy: `./scripts/check-deps.sh`
 
@@ -18,13 +23,14 @@
 
 - Only the Go standard library and `golang.org/x/*` are allowed. A new
   dependency requires an ADR and a `THIRD_PARTY.md` entry.
-- Public packages are the module root (`pdf`), `displaylist`, `render`, and `text`. Internal PDF
+- Public packages are the module root (`pdf`), `displaylist`, `render`, `text`, `extension`, `extension/legacy`, `extension/poppler`, `extension/cairo`, and `extension/openjpeg`. Internal PDF
   objects must not appear in public signatures.
 - Do not silently degrade. Every approximation or unsupported feature must
   return an appropriate error or record a diagnostic.
 - Errors must not contain document text, metadata values, or stream contents.
-- `displaylist.Version` is frozen at 1.0 for G0. Add fields only (Minor bump);
-  removals or semantic changes require a Major bump and an ADR.
+- `displaylist.Version` is 2.0. Add fields only (Minor bump); removals or
+  semantic changes require a Major bump and an ADR. The 1.0 contract is not
+  preserved.
 
 ## Git
 

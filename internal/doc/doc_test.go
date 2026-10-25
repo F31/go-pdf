@@ -88,6 +88,45 @@ func TestMultiplePagesAndCountHint(t *testing.T) {
 	if _, err := d.Page(2); !errors.Is(err, errs.ErrCorrupt) {
 		t.Fatalf("range error = %v", err)
 	}
+	found := false
+	for _, item := range d.Diagnostics() {
+		if item.Code == "DOC-PAGE-COUNT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing DOC-PAGE-COUNT diagnostic: %#v", d.Diagnostics())
+	}
+}
+
+func TestNestedPageCountHint(t *testing.T) {
+	objs := []testkit.Obj{
+		testkit.Raw(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+		testkit.Raw(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+		testkit.Raw(3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 1 >>"),
+		testkit.Raw(4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>"),
+		testkit.Raw(5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>"),
+	}
+	d, _ := openDoc(t, testkit.Build(objs, "/Root 1 0 R"), false)
+	defer d.Close()
+	if d.NumPages() != 2 {
+		t.Fatalf("pages = %d", d.NumPages())
+	}
+	var root, nested bool
+	for _, item := range d.Diagnostics() {
+		if item.Code != "DOC-PAGE-COUNT" {
+			continue
+		}
+		if item.Obj == 2 {
+			root = true
+		}
+		if item.Obj == 3 {
+			nested = true
+		}
+	}
+	if !root || !nested {
+		t.Fatalf("count diagnostics root=%v nested=%v: %#v", root, nested, d.Diagnostics())
+	}
 }
 
 func TestMetadata(t *testing.T) {
@@ -185,5 +224,25 @@ func TestRepairRecoversPageTree(t *testing.T) {
 	}
 	if d.NumPages() != 1 {
 		t.Fatalf("pages %d", d.NumPages())
+	}
+}
+
+func TestDecodeTextEncodings(t *testing.T) {
+	cases := []struct {
+		in   []byte
+		want string
+	}{
+		{[]byte{0x80, 0x93}, "•ﬁ"},
+		{[]byte{0xa0}, "€"},
+		{[]byte{0x7f, 0x9f}, "��"},
+		{[]byte{0xfe, 0xff, 0x00, 0x41}, "A"},
+		{[]byte{0xff, 0xfe, 0x41, 0x00}, "A"},
+		{[]byte{0xfe, 0xff, 0xd8, 0x3d, 0xde, 0x00}, "😀"},
+		{[]byte{0xff, 0xfe, 0x3d, 0xd8, 0x00, 0xde}, "😀"},
+	}
+	for _, tc := range cases {
+		if got := decodeTextString(syntax.String(tc.in)); got != tc.want {
+			t.Errorf("decodeTextString(%x) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

@@ -2,7 +2,10 @@ package pdf
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"sync"
 
 	"github.com/F31/go-pdf/displaylist"
 	"github.com/F31/go-pdf/internal/errs"
@@ -25,86 +28,157 @@ const (
 	DomainParse   Domain = "parse"
 	DomainExtract Domain = "extract"
 	DomainRender  Domain = "render"
-	DomainEdit    Domain = "edit"
-	DomainExport  Domain = "export"
-	DomainVerify  Domain = "verify"
 )
 
 // DomainReport is one preflight domain. Notes explain approximations and gaps.
 type DomainReport struct {
-	Status   CapabilityStatus
-	Outcome  Outcome
-	Notes    []string
-	Features []Capability
+	Status   CapabilityStatus `json:"status"`
+	Outcome  Outcome          `json:"outcome"`
+	Notes    []string         `json:"notes,omitempty"`
+	Features []Capability     `json:"features,omitempty"`
 }
 
 // PreflightReport is a per-document scan of capability and execution status.
 // It is not a proof of pixel or conformance correctness.
-type PreflightReport struct {
-	Pages       int
-	Scanned     int
-	Encrypted   bool
-	Repaired    bool
-	Domains     map[Domain]*DomainReport
-	Diagnostics []Diagnostic
+type PageFailure struct {
+	Page int    `json:"page"`
+	Code string `json:"code,omitempty"`
 }
 
-// Preflight scans every page and reports Parse/Extract/Render/Edit/Export/
-// Verify status. It can be expensive for large documents.
+type PreflightReport struct {
+	Pages       int                      `json:"pages"`
+	Scanned     int                      `json:"scanned"`
+	Failed      int                      `json:"failed"`
+	FailedPages []int                    `json:"failedPages,omitempty"`
+	Failures    []PageFailure            `json:"failures,omitempty"`
+	Encrypted   bool                     `json:"encrypted"`
+	Repaired    bool                     `json:"repaired"`
+	Domains     map[Domain]*DomainReport `json:"domains"`
+	Diagnostics []Diagnostic             `json:"diagnostics,omitempty"`
+}
+
+// PreflightOptions controls a preflight scan. Pages are 0-based; nil means all.
+// Workers is capped by the document budget.
+type PreflightOptions struct {
+	Pages   []int
+	Workers int
+}
+
+// Preflight scans every page and reports Parse/Extract/Render status.
 func (d *Document) Preflight(ctx context.Context) (*PreflightReport, error) {
-	if d == nil || d.inner == nil {
+	return d.PreflightWithOptions(ctx, PreflightOptions{})
+}
+
+// PreflightWithOptions scans selected pages with bounded workers.
+func (d *Document) PreflightWithOptions(ctx context.Context, opts PreflightOptions) (*PreflightReport, error) {
+	if d == nil || d.inner == nil || d.closed.Load() {
 		return nil, errs.Wrap(errs.ErrClosed, "DOC-CLOSED", "preflight", -1, 0, -1)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, errs.Wrap(errs.ErrCanceled, "CNT-CANCELED", "preflight", -1, 0, -1)
 	}
+	pages, err := d.extractPages(opts.Pages)
+	if err != nil {
+		return nil, err
+	}
 	r := &PreflightReport{Pages: d.NumPages(), Encrypted: d.Encrypted(), Repaired: d.Repaired()}
-	r.Diagnostics = d.Diagnostics()
 	r.Domains = map[Domain]*DomainReport{
 		DomainParse:   {Status: CapabilitySupported, Outcome: OutcomeSuccess},
 		DomainExtract: {Status: CapabilitySupported, Outcome: OutcomeSuccess},
 		DomainRender:  {Status: CapabilityApproximate, Outcome: OutcomeSuccess},
-		DomainEdit:    {Status: CapabilityUnsupported, Outcome: OutcomeNotRun},
-		DomainExport:  {Status: CapabilitySupported, Outcome: OutcomeNotRun},
-		DomainVerify:  {Status: CapabilityUnsupported, Outcome: OutcomeNotRun},
 	}
 	var missingUnicode, failedPages, images, shadings int
-	for i := 0; i < r.Pages; i++ {
-		if err := ctx.Err(); err != nil {
-			return nil, errs.Wrap(errs.ErrCanceled, "CNT-CANCELED", "preflight", -1, 0, i)
+	workers := d.extractWorkers(opts.Workers, len(pages))
+	if workers < 1 {
+		workers = 1
+	}
+	type pageResult struct {
+		page     int
+		ok       bool
+		code     string
+		missing  int
+		images   int
+		shadings int
+	}
+	jobs := make(chan int)
+	results := make(chan pageResult, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out := pageResult{page: i}
+				p, err := d.Page(i)
+				if err != nil {
+					out.code = diagnosticCode(err)
+					results <- out
+					continue
+				}
+				dl, err := p.DisplayList(ctx)
+				if err != nil {
+					out.code = diagnosticCode(err)
+					results <- out
+					continue
+				}
+				out.ok = true
+				var scan func([]displaylist.Item)
+				scan = func(items []displaylist.Item) {
+					for _, it := range items {
+						switch v := it.(type) {
+						case *displaylist.TextRun:
+							for _, g := range v.Glyphs {
+								if !g.UnicodeOK {
+									out.missing++
+								}
+							}
+						case *displaylist.Image:
+							out.images++
+						case *displaylist.Shading:
+							out.shadings++
+						case *displaylist.Group:
+							scan(v.Items)
+						}
+					}
+				}
+				scan(dl.Items)
+				results <- out
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, page := range pages {
+			select {
+			case jobs <- page:
+			case <-ctx.Done():
+				return
+			}
 		}
-		p, err := d.Page(i)
-		if err != nil {
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for out := range results {
+		if !out.ok {
 			failedPages++
-			continue
-		}
-		dl, err := p.DisplayList(ctx)
-		if err != nil {
-			failedPages++
+			r.FailedPages = append(r.FailedPages, out.page)
+			r.Failures = append(r.Failures, PageFailure{Page: out.page, Code: out.code})
 			continue
 		}
 		r.Scanned++
-		var scan func([]displaylist.Item)
-		scan = func(items []displaylist.Item) {
-			for _, it := range items {
-				switch v := it.(type) {
-				case *displaylist.TextRun:
-					for _, g := range v.Glyphs {
-						if !g.UnicodeOK {
-							missingUnicode++
-						}
-					}
-				case *displaylist.Image:
-					images++
-				case *displaylist.Shading:
-					shadings++
-				case *displaylist.Group:
-					scan(v.Items)
-				}
-			}
-		}
-		scan(dl.Items)
+		missingUnicode += out.missing
+		images += out.images
+		shadings += out.shadings
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errs.Wrap(errs.ErrCanceled, "CNT-CANCELED", "preflight", -1, 0, -1)
+	}
+	sort.Ints(r.FailedPages)
+	sort.Slice(r.Failures, func(i, j int) bool { return r.Failures[i].Page < r.Failures[j].Page })
+	r.Failed = len(r.FailedPages)
+	r.Diagnostics = d.Diagnostics()
 	r.Domains[DomainExtract].Features = featuresFor(DomainExtract)
 	r.Domains[DomainRender].Features = featuresFor(DomainRender)
 	r.Domains[DomainParse].Features = featuresFor(DomainParse)
@@ -124,16 +198,13 @@ func (d *Document) Preflight(ctx context.Context) (*PreflightReport, error) {
 		r.Domains[DomainExtract].Outcome = OutcomePartial
 		r.Domains[DomainExtract].Notes = append(r.Domains[DomainExtract].Notes, fmt.Sprintf("%d glyphs lack trusted Unicode", missingUnicode))
 	}
-	r.Domains[DomainRender].Notes = append(r.Domains[DomainRender].Notes, "sRGB compositing; no tile/executor or print color")
+	r.Domains[DomainRender].Notes = append(r.Domains[DomainRender].Notes, "Preview screen sRGB; tiled executor available; print colour and full codecs require Extended")
 	if images > 0 {
 		r.Domains[DomainRender].Notes = append(r.Domains[DomainRender].Notes, fmt.Sprintf("%d images", images))
 	}
 	if shadings > 0 {
 		r.Domains[DomainRender].Notes = append(r.Domains[DomainRender].Notes, fmt.Sprintf("%d shadings", shadings))
 	}
-	r.Domains[DomainExport].Notes = append(r.Domains[DomainExport].Notes, "PNG and JPEG encoders available; no SVG/HTML/PS/EPS")
-	r.Domains[DomainEdit].Notes = append(r.Domains[DomainEdit].Notes, "write and form editing are not implemented")
-	r.Domains[DomainVerify].Notes = append(r.Domains[DomainVerify].Notes, "signature verification is not implemented")
 	return r, nil
 }
 
@@ -142,7 +213,6 @@ func featuresFor(domain Domain) []Capability {
 		DomainParse:   {"parse": true, "security": true},
 		DomainExtract: {"text": true, "document": true, "font": true},
 		DomainRender:  {"render": true, "color": true},
-		DomainEdit:    {"edit": true},
 	}
 	out := make([]Capability, 0)
 	for _, c := range Capabilities() {
@@ -151,4 +221,12 @@ func featuresFor(domain Domain) []Capability {
 		}
 	}
 	return out
+}
+
+func diagnosticCode(err error) string {
+	var pe *errs.Error
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	return ""
 }

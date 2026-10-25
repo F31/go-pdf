@@ -7,6 +7,7 @@ import (
 
 	"github.com/F31/go-pdf"
 	"github.com/F31/go-pdf/displaylist"
+	"github.com/F31/go-pdf/extension"
 	"github.com/F31/go-pdf/internal/errs"
 )
 
@@ -18,18 +19,16 @@ type RenderProfile struct {
 	Annotations AnnotationMode
 }
 
-// ProfilePreview prioritizes latency for interactive previews.
+// ProfilePreview prioritizes latency for interactive previews and enables the
+// built-in text fallback when no font provider is configured.
 var ProfilePreview = RenderProfile{Name: "preview", DPI: 120, IncludeText: true, Annotations: AnnotationView}
-
-// ProfileProduction targets durable output and includes annotation print views.
-var ProfileProduction = RenderProfile{Name: "production", DPI: 220, IncludeText: true, Annotations: AnnotationPrint}
 
 // Options configures a Renderer. Zero values use ProfilePreview.
 type Options struct {
-	Profile     RenderProfile
-	CMYKProfile []byte
-	Fonts       FontProvider
-	Memory      MemoryBudget
+	Profile    RenderProfile
+	Fonts      FontProvider
+	FontEngine extension.FontEngine
+	Memory     MemoryBudget
 }
 
 // Renderer applies a stable profile and shared providers to page rendering.
@@ -45,6 +44,9 @@ func NewRenderer(opts Options) (*Renderer, error) {
 	if opts.Profile.DPI < 0 {
 		return nil, errs.Wrap(errs.ErrCorrupt, "RND-PROFILE", "invalid render profile DPI", -1, 0, -1)
 	}
+	if opts.Fonts == nil && opts.Profile.IncludeText {
+		opts.Fonts = defaultTextFonts()
+	}
 	return &Renderer{opts: opts}, nil
 }
 
@@ -58,11 +60,11 @@ func (r *Renderer) apply(opts PageOptions) PageOptions {
 	if opts.Annotations == AnnotationNone {
 		opts.Annotations = r.opts.Profile.Annotations
 	}
-	if opts.CMYKProfile == nil {
-		opts.CMYKProfile = r.opts.CMYKProfile
-	}
 	if opts.Fonts == nil {
 		opts.Fonts = r.opts.Fonts
+	}
+	if opts.FontEngine == nil {
+		opts.FontEngine = r.opts.FontEngine
 	}
 	if opts.Memory == nil {
 		opts.Memory = r.opts.Memory
@@ -73,6 +75,12 @@ func (r *Renderer) apply(opts PageOptions) PageOptions {
 // RenderRegion renders a page-space rectangle using the renderer profile.
 func (r *Renderer) RenderRegion(ctx context.Context, page *pdf.Page, box displaylist.Rect, opts PageOptions) (*Raster, error) {
 	return RenderRegionLease(ctx, page, box, r.apply(opts))
+}
+
+// RenderPagesEach renders pages with the renderer profile and streams them to
+// fn. See RenderPagesEach for callback and ownership rules.
+func (r *Renderer) RenderPagesEach(ctx context.Context, doc *pdf.Document, pages []int, opts PageOptions, workers int, fn func(PageResult) error) error {
+	return RenderPagesEach(ctx, doc, pages, r.apply(opts), workers, fn)
 }
 
 // RenderedPage is an owned page raster with its effective capabilities.
@@ -169,7 +177,7 @@ func (r *Renderer) Capabilities(ctx context.Context, page *pdf.Page) (RenderCapa
 			}
 			switch v := it.(type) {
 			case *displaylist.TextRun:
-				if r.opts.Fonts == nil && !hasTextOutlines(v) {
+				if r.opts.Fonts == nil && !hasEngineSource(v, r.opts.FontEngine) && !hasTextOutlines(v) {
 					caps.MissingTextOutlines++
 				}
 			case *displaylist.Group:
@@ -224,4 +232,8 @@ func hasTextOutlines(t *displaylist.TextRun) bool {
 		}
 	}
 	return false
+}
+
+func hasEngineSource(t *displaylist.TextRun, engine extension.FontEngine) bool {
+	return engine != nil && t != nil && t.Font != nil && t.Font.Source != nil
 }

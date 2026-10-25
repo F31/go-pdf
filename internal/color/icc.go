@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 )
 
 const (
@@ -18,7 +19,6 @@ type iccProfile struct {
 	matrix     [9]float64
 	trc        [3]*iccCurve
 	lut        *iccLUT
-	btoa       *iccBToA
 	pcs        string
 	isGray     bool
 }
@@ -32,6 +32,46 @@ type iccCurve struct {
 type iccPara struct {
 	typ  int
 	vals [7]float64
+}
+
+type iccCacheKey struct {
+	data string
+	n    int
+}
+
+var iccCache = struct {
+	sync.Mutex
+	m     map[iccCacheKey]*iccProfile
+	order []iccCacheKey
+}{m: make(map[iccCacheKey]*iccProfile)}
+
+const iccCacheLimit = 16
+
+func parseICCProfileCached(data []byte, n int) (*iccProfile, error) {
+	key := iccCacheKey{data: string(data), n: n}
+	iccCache.Lock()
+	if p := iccCache.m[key]; p != nil {
+		iccCache.Unlock()
+		return p, nil
+	}
+	iccCache.Unlock()
+	p, err := parseICCProfile(data, n)
+	if err != nil {
+		return nil, err
+	}
+	iccCache.Lock()
+	if existing := iccCache.m[key]; existing != nil {
+		iccCache.Unlock()
+		return existing, nil
+	}
+	if len(iccCache.order) >= iccCacheLimit {
+		delete(iccCache.m, iccCache.order[0])
+		iccCache.order = iccCache.order[1:]
+	}
+	iccCache.m[key] = p
+	iccCache.order = append(iccCache.order, key)
+	iccCache.Unlock()
+	return p, nil
 }
 
 func parseICCProfile(data []byte, n int) (*iccProfile, error) {
@@ -72,20 +112,10 @@ func parseICCProfile(data []byte, n int) (*iccProfile, error) {
 		tags[sig] = data[off : off+size]
 	}
 	p := &iccProfile{colorSpace: cs, white: [3]float64{0.9642, 1, 0.8249}, pcs: string(data[20:24])}
-	if tag, ok := tags["B2A0"]; ok {
-		if btoa, err := parseBToA(tag); err == nil {
-			p.btoa = btoa
-		}
-	} else if tag, ok := tags["B2A1"]; ok {
-		if btoa, err := parseBToA(tag); err == nil {
-			p.btoa = btoa
-		}
-	}
-	if wp, ok := tags["wtpt"]; ok {
-		if xyz, ok := parseICCXYZ(wp); ok {
-			p.white = xyz
-		}
-	}
+	// ICC matrix/LUT colorants are PCS D50-adapted. The media white point in
+	// wtpt may be D65 (for example, an sRGB display profile), so it must not be
+	// used as the XYZ conversion white.
+	_ = tags["wtpt"]
 	if cs == "GRAY" {
 		c, ok := parseICCCurve(tags["kTRC"])
 		if !ok {
@@ -233,29 +263,30 @@ func (c *iccCurve) eval(x float64) float64 {
 
 func (p *iccPara) eval(x float64) float64 {
 	v := p.vals
+	g, a, b := v[0], v[1], v[2]
 	switch p.typ {
 	case 0:
-		return math.Pow(x, v[0])
+		return math.Pow(x, g)
 	case 1:
-		if x >= -v[1]/v[0] {
-			return math.Pow(v[0]*x+v[1], v[2])
+		if x >= -b/a {
+			return math.Pow(a*x+b, g)
 		}
 		return 0
 	case 2:
-		if x >= -v[1]/v[0] {
-			return math.Pow(v[0]*x+v[1], v[2]) + v[3]
+		if x >= -b/a {
+			return math.Pow(a*x+b, g) + v[3]
 		}
 		return v[3]
 	case 3:
 		if x >= v[4] {
-			return math.Pow(v[0]*x+v[1], v[2])
+			return math.Pow(a*x+b, g)
 		}
 		return v[3] * x
 	case 4:
 		if x >= v[4] {
-			return math.Pow(v[0]*x+v[1], v[2]) + v[3]
+			return math.Pow(a*x+b, g) + v[5]
 		}
-		return v[3]*x + v[5]
+		return v[3]*x + v[6]
 	}
 	return x
 }
@@ -269,8 +300,8 @@ func (p *iccProfile) rgba(vals []float64) ([4]float64, bool, error) {
 			return [4]float64{}, false, clrErr("CLR-COMPONENTS", "not enough color components")
 		}
 		l := p.grayTRC.eval(clamp(vals[0]))
-		xyz := [3]float64{p.white[0] * l, p.white[1] * l, p.white[2] * l}
-		return xyzRGBA(xyz, p.white), false, nil
+		xyz := [3]float64{0.9642 * l, l, 0.8249 * l}
+		return iccXYZRGBA(xyz), false, nil
 	}
 	if len(vals) < 3 {
 		return [4]float64{}, false, clrErr("CLR-COMPONENTS", "not enough color components")
@@ -283,5 +314,18 @@ func (p *iccProfile) rgba(vals []float64) ([4]float64, bool, error) {
 		p.matrix[3]*r + p.matrix[4]*g + p.matrix[5]*b,
 		p.matrix[6]*r + p.matrix[7]*g + p.matrix[8]*b,
 	}
-	return xyzRGBA(xyz, p.white), false, nil
+	return iccXYZRGBA(xyz), false, nil
+}
+
+// iccXYZRGBA converts ICC PCS D50 XYZ to sRGB using the Bradford D50->D65
+// adaptation. ICC matrix colorants and LUT outputs are PCS D50-relative; the
+// media white tag must not be used as the conversion white.
+func iccXYZRGBA(xyz [3]float64) [4]float64 {
+	x := 0.9555766*xyz[0] - 0.0230393*xyz[1] + 0.0631636*xyz[2]
+	y := -0.0282895*xyz[0] + 1.0099416*xyz[1] + 0.0210077*xyz[2]
+	z := 0.0122982*xyz[0] - 0.0204830*xyz[1] + 1.3299098*xyz[2]
+	r := 3.2406*x - 1.5372*y - 0.4986*z
+	g := -0.9689*x + 1.8758*y + 0.0415*z
+	b := 0.0557*x - 0.2040*y + 1.0570*z
+	return [4]float64{srgb(r), srgb(g), srgb(b), 1}
 }

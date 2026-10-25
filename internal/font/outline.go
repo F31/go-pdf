@@ -27,7 +27,7 @@ func (f *Font) GlyphOutline(c Code) ([]displaylist.Segment, bool) {
 }
 
 func (f *Font) outlineGID(c Code) (sfnt.GlyphIndex, bool) {
-	if f == nil || f.program == nil || f.type3 {
+	if f == nil || f.program == nil || f.type3 || !f.outlineOK {
 		return 0, false
 	}
 	if f.isCID && (f.cidToGIDIdentity || len(f.cidToGID) > 0) {

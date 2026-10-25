@@ -17,3 +17,9 @@ type ExternalDecoder interface {
 // DecoderLookup creates a decoder for one image task. A document-scoped
 // registry supplies this callback; nil means no external decoder is available.
 type DecoderLookup func(context.Context, displaylist.ImageEncoding, displaylist.ImageInfo) (ExternalDecoder, error)
+
+// ExternalSampler is an optional extension of ExternalDecoder for providers
+// that can expose normalized source samples without first converting to sRGB.
+type ExternalSampler interface {
+	DecodeSamples(ctx context.Context, raw []byte, info displaylist.ImageInfo) (*displaylist.ImageSamples, error)
+}

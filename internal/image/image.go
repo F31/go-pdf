@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"sync"
 
 	"golang.org/x/image/ccitt"
 
@@ -38,6 +39,22 @@ type Ref struct {
 	colorManager pdfcolor.Manager
 	iccProfile   []byte
 	components   int
+	indexed      *indexedImage
+
+	iccOnce          sync.Once
+	iccTransform     *pdfcolor.Transform
+	iccErr           error
+	indexedOnce      sync.Once
+	indexedTransform *pdfcolor.Transform
+	indexedErr       error
+}
+
+type indexedImage struct {
+	base       string
+	components int
+	profile    []byte
+	hival      int
+	lookup     []byte
 }
 
 // NewXObject builds an image reference from an image XObject stream.
@@ -51,7 +68,8 @@ func NewInline(ctx context.Context, dict syntax.Dict, data []byte, tracker *budg
 	if err != nil {
 		return nil, err
 	}
-	return &Ref{info: info, dict: dict, raw: append([]byte(nil), data...), tracker: tracker, diag: dc, decoders: decoders, colorManager: cm, iccProfile: profile, components: ncomp}, nil
+	idx := imageIndexed(ctx, dict, nil, true)
+	return &Ref{info: info, dict: dict, raw: append([]byte(nil), data...), tracker: tracker, diag: dc, decoders: decoders, colorManager: cm, iccProfile: profile, components: ncomp, indexed: idx}, nil
 }
 
 func newRef(ctx context.Context, file *syntax.File, stm *syntax.Stream, raw []byte, tracker *budget.Tracker, dc *diag.Collector, decoders DecoderLookup, cm pdfcolor.Manager, inline bool, depth int) (*Ref, *displaylist.MaskRef, error) {
@@ -59,7 +77,8 @@ func newRef(ctx context.Context, file *syntax.File, stm *syntax.Stream, raw []by
 	if err != nil {
 		return nil, nil, err
 	}
-	r := &Ref{info: info, file: file, stream: stm, dict: stm.Dict, raw: append([]byte(nil), raw...), tracker: tracker, diag: dc, decoders: decoders, colorManager: cm, iccProfile: profile, components: ncomp}
+	idx := imageIndexed(ctx, stm.Dict, file, inline)
+	r := &Ref{info: info, file: file, stream: stm, dict: stm.Dict, raw: append([]byte(nil), raw...), tracker: tracker, diag: dc, decoders: decoders, colorManager: cm, iccProfile: profile, components: ncomp, indexed: idx}
 	if depth >= maxMaskDepth {
 		diagf(dc, "IMG-MASK-DEPTH", "image mask nesting limit reached")
 		return r, nil, nil
@@ -153,6 +172,13 @@ func imageInfo(ctx context.Context, dict syntax.Dict, inline bool, file *syntax.
 		bpc = 1
 	}
 	csObj := getAny(dict, "ColorSpace", "CS")
+	if file != nil {
+		if ref, ok := csObj.(syntax.Ref); ok {
+			if resolved, err := file.Resolve(ctx, ref); err == nil {
+				csObj = resolved
+			}
+		}
+	}
 	cs := colorSpaceName(csObj, inline)
 	profile, components := imageICC(ctx, csObj, file)
 	if len(profile) > 0 {
@@ -202,6 +228,80 @@ func imageICC(ctx context.Context, cs syntax.Object, file *syntax.File) ([]byte,
 		return nil, 0
 	}
 	return profile, n
+}
+
+func imageIndexed(ctx context.Context, dict syntax.Dict, file *syntax.File, inline bool) *indexedImage {
+	csObj := getAny(dict, "ColorSpace", "CS")
+	if file != nil {
+		if ref, ok := csObj.(syntax.Ref); ok {
+			if resolved, err := file.Resolve(ctx, ref); err == nil {
+				csObj = resolved
+			}
+		}
+	}
+	arr, ok := csObj.(syntax.Array)
+	if !ok || len(arr) < 4 {
+		return nil
+	}
+	name, _ := arr[0].(syntax.Name)
+	if string(name) != "Indexed" && !(inline && string(name) == "I") {
+		return nil
+	}
+	baseObj := arr[1]
+	if file != nil {
+		if ref, ok := baseObj.(syntax.Ref); ok {
+			if resolved, err := file.Resolve(ctx, ref); err == nil {
+				baseObj = resolved
+			}
+		}
+	}
+	base := colorSpaceName(baseObj, inline)
+	components := 0
+	var profile []byte
+	switch base {
+	case "DeviceGray":
+		components = 1
+	case "DeviceRGB":
+		components = 3
+	case "DeviceCMYK":
+		components = 4
+	case "ICCBased":
+		profile, components = imageICC(ctx, baseObj, file)
+	default:
+		return nil
+	}
+	if components == 0 {
+		return nil
+	}
+	hival, ok := number(arr[2])
+	if !ok || hival < 0 || hival > 255 {
+		return nil
+	}
+	lookupObj := arr[3]
+	if file != nil {
+		if ref, ok := lookupObj.(syntax.Ref); ok {
+			if resolved, err := file.Resolve(ctx, ref); err == nil {
+				lookupObj = resolved
+			}
+		}
+	}
+	var lookup []byte
+	switch v := lookupObj.(type) {
+	case syntax.String:
+		lookup = append([]byte(nil), v...)
+	case *syntax.Stream:
+		if file == nil {
+			return nil
+		}
+		data, err := file.DecodeStream(ctx, v)
+		if err != nil {
+			return nil
+		}
+		lookup = data
+	default:
+		return nil
+	}
+	return &indexedImage{base: base, components: components, profile: profile, hival: int(hival), lookup: lookup}
 }
 
 func colorSpaceName(o syntax.Object, inline bool) string {
@@ -338,6 +438,24 @@ func (r *Ref) DecodeSamples(ctx context.Context) (*displaylist.ImageSamples, err
 			return nil, r.fail("IMG-EXTERNAL", "external image decoder failed", err, errs.ErrUnsupported)
 		}
 		if d != nil {
+			if sampler, ok := d.(ExternalSampler); ok {
+				samples, sampleErr := sampler.DecodeSamples(ctx, append([]byte(nil), r.raw...), r.info)
+				if sampleErr == nil && samples != nil {
+					if samples.ColorSpace == "" {
+						samples.ColorSpace = r.info.ColorSpace
+					}
+					if len(samples.Profile) == 0 && len(r.iccProfile) > 0 {
+						samples.Profile = append([]byte(nil), r.iccProfile...)
+					}
+					return samples, nil
+				}
+				if sampleErr != nil {
+					if errors.Is(sampleErr, errs.ErrBudget) || errors.Is(sampleErr, errs.ErrCanceled) {
+						return nil, sampleErr
+					}
+					return nil, r.fail("IMG-NO-SAMPLES", "external image decoder cannot expose source samples", sampleErr, errs.ErrUnsupported)
+				}
+			}
 			return nil, r.fail("IMG-NO-SAMPLES", "external image decoder does not expose source samples", nil, errs.ErrUnsupported)
 		}
 	}
@@ -504,13 +622,13 @@ func (r *Ref) decodedBytes(ctx context.Context) ([]byte, error) {
 		return data, nil
 	}
 	if r.file != nil && r.stream != nil {
-		data, err := r.file.DecodeStream(ctx, r.stream)
+		data, err := r.file.DecodeStreamLimit(ctx, r.stream, r.decodedLimit())
 		if err != nil {
 			return nil, r.filterError(err)
 		}
 		return data, nil
 	}
-	data, err := applyFilters(ctx, r.raw, filters, parms, r.tracker)
+	data, err := applyFiltersLimit(ctx, r.raw, filters, parms, r.tracker, r.decodedLimit())
 	if err != nil {
 		return nil, r.filterError(err)
 	}
@@ -546,7 +664,7 @@ func (r *Ref) decodeSamples(data []byte) (stdimage.Image, error) {
 		if ncomp != 1 && ncomp != 3 && ncomp != 4 {
 			return nil, r.fail("IMG-COLORSPACE", "unsupported ICCBased image component count", nil, errs.ErrUnsupported)
 		}
-	case "DeviceGray", "ImageMask", "":
+	case "DeviceGray", "ImageMask", "", "Indexed":
 		ncomp = 1
 	default:
 		return nil, r.fail("IMG-COLORSPACE", "unsupported image color space "+cs, nil, errs.ErrUnsupported)
@@ -563,6 +681,9 @@ func (r *Ref) decodeSamples(data []byte) (stdimage.Image, error) {
 		maxv = 65535
 	}
 	decode := r.info.Decode
+	if r.indexed != nil {
+		return r.decodeIndexed(data, w, h, bpc, maxv, decode)
+	}
 	sample := func(row []byte, index int) uint32 {
 		bit := index * bpc
 		if bpc == 8 {
@@ -656,17 +777,119 @@ func (r *Ref) decodeSamples(data []byte) (stdimage.Image, error) {
 	}
 }
 
+func (r *Ref) decodeIndexed(data []byte, w, h, bpc int, maxv uint32, decode []float64) (stdimage.Image, error) {
+	idx := r.indexed
+	rowBytes := (w*bpc + 7) / 8
+	sample := func(row []byte, index int) uint32 {
+		bit := index * bpc
+		if bpc == 8 {
+			return uint32(row[bit/8])
+		}
+		if bpc == 16 {
+			i := bit / 8
+			return uint32(row[i])<<8 | uint32(row[i+1])
+		}
+		byteIdx := bit / 8
+		shift := 8 - bpc - bit%8
+		return uint32(row[byteIdx]>>shift) & maxv
+	}
+	out := stdimage.NewRGBA(stdimage.Rect(0, 0, w, h))
+	vals := make([]float64, idx.components)
+	for y := 0; y < h; y++ {
+		row := data[y*rowBytes:]
+		for x := 0; x < w; x++ {
+			v := float64(sample(row, x))
+			if len(decode) >= 2 {
+				v = decode[0] + v/float64(maxv)*(decode[1]-decode[0])
+			}
+			n := int(math.Round(v))
+			if n < 0 {
+				n = 0
+			}
+			if n > idx.hival {
+				n = idx.hival
+			}
+			off := n * idx.components
+			for j := 0; j < idx.components; j++ {
+				vals[j] = 0
+				if off+j < len(idx.lookup) {
+					vals[j] = float64(idx.lookup[off+j]) / 255
+				}
+			}
+			var c stdcolor.RGBA
+			switch idx.base {
+			case "DeviceGray":
+				g := uint8(math.Round(clamp01(vals[0]) * 255))
+				c = stdcolor.RGBA{R: g, G: g, B: g, A: 255}
+			case "DeviceRGB":
+				c = stdcolor.RGBA{
+					R: uint8(math.Round(clamp01(vals[0]) * 255)),
+					G: uint8(math.Round(clamp01(vals[1]) * 255)),
+					B: uint8(math.Round(clamp01(vals[2]) * 255)),
+					A: 255,
+				}
+			case "DeviceCMYK":
+				cr, cg, cb := stdcolor.CMYKToRGB(
+					uint8(math.Round(clamp01(vals[0])*255)),
+					uint8(math.Round(clamp01(vals[1])*255)),
+					uint8(math.Round(clamp01(vals[2])*255)),
+					uint8(math.Round(clamp01(vals[3])*255)),
+				)
+				c = stdcolor.RGBA{R: cr, G: cg, B: cb, A: 255}
+			case "ICCBased":
+				var err error
+				c, err = r.indexedColor(vals)
+				if err != nil {
+					return nil, err
+				}
+			default:
+				return nil, r.fail("IMG-COLORSPACE", "unsupported indexed base color space", nil, errs.ErrUnsupported)
+			}
+			out.SetRGBA(x, y, c)
+		}
+	}
+	return out, nil
+}
+
+func (r *Ref) indexedColor(vals []float64) (stdcolor.RGBA, error) {
+	idx := r.indexed
+	var rgba [4]float64
+	var err error
+	if r.colorManager != nil {
+		rgba, _, err = r.colorManager.Convert(idx.base, idx.profile, len(vals), vals)
+	} else {
+		r.indexedOnce.Do(func() {
+			r.indexedTransform, r.indexedErr = pdfcolor.NewTransform(idx.profile, len(vals))
+		})
+		if r.indexedErr != nil {
+			return stdcolor.RGBA{}, r.fail("IMG-ICC", "parse indexed ICC profile", r.indexedErr, errs.ErrUnsupported)
+		}
+		rgba, _, err = r.indexedTransform.ToSRGB(vals)
+	}
+	if err != nil {
+		return stdcolor.RGBA{}, r.fail("IMG-COLOR", "convert indexed color", err, errs.ErrUnsupported)
+	}
+	return stdcolor.RGBA{
+		R: uint8(math.Round(clamp01(rgba[0]) * 255)),
+		G: uint8(math.Round(clamp01(rgba[1]) * 255)),
+		B: uint8(math.Round(clamp01(rgba[2]) * 255)),
+		A: 255,
+	}, nil
+}
+
 func (r *Ref) convertImageRGBA(vals []float64) (stdcolor.RGBA, error) {
 	var rgba [4]float64
 	var err error
 	if r.colorManager != nil {
 		rgba, _, err = r.colorManager.Convert(r.info.ColorSpace, r.iccProfile, len(vals), vals)
 	} else if r.info.ColorSpace == "ICCBased" {
-		tr, terr := pdfcolor.NewTransform(r.iccProfile, len(vals))
-		if terr != nil {
-			return stdcolor.RGBA{}, r.fail("IMG-ICC", "parse image ICC profile", terr, errs.ErrUnsupported)
+		r.iccOnce.Do(func() {
+			r.iccTransform, r.iccErr = pdfcolor.NewTransform(r.iccProfile, len(vals))
+		})
+		if r.iccErr != nil {
+			return stdcolor.RGBA{}, r.fail("IMG-ICC", "parse image ICC profile", r.iccErr, errs.ErrUnsupported)
 		}
-		rgba, _, err = tr.ToSRGB(vals)
+		rgba, _, err = r.iccTransform.ToSRGB(vals)
 	} else {
 		terms := []float64{0, 0, 0, 1}
 		copy(terms, vals)
@@ -1020,11 +1243,38 @@ func padParms(in []filter.Params, n int) []filter.Params {
 	return out
 }
 
+func (r *Ref) decodedLimit() int64 {
+	if r == nil || r.info.Width <= 0 || r.info.Height <= 0 || r.info.BitsPerComponent <= 0 {
+		return 0
+	}
+	components := r.components
+	if components <= 0 {
+		switch r.info.ColorSpace {
+		case "DeviceGray", "CalGray", "Indexed", "ImageMask", "Separation":
+			components = 1
+		case "DeviceRGB", "CalRGB", "Lab":
+			components = 3
+		case "DeviceCMYK":
+			components = 4
+		default:
+			components = 1
+		}
+	}
+	rowBits := int64(r.info.Width) * int64(components) * int64(r.info.BitsPerComponent)
+	rowBytes := (rowBits + 7) / 8
+	// Leave room for a predictor filter byte per row and small decoder slack.
+	return rowBytes*int64(r.info.Height) + int64(r.info.Height) + 64
+}
+
 func applyFilters(ctx context.Context, data []byte, names []string, parms []filter.Params, tracker *budget.Tracker) ([]byte, error) {
+	return applyFiltersLimit(ctx, data, names, parms, tracker, 0)
+}
+
+func applyFiltersLimit(ctx context.Context, data []byte, names []string, parms []filter.Params, tracker *budget.Tracker, decodedLimit int64) ([]byte, error) {
 	if len(names) == 0 {
 		return data, nil
 	}
-	r, err := filter.DecodeChain(ctx, bytes.NewReader(data), names, parms, tracker, int64(len(data)))
+	r, err := filter.DecodeChainLimit(ctx, bytes.NewReader(data), names, parms, tracker, int64(len(data)), decodedLimit)
 	if err != nil {
 		return nil, err
 	}

@@ -37,6 +37,8 @@ type managedSpace struct {
 	n       int
 }
 
+func (m managedSpace) ICCProfile() []byte { return m.profile }
+
 func (m managedSpace) Name() string    { return m.name }
 func (m managedSpace) Components() int { return m.n }
 func (m managedSpace) Approx() bool {
@@ -101,11 +103,11 @@ func loadFamily(ctx context.Context, file *syntax.File, family string, arr synta
 	case "ICCBased":
 		return loadICC(ctx, file, arr, managers...)
 	case "Indexed", "I":
-		return loadIndexed(ctx, file, arr, tracker)
+		return loadIndexed(ctx, file, arr, tracker, managers...)
 	case "Separation":
-		return loadSeparation(ctx, file, arr, tracker)
+		return loadSeparation(ctx, file, arr, tracker, managers...)
 	case "DeviceN":
-		return loadDeviceN(ctx, file, arr, tracker)
+		return loadDeviceN(ctx, file, arr, tracker, managers...)
 	default:
 		return byName(family, arr)
 	}
@@ -226,7 +228,10 @@ func (l labSpace) RGBA(vals []float64) ([4]float64, bool, error) {
 type icc struct {
 	base    Space
 	profile *iccProfile
+	data    []byte
 }
+
+func (i icc) ICCProfile() []byte { return i.data }
 
 func (i icc) Name() string    { return "ICCBased" }
 func (i icc) Components() int { return i.base.Components() }
@@ -369,8 +374,8 @@ func loadICC(ctx context.Context, file *syntax.File, arr syntax.Array, managers 
 		return managedSpace{base: base, manager: managers[0], name: "ICCBased", profile: data, n: base.Components()}, nil
 	}
 	if err == nil {
-		if profile, perr := parseICCProfile(data, int(n)); perr == nil {
-			return icc{base: iccBase(profile.components()), profile: profile}, nil
+		if profile, perr := parseICCProfileCached(data, int(n)); perr == nil {
+			return icc{base: iccBase(profile.components()), profile: profile, data: data}, nil
 		}
 	}
 	return icc{base: base}, nil
@@ -397,11 +402,11 @@ func (p *iccProfile) components() int {
 	return 3
 }
 
-func loadIndexed(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker) (Space, error) {
+func loadIndexed(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker, managers ...Manager) (Space, error) {
 	if len(arr) < 4 {
 		return nil, clrErr("CLR-INDEXED", "missing Indexed parameters")
 	}
-	base, err := Load(ctx, file, arr[1], tracker)
+	base, err := Load(ctx, file, arr[1], tracker, managers...)
 	if err != nil {
 		return nil, err
 	}
@@ -419,11 +424,11 @@ func loadIndexed(ctx context.Context, file *syntax.File, arr syntax.Array, track
 	return indexed{base: base, hival: int(hival), lookup: lookup}, nil
 }
 
-func loadSeparation(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker) (Space, error) {
+func loadSeparation(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker, managers ...Manager) (Space, error) {
 	if len(arr) < 4 {
 		return nil, clrErr("CLR-SEPARATION", "missing Separation parameters")
 	}
-	alt, err := Load(ctx, file, arr[2], tracker)
+	alt, err := Load(ctx, file, arr[2], tracker, managers...)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +439,7 @@ func loadSeparation(ctx context.Context, file *syntax.File, arr syntax.Array, tr
 	return tint{name: "Separation", alt: alt, fn: fn, inputs: 1}, nil
 }
 
-func loadDeviceN(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker) (Space, error) {
+func loadDeviceN(ctx context.Context, file *syntax.File, arr syntax.Array, tracker *budget.Tracker, managers ...Manager) (Space, error) {
 	if len(arr) < 4 {
 		return nil, clrErr("CLR-DEVICEN", "missing DeviceN parameters")
 	}
@@ -442,7 +447,7 @@ func loadDeviceN(ctx context.Context, file *syntax.File, arr syntax.Array, track
 	if !ok || len(names) == 0 {
 		return nil, clrErr("CLR-DEVICEN", "invalid DeviceN colorants")
 	}
-	alt, err := Load(ctx, file, arr[2], tracker)
+	alt, err := Load(ctx, file, arr[2], tracker, managers...)
 	if err != nil {
 		return nil, err
 	}

@@ -97,11 +97,60 @@ func (p *Page) Label(ctx context.Context) (string, error) {
 
 // Text extracts a basic character/word/line index from the page.
 func (p *Page) Text(ctx context.Context) (*pdftext.Page, error) {
+	return p.TextWithOptions(ctx, pdftext.Options{})
+}
+
+// TextWithOptions extracts text with explicit segmentation options.
+func (p *Page) TextWithOptions(ctx context.Context, opts pdftext.Options) (*pdftext.Page, error) {
 	dl, err := p.DisplayList(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return pdftext.Extract(dl, pdftext.Options{}), nil
+	if p.doc != nil {
+		if tree, err := p.doc.StructureTree(ctx); err == nil {
+			if len(opts.StructOrder) == 0 {
+				opts.StructOrder = structOrder(tree, p.Index())
+			}
+			if opts.StructInfo == nil {
+				opts.StructInfo = structInfo(tree, p.Index())
+			}
+		}
+	}
+	return pdftext.Extract(dl, opts), nil
+}
+
+// Tables returns tagged Table elements on the page with cell text attached.
+func (p *Page) Tables(ctx context.Context) ([]Table, error) {
+	if p == nil || p.doc == nil {
+		return nil, nil
+	}
+	tree, err := p.doc.StructureTree(ctx)
+	if err != nil {
+		return nil, err
+	}
+	text, err := p.Text(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []Table
+	var walk func([]StructElement)
+	walk = func(nodes []StructElement) {
+		for i := range nodes {
+			n := &nodes[i]
+			if n.Type == "Table" && structureHasPage(n, p.Index()) {
+				if table, ok := n.AsTable(); ok {
+					table.Page = p.Index()
+					table.EndPage = p.Index()
+					table.FilterPage(p.Index())
+					table.AttachText(text)
+					out = append(out, table)
+				}
+			}
+			walk(n.Children)
+		}
+	}
+	walk(tree)
+	return out, nil
 }
 
 // Search finds query occurrences in the page text.
@@ -252,6 +301,18 @@ func walkItems(items []displaylist.Item, fn func(displaylist.Item)) {
 			walkItems(g.Items, fn)
 		}
 	}
+}
+
+func structureHasPage(n *StructElement, page int) bool {
+	if n.Page == page {
+		return true
+	}
+	for i := range n.Children {
+		if structureHasPage(&n.Children[i], page) {
+			return true
+		}
+	}
+	return false
 }
 
 func structureIDs(tree []StructElement, page int) map[int]int {

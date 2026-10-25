@@ -15,6 +15,23 @@ type labelRange struct {
 	first  int
 }
 
+// PageLabelRange is a decoded /PageLabels range. Start is zero-based.
+type PageLabelRange struct {
+	Start  int
+	Style  string
+	Prefix string
+	First  int
+}
+
+func (d *Document) PageLabelRanges(ctx context.Context) []PageLabelRange {
+	src := d.pageLabelRanges(ctx)
+	out := make([]PageLabelRange, len(src))
+	for i, r := range src {
+		out[i] = PageLabelRange{Start: r.start, Style: r.style, Prefix: r.prefix, First: r.first}
+	}
+	return out
+}
+
 func (d *Document) PageLabel(ctx context.Context, index int) string {
 	if index < 0 || index >= len(d.pages) {
 		return ""
@@ -144,8 +161,5 @@ func letters(n int, upper bool) string {
 }
 
 func decodeBytes(b []byte) string {
-	if len(b) >= 2 && b[0] == 0xFE && b[1] == 0xFF {
-		return utf16BE(b[2:])
-	}
-	return string(b)
+	return decodeString(b)
 }
