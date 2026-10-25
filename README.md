@@ -1,105 +1,380 @@
 # go-pdf
 
-纯 Go、无 CGO 的 PDF 解析与内容提取组件。G0 提供文档打开、页面遍历、页面空间、元数据、资源预算与诊断基础；G1 提供内容流解释与基础显示列表；G2 增量提供简单字体与 Type0/CID 的 Unicode、字宽和预定义 CJK CMap。
+**纯 Go、无 CGO 的服务端 PDF 内核与屏幕预览引擎。**
 
-## 状态
+当前版本：**v0.5.0**
 
-当前为 **Server Document Core**：Core 负责解析/IR/文本/结构，Preview 提供屏幕预览，Extended 通过进程或适配器接入 Poppler/OpenJPEG/Cairo 等后端。范围与 SLO 见 [ADR-0014](docs/adr/0014-server-document-core.md)。
+模块：`github.com/F31/go-pdf`
 
-- 经典 xref、xref 流、对象流、增量更新、混合引用、重建
+go-pdf 提供从 PDF 解析、解密、内容解释、文本/结构提取，到页面预检和屏幕渲染的一套 Go API，同时保留 Poppler、OpenJPEG、JBIG2 等外部引擎作为可选的 Extended 后端。
+
+---
+
+## 产品简介
+
+go-pdf 面向服务端文档处理，而不是桌面 PDF 阅读器或打印排版工具。
+
+它解决四类问题：
+
+- **读得开**：xref/对象流/增量更新/损坏修复、R Standard R2–R6 解密。
+- **读得懂**：文本、字符位置、阅读顺序、结构树、表格、链接、表单字段、附件。
+- **看得见**：路径、文字、图像、ICC、透明、软蒙版、Pattern、Mesh 的屏幕预览。
+- **管得住**：资源预算、取消、页级并发、流式回调、显式错误和诊断。
+
+典型使用场景：
+
+- 文档中台、知识库、搜索索引、内容审核
+- 合同/报告/票据的文本与结构抽取
+- 批量文档预检、元数据归档、附件读取
+- 服务端缩略图、页面预览、区域截图
+- 用 Go 构建的文档处理流水线
+
+---
+
+## 定位
+
+### 产品档位
+
+| 档位 | 定位 | 主要能力 |
+|---|---|---|
+| **Core** | 服务端 PDF 读取与理解 | 解析、解密、页面树、内容解释、文本、结构/表格、预检、预算与取消 |
+| **Preview** | 屏幕预览 | sRGB 路径/文字/图像、透明、软蒙版、Pattern、Mesh、区域/整页渲染 |
+| **Extended** | 可选高保真与外部能力 | Poppler 光栅、pdftocairo SVG、OpenJPEG JPX、jbig2dec JBIG2、外部颜色/字体 provider |
+
+Profile 是发布承诺和依赖边界，不是不同的解析器。`pdf.CapabilitiesFor` 和 `pdf capabilities -profile core|preview|extended` 可查询静态能力表。
+
+### 明确边界
+
+go-pdf v0.5.0 **不承诺**：
+
+- PDF 写入、页面编辑、表单填写保存
+- 数字签名生成/验证
+- 打印色彩、PDF/X、专色/叠印
+- Adobe/Poppler 像素级一致
+- FreeType 级字体 hinting
+- OCR、PDF/A 认证、无障碍认证
+- 自研完整 JBIG2/JPX、CFF/Type1、完整 shaping
+
+这些能力需要其他引擎、单独产品线或新的 ADR。缺失能力不会伪造结果：返回 `ErrUnsupported`、记录诊断，或明确标记为近似。
+
+### 质量定位
+
+Preview 目标是“屏幕上看对、缺失内容可解释”，不是“和 Adobe 完全一样”。
+
+当前 v0.5.0 基线：
+
+- 全量 10,866 页语料：**0 render_error**
+- 英文文本位置抽样：词框边缘误差 **P95 0.012 pt**
+- CI 覆盖 Linux/macOS/Windows、race、vet、staticcheck、govulncheck、fuzz
+- 静态 stripped 二进制约 **13.1 MB**
+- Core/Preview/Extended 质量边界见 [docs/perf/p4-baseline.md](docs/perf/p4-baseline.md)
+
+---
+
+## 技术架构
+
+```text
+                        ┌──────────────────────────────┐
+                        │        Application           │
+                        │  Go service / CLI / worker   │
+                        └──────────────┬───────────────┘
+                                       │
+             ┌─────────────────────────┴─────────────────────────┐
+             │                                                   │
+      ┌──────▼──────┐                                    ┌───────▼───────┐
+      │  pdf core   │                                    │ render         │
+      │ Open/Page   │                                    │ Preview / tiles│
+      │ Text/Tables │                                    │ Raster         │
+      │ Preflight   │                                    └───────┬───────┘
+      └──────┬──────┘                                            │
+             │                                                   │
+      ┌──────▼──────────────┐                            ┌───────▼────────┐
+      │ internal/syntax     │                            │ displaylist IR │
+      │ filter / xref       │                            │ Version 2.0    │
+      │ crypt / document    │                            └───────┬────────┘
+      └──────┬──────────────┘                                    │
+             │                                                   │
+      ┌──────▼───────────────────────────────────────────────────▼───────┐
+      │ content interpreter: graphics state, paths, images, fonts,      │
+      │ color, shading, patterns, transparency, text                    │
+      └──────┬──────────────────────────────────────────────────────────┘
+             │
+      ┌──────▼──────────────────────────────────────────────┐
+      │ text/            font/            color/            │
+      │ chars/words      sfnt/CMap        ICC/sRGB          │
+      └─────────────────────────────────────────────────────┘
+
+      Optional Extended adapters (out of process):
+      extension/poppler  extension/cairo  extension/openjpeg  extension/jbig2
+```
+
+### 数据流
+
+```text
+bytes / ReaderAt
+  → syntax + filters + xref
+  → document/page tree
+  → content interpreter
+  → displaylist
+      ├→ text extraction / selection / tables / structure
+      ├→ preflight / diagnostics
+      └→ render (whole page, region, tiles, streaming pages)
+```
+
+### 设计约束
+
+- Core 只使用 Go 标准库和 `golang.org/x/*`。
+- Core 默认 `CGO_ENABLED=0`，不链接 Poppler、OpenJPEG、FreeType、lcms2。
+- Extended 通过独立进程、CGO/build tag 或显式 provider 接入，不进入 Core 默认依赖。
+- 错误不包含文档正文、元数据值或流内容。
+- 近似渲染必须可诊断，不允许静默缺图/缺字。
+- `displaylist.Version` 当前为 **2.0**，只保证增字段的 Minor 兼容。
+
+---
+
+## 功能特性
+
+### 解析与安全
+
+- 经典 xref、xref stream、object stream、增量更新、混合引用、损坏修复
 - Flate、LZW、ASCII85、ASCIIHex、RunLength、Predictor
-- 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit` 页面空间
-- 内容流解释：图形状态、路径、裁剪、基础颜色、文本状态
-- 简单字体与标准 14 字体宽度、WinAnsi/StandardEncoding、简单字体 `/ToUnicode`
-- Type0/CIDFont + Identity-H/V、ToUnicode CMap、CID `/W`/`/DW` 宽度
-- 预定义 CMap：简体中文 `UniGB`/`GBK`/`GB-EUC`、Big5 `UniCNS`/`B5`/`B5pc`/`ETen`、日文 `UniJIS`/`90ms-RKSJ`/`90msp-RKSJ`/`90pv-RKSJ`/`EUC`/`H`、韩文 `UniKS`/`KSCms-UHC`/`KSC-EUC`/`KSCpc-EUC`/`KSC-Johab`（H/V）
-- 嵌入 CMap 流与 `usecmap` 继承、1/2/4 字节 codespace、CID/Unicode 映射
-- 间接 `/Resources /Font`、`WMode`、`W2`/`DW2` 竖排宽度与位置
-- Type3 `CharProcs` 字形路径、`FlagFromType3`、`FontMatrix` 字宽与 ToUnicode
-- `x/image/font/sfnt` 字体度量、`FontMetrics.Advances`、`CIDToGIDMap` 与文档级字体缓存
-- 嵌入 TrueType/OpenType 字形轮廓读取（1/1000 文本空间，Y 向上，二次曲线转三次），覆盖 CIDToGID 映射
-- Form XObject 展开：`Matrix`、`BBox` 裁剪、资源继承、递归/循环与深度预算
-- Image XObject 与内联图像：`ImageRef.Raw/Decode`、DeviceGray/RGB/CMYK、1/2/4/8/16 bpc、Decode 数组、ImageMask、DCT/JPEG、CCITT G3 1-D/G4
-- JBIG2/JPX 通过不可变 `DecoderFactory` Registry 注入；`pdf.NewEngine` 可跨文档复用配置，不再提供进程级全局注册
-- Standard security R2-R6：RC4-40/128、AES-128、AES-256；`WithPassword` 支持用户/所有者密码与 SASLprep 归一化
-- ExtGState 常量透明度 `ca`/`CA`、混合模式记录、线宽/端点/连接/虚线状态
-- 颜色空间：CalGray/CalRGB/Lab、ICCBased matrix/TRC（RGB/Gray）、LUT8/LUT16/mAB CLUT（CMYK→Lab/XYZ）到 sRGB、Indexed、Separation/DeviceN；PDF Function 类型 0/2/3/4
-- 轴向/径向渐变：`ShadingType 2/3`、64 色标采样、`Extend`、CTM 变换与裁剪
-- 可选内容可见性：`/OCProperties` 的 `BaseState`/`ON`/`OFF`、`BDC /OC`、OCMD `/P`/`/VE` 与 `WithHiddenLayers`；OCG 名称写入 `Common.Layer`
-- Tiling 图案；mesh shading 支持 type 4–7 顶点/patch 与 Function 颜色，流大小受预算限制，超限记录诊断
-- `render.RenderPage` 按 CropBox、旋转和 UserUnit 后的页面空间整页渲染；`EncodePNG`/`EncodeJPEG` 输出图像
-- `render.RenderRegion` 区域渲染：路径填充/EvenOdd、虚线、butt/round/projecting 端点与 miter/bevel/round 连接、ImageMask 模板、彩色/未着色 Tiling 图案基础平铺、type 4–7 mesh/function shading、Alpha/Luminosity 软蒙版（含 /BC backdrop）、透明组离屏合成（保留 BlendColorSpace、Backdrop；隔离/非隔离组按 sRGB 扁平化，DeviceGray 混合空间仍可生效；knockout 组按元素独立合成，非隔离组元素以当前 backdrop 为初始背景）、图像与色键遮罩、裁剪、常量 alpha、16 种混合模式、轴向/径向渐变、嵌入字体轮廓文字；DPI 默认 220、上限 300；`PageOptions.MinStrokeWidth` 控制最小设备像素线宽（默认 1px，负值关闭非零线宽下限）；`IncludeText` 默认使用本机系统字体，再回退到内置 Go sans/mono bold/italic；也可通过 `render.FontProvider`/`render.ChainFonts` 显式指定以保证主机无关输出
-- 图像解码失败（如未注册 JBIG2/JPX）在区域渲染中显式返回 `ErrUnsupported`，禁止静默缺图
-- ImageMask、色键 Mask、SMask 关联输出；`Page.Images` 与 `Page.Fonts` 清单
-- 显示列表 `Version 2.0`；`PaintState` 保留填充/描边 alpha，`TextSpan` 用字形区间映射 ActualText；路径形状提示、`Source` 操作符追溯、相对几何 `Sig` 与 `Page.Scanned`
-- `Page.Walk` / `Page.DisplayList` 输出文字、路径、图像与裁剪
-- `Page.Text` 与公共 `text` 包提供字符、词、行、块与 ActualText 文本索引；按行段/列检测输出阅读顺序，支持 tagged-PDF `StructOrder`、纯/mixed RTL 行逻辑序和 NFC/NFKC 正规化，`Page.Columns`、`Page.Blocks`、`Line.Column`、`Line.Block`、`Line.Direction` 可查询结构；`Page.Select` 提供文本范围、逐行高亮 quads 与字符映射；`Char.Rotation`/`Char.Quad` 保留旋转文字方向与定向包围盒；90°/270° 文本按旋转基线分行；竖排默认从右到左分列，可用 `Options.VerticalOrder` 切换；竖排字符带 90° Rotation 与纵向 Quad；Selection/Hit 同时返回 `CharQuads`
-- `Page.Links` 解析 Link 注释的矩形、URI、直接/命名 GoTo 目标；`displaylist.Page.Links` 同步填充
-- `Document.Outlines` 解析大纲树的标题、页目标、URI 与子节点
-- `Page.Annotations` 解析通用注释与 Widget 的 Rect、Subtype、Contents、URI、目标页、字段名/值/类型
-- 注释 `/AP /N` 外观流展开到 `AnnotationAppearance`；`RenderRegion` 可用 `Annotations: AnnotationView` 叠加，并按 Invisible/Hidden/NoView 标志过滤
-- `Document.FormFields` 解析 AcroForm 字段树、继承类型、值、Flags、页面与 Widget Rect
-- `Document.StructureTree` 解析轻量 Tagged PDF 结构树、角色、标题、页面与 MCID
-- `Document.Attachments` 解析 EmbeddedFiles 名称树并读取嵌入文件
-- Core/Preview/Extended 产品档位（ADR-0012）；`pdf.CapabilitiesFor` 与 `pdf capabilities -profile` 输出分档能力清单
-- `pdf.Capabilities()` 输出 Preview 静态功能支持/近似/外部/不支持清单
-- 标记内容 `BDC` 的 `/MCID` 写入显示项 `Common.MCID`；`DisplayList` 按结构树回填 `StructRef`；结构元素保留 Type/RawType、Title/Alt/ActualText/Lang/ID、Classes、RoleMap/ClassMap 映射、`/A` 属性树与类属性；提供 `Attribute`、`BBox`、`ColSpan`、`RowSpan`、`Scope`、`Placement`、`ListNumbering` 访问器与 `AsTable` / `Page.Tables` / `Document.Tables` 轻量表格视图（行列位置、span、HeaderRefs、段落、嵌套表格、跨页同 ID 合并、`TablesMerged` 启发式合并、重复表头去重与 span 诊断）
-- `Page.Label` / `Document.PageLabel` 解析 `/PageLabels` 的十进制、罗马数字、字母与前缀
-- `Document.Preflight` / `PreflightWithOptions` 按 Parse/Extract/Render 报告状态与 Outcome，支持页选择、受限 workers 和稳定 JSON 输出
-- `extension/poppler` 通过独立进程调用 pdftoppm，作为可选 Extended 高保真渲染后端；支持 `RenderPage`、连续页 `RenderEach` 与任意页集 `RenderPages`，不链接 GPL 代码
-- `extension/cairo` 通过独立进程调用 pdftocairo 输出单页 SVG，作为可选 Extended 矢量输出
-- `extension/openjpeg` 通过独立进程调用 opj_decompress 解码 JPX，注册为可选图像 provider
-- `extension/jbig2` 通过独立进程调用 jbig2dec 解码 JBIG2，注册为可选图像 provider
-- `extension/poppler`/`cairo`/`openjpeg`/`jbig2` 均提供 `ProviderInfo`/`Features`，外部进程输出、超时和临时目录受控
-- `pdf.WithExtensionRegistry` 接入 `extension.Registry` 图像 provider；`DecodeSamples` 保留源样本，`Decode` 兼容为 image.Image；与旧 `DecoderRegistry` 重复配置返回参数错误
-- `displaylist.FontInfo.Source` 暴露嵌入字体程序，`Paint.Profile` 保留 ICCBased 原始 profile；`render.Options.FontEngine` 可消费字体 provider
-- 活跃文件内存预算 `MaxLiveBytes`；`Document.ResourceUsage` 输出 Live/Peak/Decoded/Objects
-- 统一预算、诊断、`*pdf.Error`、`render.Renderer`/Profile/Capabilities、图像质量指标/阈值门禁与 `displaylist.Version 2.0`
-- `Attachment.WriteTo` 将嵌入文件直接解码到调用方 writer，避免先聚合成完整 `[]byte`
-- `Document.ExtractText` 批量提取：页选择、受限 workers、逐页错误、失败页列表/诊断码、JSONL CLI
-- `Document.ExtractTextEach` 流式回调提取：不保留全部页文本，回调串行、完成顺序输出，结束时返回 `Processed/Succeeded/Failed/FailedPages/Failures` 汇总
-- `Document.PreflightWithOptions` 批量预检：页选择、受限 workers、并发扫描
+- Standard security R2–R6：RC4-40/128、AES-128、AES-256
+- 用户/所有者密码、SASLprep、加密边界
+- `ReaderAt` 输入；`*os.File` 优先 mmap；大于阈值自动 spool 到临时文件
+- 文件、对象、流、解码总量、嵌套、操作符、路径、图像像素、栅格和活跃内存预算
 
-预定义 CMap 中少数多字符 Unicode 目标（当前 1,878 条兼容序列）未展开；变体选择符归并到首字符。
+### 文档语义
 
-不在 Core/Preview 范围：CCITT G3 2-D/无 EOL、自研 JBIG2/JPX（G3 2-D 与 JBIG2/JPX 可通过 Registry 注入）、CFF/Type1、精确 knockout、写入、签名、打印色彩与矢量输出。缺失能力写诊断或返回 `ErrUnsupported`，不会伪造结果。
+- 页面树、继承属性、`CropBox`/`Rotate`/`UserUnit`
+- 链接、大纲、页标签
+- 注释/Widget 元数据与 AP 渲染
+- AcroForm 字段树、值、Flags、页面与 Widget Rect
+- Tagged PDF 结构树、RoleMap/ClassMap、MCID/StructRef
+- 表格视图：行列、span、HeaderRefs、段落、嵌套表、跨页合并、启发式合并
+- 附件列表与流式写入
+- XMP 核心属性
+- 预检：Parse/Extract/Render 状态、失败页、诊断码
 
-## 使用
+### 文本
+
+- 简单字体、Type0/CID、Identity-H/V、Type3、嵌入 TrueType/OpenType
+- 预定义 CJK CMap 与嵌入 CMap、1/2/4 字节 codespace
+- ToUnicode、ActualText、NFC/NFKC
+- 字符、词、行、块、列感知阅读顺序
+- RTL/mixed、90°/270° 旋转、竖排 RTL/LTR
+- `Char.Origin/Advance/Bounds/Rotation/Quad`
+- 选区/highlight quads、搜索命中与 `CharQuads`
+- 文本位置以 `Glyph.Matrix`、CTM 缩放和 `FontInfo.Ascent/Descent` 计算
+
+### Preview 渲染
+
+- 路径填充/描边、EvenOdd、虚线、cap/join、裁剪
+- 图像、ImageMask、色键 Mask、SMask
+- CalGray/CalRGB/Lab、ICCBased、Indexed、Separation/DeviceN
+- 轴向/径向渐变、function shading
+- tiling pattern、shading pattern、type 4–7 mesh + Function
+- 透明组、soft mask、backdrop、knockout、16 种混合模式
+- OCG/OCMD 可见性
+- 整页、区域、固定/自适应 tile、页级流式渲染
+- 输出 PNG/JPEG，支持透明背景
+- `MinStrokeWidth` 显式控制最小设备像素线宽（默认 1px）
+
+### Server 与 CLI
+
+- `Document.ExtractText`：有界并发、逐页错误、失败页汇总
+- `Document.ExtractTextEach`：流式回调，不保留全部页文本
+- `Document.PreflightWithOptions`：批量预检
+- `render.RenderPagesEach`：有界并发、按页释放栅格
+- `render.RenderTiles` / `RenderPageTiles`：tile 流式输出
+- CLI：`info`、`text`、`search`、`render`、`svg`、`links`、`annotations`、`outlines`、`labels`、`forms`、`tables`、`attachments`、`preflight`、`capabilities`、`compare`
+
+### Extended
+
+- `extension/poppler`：pdftoppm 高保真光栅
+- `extension/cairo`：pdftocairo SVG
+- `extension/openjpeg`：opj_decompress JPX
+- `extension/jbig2`：jbig2dec JBIG2
+- `extension.Registry`：image/color/font provider
+- 所有进程 adapter 有输出上限、超时、临时目录清理、错误截断、版本/许可/确定性报告
+- Core 不导入具体 provider；`scripts/check-core-deps.sh` 强制检查
+
+---
+
+## 快速开始
+
+要求 Go 1.25+；发布构建建议 Go 1.26.10+。
+
+### 打开文档
 
 ```go
-doc, err := pdf.OpenFile(ctx, "in.pdf") // Unix 上优先 mmap，Close 释放映射
-// pdf.Open(ctx, file, size) 在 reader 为 *os.File 时同样使用 mmap
+doc, err := pdf.OpenFile(ctx, "in.pdf") // Unix 优先 mmap
 if err != nil {
     return err
 }
 defer doc.Close()
 
-n := doc.NumPages()
-pg, err := doc.Page(0)
+page, err := doc.Page(0)
 if err != nil {
     return err
 }
-w, h := pg.Size()
-_ = w
-_ = h
+w, h := page.Size()
+_, _ = w, h
 ```
 
 内存输入：
 
 ```go
-doc, err := pdf.Open(ctx, readerAt, size)
+doc, err := pdf.Open(ctx, readerAt, size, pdf.WithPassword("secret"))
 ```
 
-区域渲染：
+### 提取文本
 
 ```go
-img, err := render.RenderRegion(ctx, pg, displaylist.Rect{X1: 300, Y1: 200}, render.PageOptions{
-    DPI: 220, Background: "white", IncludeText: true, Memory: pg,
+pageText, err := page.Text(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(pageText.Text)
+
+for _, ch := range pageText.Chars {
+    fmt.Println(ch.Text, ch.Origin.X, ch.Origin.Y, ch.Bounds)
+}
+```
+
+批量提取：
+
+```go
+result, err := doc.ExtractText(ctx, pdf.ExtractOptions{
+    Workers: 4,
 })
 ```
 
-系统字体回退默认启用：`IncludeText` 未指定 `Fonts` 时使用本机系统字体，
-再回退到内置 Go 字体。需要主机无关输出或自定义目录时显式设置：
+### 预检
+
+```go
+report, err := doc.PreflightWithOptions(ctx, pdf.PreflightOptions{
+    Workers: 4,
+})
+fmt.Println(report.Pages, report.Failed, report.FailedPages)
+```
+
+### 区域渲染
+
+```go
+img, err := render.RenderRegion(ctx, page, displaylist.Rect{
+    X1: 300, Y1: 200,
+}, render.PageOptions{
+    DPI:         220,
+    Background:  "white",
+    IncludeText: true,
+    Memory:      page,
+})
+```
+
+需要显式管理输出栅格生命周期时使用 `RenderRegionLease` / `RenderPageLease`，并调用 `Release`。
+
+### CLI
+
+```bash
+CGO_ENABLED=0 go build -o pdf ./cmd/pdf
+
+./pdf info -json in.pdf
+./pdf text -page 1 in.pdf
+./pdf text -jsonl in.pdf
+./pdf search "invoice" in.pdf
+./pdf render -page 1 -dpi 150 -o page.png in.pdf
+./pdf preflight in.pdf
+./pdf capabilities -profile core
+```
+
+---
+
+## 部署配置
+
+### 构建静态二进制
+
+```bash
+GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0 \
+  go build -trimpath -ldflags="-s -w" -o pdf ./cmd/pdf
+```
+
+Linux amd64 静态 stripped 二进制约 **13.1 MB**。
+
+发布构建可输出到 `dist/`（已忽略）；按目标 OS/Arch 交叉编译并记录 SHA256。
+
+### 运行时预算
+
+`pdf.Budget` 默认值：
+
+| 配置 | 默认值 | 说明 |
+|---|---:|---|
+| `MaxFileSize` | 512 MiB | 输入文件上限 |
+| `MaxObjects` | 5,000,000 | 对象数量上限 |
+| `MaxStreamBytes` | 256 MiB | 单流解码上限 |
+| `MaxTotalDecoded` | 2 GiB | 单文档累计解码上限 |
+| `MaxInflateRatio` | 200 | 压缩比上限 |
+| `MaxXRefChain` | 256 | xref 链长度 |
+| `MaxPageTreeDepth` | 64 | 页面树深度 |
+| `MaxFormDepth` | 16 | Form XObject 嵌套 |
+| `MaxNestingDepth` | 64 | 内容/对象嵌套 |
+| `MaxOperators` | 20,000,000 | 单页操作符上限 |
+| `MaxPathSegments` | 5,000,000 | 单页路径段上限 |
+| `MaxImagePixels` | 256,000,000 | 图像像素上限 |
+| `MaxFunctionSteps` | 100,000 | Function 计算步数 |
+| `MaxConcurrency` | GOMAXPROCS | 默认并发上限 |
+| `MaxRasterPixels` | 64,000,000 | 单次栅格像素上限 |
+| `MaxLiveBytes` | 1 GiB | 活跃内存上限 |
+
+按业务调整：
+
+```go
+b := pdf.DefaultBudget
+b.MaxFileSize = 128 << 20
+b.MaxLiveBytes = 512 << 20
+b.MaxConcurrency = 4
+
+doc, err := pdf.OpenFile(ctx, path, pdf.WithBudget(&b))
+```
+
+### 打开选项
+
+| 选项 | 作用 |
+|---|---|
+| `WithRepair(bool)` | 启用/关闭损坏修复 |
+| `WithBudget(*Budget)` | 资源预算 |
+| `WithPassword(string)` | R2–R6 密码 |
+| `WithHiddenLayers(bool)` | 是否包含隐藏 OCG |
+| `WithPreserveForms(bool)` | 保留透明 Form group |
+| `WithColorManager(ColorManager)` | 外部 ICC/CMYK 转换 |
+| `WithExtensionRegistry(*extension.Registry)` | 图像等 provider |
+
+### 渲染选项
+
+| `PageOptions` | 说明 |
+|---|---|
+| `DPI` | 默认 220，上限 300 |
+| `MaxPixels` | 默认 64,000,000 |
+| `Background` | `"white"` 或 `"transparent"` |
+| `IncludeText` | 默认关闭；开启后渲染字体轮廓 |
+| `Fonts` | 显式字体 provider，保证主机无关 |
+| `FontEngine` | 外部字体 provider |
+| `Annotations` | 注释 AP 叠加策略 |
+| `Memory` | 页级/自定义内存预算 |
+| `MinStrokeWidth` | 最小设备像素线宽；默认 1px，负值关闭非零线宽下限 |
+
+可复现生产输出必须显式配置字体，例如：
+
+```go
+opts := render.PageOptions{
+    DPI:         150,
+    IncludeText: true,
+    Fonts:       render.BuiltinFonts(), // 或固定字体目录
+}
+```
+
+`IncludeText` 未设置 `Fonts` 时默认使用主机系统字体，结果依赖主机环境。
+
+固定字体目录：
 
 ```go
 sys, err := render.SystemFonts("/opt/fonts", "/srv/fonts")
@@ -108,121 +383,111 @@ if err == nil {
 }
 ```
 
-`SystemFonts()` 扫描平台 TTF/OTF/TTC/OTC，按 Family/Style 匹配；CJK 字符优先尝试 CJK 字体，并按 SC/TC/JP/KR locale 与字符脚本排序，缺字时继续尝试后续候选；`ChainFonts` 可再接 CJK 或业务字体 provider。没有 Unicode cmap 的简单嵌入字体子集会被拒绝用于轮廓，自动进入回退。
+### 服务端部署建议
 
-生产颜色扩展：
+1. 每个请求设置 context 超时，所有 Open/Extract/Render 都传入该 context。
+2. 为不可信上传设置较小的 `MaxFileSize`、`MaxLiveBytes`、`MaxConcurrency`。
+3. 批量提取使用 `ExtractText` 或 `ExtractTextEach`，不要无界 goroutine。
+4. 整册预览使用 `RenderPagesEach` 或 tiles，避免整本文档栅格驻留。
+5. 生产字体固定，不要依赖主机系统字体。
+6. Preview 只用于屏幕预览；打印/高保真走 Poppler Extended。
+7. Extended 进程放在受控子进程/容器中，设置超时、临时目录和输出上限。
+8. 监控 `Unsupported`、`Approximate`、失败页和 render error，不要只看平均 PSNR。
+
+### Extended provider 示例
 
 ```go
-engine, _ := registry.ColorEngine("lcms")
-cm := pdf.NewColorManagerFromEngine(engine)
-defer cm.(interface{ Close() error }).Close()
-doc, err := pdf.Open(ctx, readerAt, size, pdf.WithColorManager(cm))
+r, err := poppler.New("")
+if err != nil {
+    return err
+}
+img, err := r.RenderPage(ctx, "in.pdf", 0)
 ```
 
-`ColorEngine` 的 transform 按源空间/profile 缓存，目标为 DeviceRGB/sRGB；Indexed、Separation、DeviceN 会使用同一颜色管理路径。
+或者通过 `extension.Registry` 注册 JPX/JBIG2 图像 provider，再用 `pdf.WithExtensionRegistry` 传入文档。
 
-可用选项：`WithRepair`、`WithBudget`、`WithPassword`（Standard R2-R6）、`WithHiddenLayers`（是否包含隐藏图层）、`WithPreserveForms`（保留 Form XObject 透明组）、`WithColorManager`（DeviceCMYK/ICCBased 外部转换）、`WithExtensionRegistry`（显式注册扩展 provider；源样本路径保留 plane，`Decode` 兼容路径适配到 image.Image）。
+---
 
-`Open` 对 `*os.File` 使用 mmap；其他 `ReaderAt` 小于 8 MiB 直接读取，大于阈值以 1 MiB 块写入临时文件后映射，避免按文件大小增长 Go heap；分块复制响应 context 取消。渲染默认使用页面所属文档的活跃内存预算；`render.PageOptions.Memory` 可覆盖为其他 `MemoryBudget`。路径/文字/透明组/软蒙版/clip mask、图像解码结果、输出栅格、字体缓存与图案/软蒙版缓存都会计费。`render.RenderPageLease` 返回需 `Release` 的 `Raster`；`render.RenderPages` 保留请求顺序并返回全部栅格；`render.RenderPagesEach` 提供有界并发流式回调，回调结束即释放页面栅格，适合服务端避免整册驻留；`render.RenderTiles`/`RenderPageTiles` 以固定像素块流式输出并复用同一份页面显示列表，单块租约在回调返回后释放；`render.PlanTiles`/`PlanTilesAdaptive` 预计算网格；`RenderTilesTo`/`RenderPageTilesTo` 可直接组装到调用方画布。
+## 质量与发布
 
-## 构建与测试
+本仓库固定四层质量边界：
 
-构建需要 Go 1.25+。
+| 层 | 基准 |
+|---|---|
+| Core | `docs/perf/p1-baseline.md` |
+| Preview | `docs/perf/p2-baseline.md`、`docs/perf/poppler-corpus-baseline.md` |
+| Extended | `docs/perf/p3-baseline.md` |
+| 发布 | `docs/perf/p4-baseline.md`、`docs/release.md` |
+
+常用检查：
 
 ```bash
-CGO_ENABLED=0 go build ./...
-go vet ./...
+go test ./...
+CGO_ENABLED=0 go test ./...
 go test -race ./...
-go test ./... -run=^$ -bench=. -benchmem
-./scripts/bench-server.sh
-go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=30s
-POPPLER_QUALITY=1 go test ./render -run TestPopplerReferenceQuality -v
-POPPLER_CORPUS=1 go test ./render -run TestPopplerCorpusQuality -v -timeout 20m
-POPPLER_CORPUS=1 POPPLER_CORPUS_PAGES=0 \
-  POPPLER_CORPUS_REPORT=/tmp/poppler-corpus.csv \
-  go test ./render -run TestPopplerCorpusQuality -v -timeout 24h
+go vet ./...
+staticcheck ./...
+./scripts/check-core-deps.sh
+./scripts/check-licenses.sh
+./scripts/verify.sh
+PERF_GATE=1 ./scripts/release-check.sh
 ```
 
-全量分片执行：
+跨引擎与语料：
 
 ```bash
+./scripts/cross-engine.sh in.pdf 1
+./scripts/fetch-english-corpus.sh /tmp/english-corpus
+./scripts/english-text-position.sh /tmp/english-corpus
 POPPLER_CORPUS_SHARDS=16 ./scripts/corpus-poppler-full.sh
 ```
 
-脚本只构建一次测试二进制，按页块动态调度，默认使用 16 个 worker，
-Poppler 输出 PPM，合并为 `/tmp/poppler-corpus/poppler-corpus.csv`。
+Poppler 像素全等不是发布门禁；语义正确性、显式诊断、资源边界和可复现性优先。
 
-可调参数：
+---
 
-- `POPPLER_CORPUS_SHARDS`：并行 worker 数，默认 16。
-- `POPPLER_CORPUS_CHUNK_PAGES`：每个任务的页数，默认 128。
-- `POPPLER_CORPUS_CHUNK`：单次 pdftoppm 批量页数，默认 32。
-- `POPPLER_CORPUS_FORMAT=ppm|png`：默认 ppm。
-- `POPPLER_CORPUS_REF_CACHE=/path`：缓存 Poppler 参考图，供重复回归。
-- `POPPLER_CORPUS_FONT_DIR=/path1:/path2`：固定字体目录；默认使用 `render.BuiltinFonts()`。
-- `POPPLER_CORPUS_SYSTEM_FONTS=1`：使用主机字体，报告标记 host-dependent。
-- `POPPLER_CORPUS_SAMPLE_CHUNKS=N`：每 N 个页块抽 1 个。
-- `POPPLER_CORPUS_PAGE_START/PAGE_END`：限定页范围，便于单页排查。
+## 已知限制
 
-`TestPopplerReferenceQuality` 和 `TestPopplerCorpusQuality` 需要本机
-`pdftoppm`，并分别由 `POPPLER_QUALITY=1`、`POPPLER_CORPUS=1` 显式启用；
-默认 CI 不依赖 Poppler。`POPPLER_CORPUS_PAGES=0` 表示全部页面，
-`POPPLER_CORPUS_REPORT` 输出逐页 CSV；报告可能包含本地文件名，不应提交。
-语料基线与指标分层见 `docs/perf/poppler-corpus-baseline.md`、`docs/perf/quality-layers.md`。
+- 无 PDF 写入、页面编辑、表单保存、数字签名。
+- 无打印色彩/PDF-X/专色/叠印。
+- 无内置 JBIG2/JPX/G3 2-D；通过 Extended provider 或 Unsupported 处理。
+- 无完整 CFF/Type1、完整 shaping、FreeType hinting。
+- 无 OCR、PDF/A 认证、无障碍认证。
+- Preview 不是 Adobe/Poppler 像素级替代品。
+- 默认系统字体会导致跨主机差异；可复现输出请使用固定字体。
+- v0.5.0 仍是 pre-1.0；公共 API 和 `displaylist` 尚未承诺长期稳定。
 
-依赖白名单检查：
-
-```bash
-./scripts/check-deps.sh
-```
-
-本地私有语料放在 `docs/pdf/`（已被 `.gitignore` 排除，不会提交）。存在时运行：
-
-```bash
-go test -run TestLocalCorpus -v -timeout 20m
-```
-
-该测试会打开目录内全部 PDF、遍历页面并汇总加密/损坏/预算等分类；CI 中目录不存在时自动跳过。
+---
 
 ## 目录
 
 ```text
-pdf.go document/page/options/errors   公共 API
-displaylist/                          显示列表契约
-render/                               区域渲染公共 API
-text/                                 字符/词/行文本索引
-extension/                            可选 provider 接口、不可变注册表与 legacy 适配器
-extension/poppler/                   可选 Extended pdftoppm 进程后端
-extension/cairo/                     可选 Extended pdftocairo SVG 进程后端
-extension/openjpeg/                  可选 Extended opj_decompress JPX provider
-extension/jbig2/                     可选 Extended jbig2dec JBIG2 provider
-cmd/pdf/                              CLI（info[-json]/text/search[-jsonl]/render/svg/links[-jsonl]/annotations[-jsonl]/outlines[-json]/labels[-json]/forms[-json]/tables[-jsonl,-json]/attachments[-json,-extract]/preflight）
+pdf.go / document / page / options   公共 API
+displaylist/                          显示列表契约（Version 2.0）
+render/                               屏幕渲染 API 与 tile/page 执行器
+text/                                 字符、词、行、块与选区
+extension/                            可选 provider 接口与注册表
+extension/poppler/                    pdftoppm 高保真光栅
+extension/cairo/                      pdftocairo SVG
+extension/openjpeg/                   opj_decompress JPX
+extension/jbig2/                      jbig2dec JBIG2
+cmd/pdf/                              CLI
 internal/syntax/                      词法、对象、xref、重建
 internal/filter/                      过滤器与 Predictor
-internal/doc/                         页面树、页面空间、元数据
-internal/font/                        字体、CMap、字宽（data/ 为嵌入映射）
+internal/doc/                         页面树、页面空间、文档语义
+internal/font/                        字体、CMap、字宽、轮廓
+internal/color/                       ICC、色彩空间、sRGB
+internal/content/                     内容流解释器
 internal/budget/                      资源预算
-internal/diag/                        诊断收集
-internal/testkit/                     测试 PDF 构造工具
-testdata/                             语料与金样
+internal/diag/                        诊断
+testdata/                             合成语料与金样
+scripts/                              质量、发布、语料工具
 ```
 
-## 性能基线
-
-批量文本一致性可用 `CORPUS_CONSISTENCY=1 go test . -run TestLocalCorpusBatchConsistency` 在本地语料上校验。Server Core 批量提取/预检基线见
-[`docs/perf/server-core-baseline.md`](docs/perf/server-core-baseline.md)。Poppler 24.02 的本机实测体积、RSS、吞吐与输出体积见
-[`docs/perf/poppler-24.02-baseline.md`](docs/perf/poppler-24.02-baseline.md)。该基线用于同机同语料对比，
-不是通用厂商基准。
-
-## 设计约束
-
-- 仅标准库与 `golang.org/x/*`；新增依赖必须走 ADR 与许可审计。
-- 当前外部依赖：`golang.org/x/image`（sfnt 度量）、`golang.org/x/text`（SASLprep/NFKC 与 sfnt 传递），见 ADR-0003、ADR-0009。
-- 普通错误以 `error` 返回，不向调用方传播 panic。
-- 默认严格模式；重建必须显式开启并记录诊断。
-- 诊断与错误信息不包含文档正文。
-- 公共入口暴露根包、`displaylist`、`render`、`text` 与 `extension` 的稳定类型。
+---
 
 ## 许可
 
-Apache-2.0。第三方依赖、内嵌资源与语料许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+Apache-2.0。第三方依赖、内嵌资源和语料许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+发布与支持边界见 [docs/release.md](docs/release.md)。
