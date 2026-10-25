@@ -128,20 +128,28 @@ jobs:
         with:
           go-version: "1.26.x"
       - name: Fuzz
+        shell: bash
         run: |
-          set -e
-          go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s -parallel=4
-          go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s -parallel=4
-          go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime=20s -parallel=4
-          go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s -parallel=4
-          go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s -parallel=4
-          go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime=20s -parallel=4
-          go test ./internal/font -run=^$ -fuzz=FuzzParseToUnicode -fuzztime=20s -parallel=4
-          go test ./internal/font -run=^$ -fuzz=FuzzPredefinedSplit -fuzztime=20s -parallel=4
-          go test ./internal/font -run=^$ -fuzz=FuzzParseEmbeddedCMap -fuzztime=20s -parallel=4
-          go test ./internal/font -run=^$ -fuzz=FuzzSFNTRepair -fuzztime=20s -parallel=4
-          go test ./internal/image -run=^$ -fuzz=FuzzImageDecode -fuzztime=20s -parallel=4
-          go test ./internal/function -run=^$ -fuzz=FuzzPostScript -fuzztime=20s -parallel=4
+          set -euo pipefail
+          log=/tmp/go-pdf-fuzz.log
+          : > "$log"
+          trap 'status=$?; if [ $status -ne 0 ]; then tail -40 "$log" | while IFS= read -r line; do echo "::error title=Fuzz failure::$line"; done; fi' EXIT
+          run_fuzz() {
+            echo "=== $*" | tee -a "$log"
+            "$@" 2>&1 | tee -a "$log"
+          }
+          run_fuzz go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime=20s -parallel=4
+          run_fuzz go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzParseToUnicode -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzPredefinedSplit -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzParseEmbeddedCMap -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzSFNTRepair -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/image -run=^$ -fuzz=FuzzImageDecode -fuzztime=20s -parallel=4
+          run_fuzz go test ./internal/function -run=^$ -fuzz=FuzzPostScript -fuzztime=20s -parallel=4
       - name: Upload fuzz corpus on failure
         if: failure()
         uses: actions/upload-artifact@v4
