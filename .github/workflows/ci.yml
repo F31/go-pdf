@@ -68,6 +68,9 @@ jobs:
             echo "### Log tail"
             tail -80 test-os.log || true
           } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:' test-os.log | head -10 | while IFS= read -r line; do
+            echo "::error title=Test failure::$line"
+          done
       - name: Upload test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
