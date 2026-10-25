@@ -1,6 +1,7 @@
 # P1 Core 稳定化基线
 
 日期：2026-10-25
+基线提交：`9b57b82`
 用途：记录 Core 解析/资源/批量/错误/跨平台稳定化结果；Preview 质量另见
 `docs/perf/p0-baseline.md` 与 `docs/perf/poppler-corpus-baseline.md`。
 
@@ -72,4 +73,14 @@ go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime=5s
 - P0 已加入 Linux/macOS/Windows CI；`gitattributes` 固定 golden 为 LF、PDF/字体/
   图片为 binary。
 - 新增 spool/temp 测试在 macOS/Windows 也会运行。
-- P1 完成后需等待远端 CI 全绿，作为 2.9 阶段门禁。
+- P1 远端 CI：https://github.com/F31/go-pdf/actions/runs/40165037414（10/10 success）。
+
+## P1 验收
+
+- 截断 ReaderAt 不再挂起，临时文件可清理：通过。
+- 取消错误同时匹配 `pdf.ErrCanceled` 与 `context.Canceled`：通过。
+- spool/cancel/large ReaderAt/预算/并发测试：通过。
+- 单页与批量、预检失败页一致：通过。
+- 结构树循环终止、表格重复调用一致：通过。
+- FuzzOpenFile / FuzzEncryptedOpen 冒烟：通过。
+- Linux/macOS/Windows、race、vet、staticcheck、fuzz、交叉编译：通过。
