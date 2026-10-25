@@ -4,6 +4,7 @@ set -euo pipefail
 FUZZTIME="${FUZZTIME:-10s}"
 echo "== build (CGO_ENABLED=0) =="
 CGO_ENABLED=0 go build ./...
+CGO_ENABLED=0 go test ./...
 
 echo "== vet =="
 go vet ./...
@@ -13,6 +14,7 @@ go test -race ./...
 
 echo "== dependency whitelist =="
 ./scripts/check-deps.sh
+./scripts/check-core-deps.sh
 
 echo "== cross compile =="
 for os in linux darwin windows; do
@@ -25,6 +27,7 @@ done
 echo "== fuzz smoke ($FUZZTIME) =="
 go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime="$FUZZTIME" -parallel=4
+go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime="$FUZZTIME" -parallel=4

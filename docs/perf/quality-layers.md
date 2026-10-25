@@ -10,6 +10,7 @@ provider 差异混成一个分数。指标只用于同层、同参数、同版�
 | Core | `docs/perf/server-core-baseline.md` | `./scripts/bench-server.sh` | 打开、单页文本、批量提取、预检、页失败、文本一致性、P50/P95 | PSNR、SSIM、字体形状 |
 | Preview | `docs/perf/poppler-corpus-baseline.md`、`docs/perf/p0-baseline.md` | `POPPLER_CORPUS=1 ... go test ./render`、`scripts/corpus-poppler-full.sh` | 固定字体/DPI/背景下的语义缺口、PSNR、SSIM、ΔE、render_error | 核心提取吞吐、外部 provider 差分 |
 | Extended | 各 provider 的测试/报告（P3） | `go test ./extension/...`，真实二进制作为可选集成 | provider 名称/版本/许可/确定性、成功/失败隔离、尺寸/样本差分 | Core 总分、Poppler 像素全等 |
+| 发布 | `docs/release.md`、`docs/perf/p4-baseline.md` | `./scripts/release-check.sh`、`./scripts/perf-gate.sh` | 构建/测试/依赖/边界/体积/性能 | 未校准的跨机性能数字 |
 
 ## 报告路径约定
 
