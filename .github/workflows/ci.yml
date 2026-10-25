@@ -55,7 +55,16 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test (no cgo)
-        run: CGO_ENABLED=0 go test ./...
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -count=1 ./... 2>&1 | tee test-os.log
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-os-${{ matrix.os }}
+          path: test-os.log
+          if-no-files-found: ignore
 
   staticcheck:
     name: Staticcheck
