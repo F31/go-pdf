@@ -195,10 +195,24 @@ func imageInfo(ctx context.Context, dict syntax.Dict, inline bool, file *syntax.
 	}
 	decode, _ := numberArray(getAny(dict, "Decode", "D"), file)
 	interp, _ := boolValue(dict, "Interpolate", "I")
+	var ccitt *displaylist.CCITTParams
+	if strings.EqualFold(enc, "CCITTFaxDecode") || strings.EqualFold(enc, "CCF") {
+		p := firstParms(decodeParms(dict, file))
+		ccitt = &displaylist.CCITTParams{
+			K:                p.Int("k", 0),
+			Columns:          p.Int("columns", 0),
+			Rows:             p.Int("rows", 0),
+			BlackIsZero:      p.Bool("blackiszero", false),
+			EncodedByteAlign: p.Bool("encodedbytealign", false),
+			EndOfLine:        p.Bool("endofline", false),
+			EndOfBlock:       p.Bool("endofblock", true),
+			EndOfData:        p.Bool("endofdata", false),
+		}
+	}
 	return displaylist.ImageInfo{
 		Width: w, Height: h, BitsPerComponent: bpc, ColorSpace: cs,
 		Encoding: displaylist.ImageEncoding(enc), Decode: decode,
-		Interpolate: interp, Inline: inline,
+		Interpolate: interp, Inline: inline, CCITT: ccitt,
 	}, profile, components, nil
 }
 

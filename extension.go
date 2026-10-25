@@ -83,6 +83,13 @@ func (d extensionExternalDecoder) decodePlane(ctx context.Context, raw []byte, i
 		Interpolate:      info.Interpolate,
 		BitsPerComponent: info.BitsPerComponent,
 	}
+	if info.CCITT != nil {
+		cfg.CCITT = &extension.CCITTParams{
+			K: info.CCITT.K, Columns: info.CCITT.Columns, Rows: info.CCITT.Rows,
+			BlackIsZero: info.CCITT.BlackIsZero, EncodedByteAlign: info.CCITT.EncodedByteAlign,
+			EndOfLine: info.CCITT.EndOfLine, EndOfBlock: info.CCITT.EndOfBlock, EndOfData: info.CCITT.EndOfData,
+		}
+	}
 	decoder, err := d.factory.NewDecoder(ctx, cfg)
 	if err != nil {
 		return nil, err

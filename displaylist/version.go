@@ -9,7 +9,7 @@ type VersionInfo struct {
 
 // Version tracks the public display-list contract. Field additions increment
 // Minor; breaking changes increment Major and require an ADR.
-var Version = VersionInfo{Major: 2, Minor: 0}
+var Version = VersionInfo{Major: 2, Minor: 1}
 
 func (v VersionInfo) String() string { return fmt.Sprintf("%d.%d", v.Major, v.Minor) }
 

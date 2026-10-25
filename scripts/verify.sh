@@ -29,6 +29,7 @@ echo "== fuzz smoke ($FUZZTIME) =="
 go test ./internal/syntax -run=^$ -fuzz=FuzzParseObject -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/syntax -run=^$ -fuzz=FuzzOpenFile -fuzztime="$FUZZTIME" -parallel=4
 go test . -run=^$ -fuzz=FuzzEncryptedOpen -fuzztime="$FUZZTIME" -parallel=4
+go test ./extension/g32d -run=^$ -fuzz=FuzzCCITTG32D -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/filter -run=^$ -fuzz=FuzzDecodeFilters -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/filter -run=^$ -fuzz=FuzzPredictor -fuzztime="$FUZZTIME" -parallel=4
 go test ./internal/content -run=^$ -fuzz=FuzzContentLexer -fuzztime="$FUZZTIME" -parallel=4

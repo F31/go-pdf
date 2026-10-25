@@ -15,6 +15,18 @@ const (
 	ImageCCITTG32D ImageEncoding = "CCITTFaxDecode"
 )
 
+// CCITTParams carries CCITTFaxDecode parameters for an optional provider.
+type CCITTParams struct {
+	K                int
+	Columns          int
+	Rows             int
+	BlackIsZero      bool
+	EncodedByteAlign bool
+	EndOfLine        bool
+	EndOfBlock       bool
+	EndOfData        bool
+}
+
 // ImageConfig carries the decoded image geometry and colour metadata. Codec
 // parameters that are not relevant to a provider may be zero.
 type ImageConfig struct {
@@ -28,6 +40,7 @@ type ImageConfig struct {
 	ICCProfile       []byte
 	ImageMask        bool
 	Interpolate      bool
+	CCITT            *CCITTParams
 }
 
 // ImagePlane is an interleaved, row-major, top-down sample plane. Pix uses one

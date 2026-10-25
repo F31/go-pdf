@@ -48,7 +48,7 @@ PERF_GATE=1 ./scripts/release-check.sh   # 同机校准后
 ## 已知限制
 
 - 没有 PDF 写入、页面编辑、表单保存、数字签名、打印色彩/PDF-X。
-- 没有内置 JBIG2/JPX/G3 2-D；通过 Extended provider 或显式 Unsupported 处理。
+- 没有内置 JBIG2/JPX；G3 2-D 通过可选纯 Go `extension/g32d` 显式注册，未注册时 Unsupported。
 - 没有完整 CFF/Type1/shaping、FreeType hinting、OCR、PDF/A 认证。
 - Preview 默认系统字体会导致跨主机差异；可复现测试使用 `BuiltinFonts` 或固定字体目录。
-- `displaylist` 当前 2.0，只保证增字段的 Minor 兼容，不保证 1.0 契约。
+- `displaylist` 当前 2.1，只保证增字段的 Minor 兼容，不保证 1.0 契约。

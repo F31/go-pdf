@@ -2,7 +2,7 @@
 
 **纯 Go、无 CGO 的服务端 PDF 内核与屏幕预览引擎。**
 
-当前版本：**v0.5.0**
+当前版本：**v0.5.1**
 
 模块：`github.com/F31/go-pdf`
 
@@ -39,13 +39,13 @@ go-pdf 面向服务端文档处理，而不是桌面 PDF 阅读器或打印排�
 |---|---|---|
 | **Core** | 服务端 PDF 读取与理解 | 解析、解密、页面树、内容解释、文本、结构/表格、预检、预算与取消 |
 | **Preview** | 屏幕预览 | sRGB 路径/文字/图像、透明、软蒙版、Pattern、Mesh、区域/整页渲染 |
-| **Extended** | 可选高保真与外部能力 | Poppler 光栅、pdftocairo SVG、OpenJPEG JPX、jbig2dec JBIG2、外部颜色/字体 provider |
+| **Extended** | 可选高保真与外部能力 | Poppler 光栅、pdftocairo SVG、OpenJPEG JPX、jbig2dec JBIG2、纯 Go G3 2-D、外部颜色/字体 provider |
 
 Profile 是发布承诺和依赖边界，不是不同的解析器。`pdf.CapabilitiesFor` 和 `pdf capabilities -profile core|preview|extended` 可查询静态能力表。
 
 ### 明确边界
 
-go-pdf v0.5.0 **不承诺**：
+go-pdf v0.5.1 **不承诺**：
 
 - PDF 写入、页面编辑、表单填写保存
 - 数字签名生成/验证
@@ -61,10 +61,11 @@ go-pdf v0.5.0 **不承诺**：
 
 Preview 目标是“屏幕上看对、缺失内容可解释”，不是“和 Adobe 完全一样”。
 
-当前 v0.5.0 基线：
+当前 v0.5.1 基线：
 
 - 全量 10,866 页语料：**0 render_error**
 - 英文文本位置抽样：词框边缘误差 **P95 0.012 pt**
+- G3 2-D：可选纯 Go provider，Poppler 参考对比通过
 - CI 覆盖 Linux/macOS/Windows、race、vet、staticcheck、govulncheck、fuzz
 - 静态 stripped 二进制约 **13.1 MB**
 - Core/Preview/Extended 质量边界见 [docs/perf/p4-baseline.md](docs/perf/p4-baseline.md)
@@ -90,7 +91,7 @@ Preview 目标是“屏幕上看对、缺失内容可解释”，不是“和 Ad
              │                                                   │
       ┌──────▼──────────────┐                            ┌───────▼────────┐
       │ internal/syntax     │                            │ displaylist IR │
-      │ filter / xref       │                            │ Version 2.0    │
+      │ filter / xref       │                            │ Version 2.1    │
       │ crypt / document    │                            └───────┬────────┘
       └──────┬──────────────┘                                    │
              │                                                   │
@@ -104,8 +105,9 @@ Preview 目标是“屏幕上看对、缺失内容可解释”，不是“和 Ad
       │ chars/words      sfnt/CMap        ICC/sRGB          │
       └─────────────────────────────────────────────────────┘
 
-      Optional Extended adapters (out of process):
+      Optional Extended adapters:
       extension/poppler  extension/cairo  extension/openjpeg  extension/jbig2
+      extension/g32d (pure Go, explicit registration)
 ```
 
 ### 数据流
@@ -128,7 +130,7 @@ bytes / ReaderAt
 - Extended 通过独立进程、CGO/build tag 或显式 provider 接入，不进入 Core 默认依赖。
 - 错误不包含文档正文、元数据值或流内容。
 - 近似渲染必须可诊断，不允许静默缺图/缺字。
-- `displaylist.Version` 当前为 **2.0**，只保证增字段的 Minor 兼容。
+- `displaylist.Version` 当前为 **2.1**，只保证增字段的 Minor 兼容。
 
 ---
 
@@ -194,6 +196,7 @@ bytes / ReaderAt
 - `extension/cairo`：pdftocairo SVG
 - `extension/openjpeg`：opj_decompress JPX
 - `extension/jbig2`：jbig2dec JBIG2
+- `extension/g32d`：纯 Go CCITT Group 3 2-D，显式注册
 - `extension.Registry`：image/color/font provider
 - 所有进程 adapter 有输出上限、超时、临时目录清理、错误截断、版本/许可/确定性报告
 - Core 不导入具体 provider；`scripts/check-core-deps.sh` 强制检查
@@ -404,7 +407,19 @@ if err != nil {
 img, err := r.RenderPage(ctx, "in.pdf", 0)
 ```
 
-或者通过 `extension.Registry` 注册 JPX/JBIG2 图像 provider，再用 `pdf.WithExtensionRegistry` 传入文档。
+或者通过 `extension.Registry` 注册 JPX/JBIG2/G3 2-D 图像 provider，再用 `pdf.WithExtensionRegistry` 传入文档：
+
+```go
+reg, err := extension.NewRegistry(
+    extension.WithImageFactory(g32d.New()),
+)
+if err != nil {
+    return err
+}
+doc, err := pdf.OpenFile(ctx, "scan.pdf", pdf.WithExtensionRegistry(reg))
+```
+
+`g32d` 只在显式注册时启用；未注册的 G3 2-D 仍返回 `Unsupported`，不会静默输出空白。
 
 ---
 
@@ -450,12 +465,12 @@ Poppler 像素全等不是发布门禁；语义正确性、显式诊断、资源
 
 - 无 PDF 写入、页面编辑、表单保存、数字签名。
 - 无打印色彩/PDF-X/专色/叠印。
-- 无内置 JBIG2/JPX/G3 2-D；通过 Extended provider 或 Unsupported 处理。
+- 无内置 JBIG2/JPX；G3 2-D 需显式注册纯 Go `extension/g32d`，未注册时 Unsupported。
 - 无完整 CFF/Type1、完整 shaping、FreeType hinting。
 - 无 OCR、PDF/A 认证、无障碍认证。
 - Preview 不是 Adobe/Poppler 像素级替代品。
 - 默认系统字体会导致跨主机差异；可复现输出请使用固定字体。
-- v0.5.0 仍是 pre-1.0；公共 API 和 `displaylist` 尚未承诺长期稳定。
+- v0.5.1 仍是 pre-1.0；公共 API 和 `displaylist` 尚未承诺长期稳定。
 
 ---
 
@@ -463,7 +478,7 @@ Poppler 像素全等不是发布门禁；语义正确性、显式诊断、资源
 
 ```text
 pdf.go / document / page / options   公共 API
-displaylist/                          显示列表契约（Version 2.0）
+displaylist/                          显示列表契约（Version 2.1）
 render/                               屏幕渲染 API 与 tile/page 执行器
 text/                                 字符、词、行、块与选区
 extension/                            可选 provider 接口与注册表
@@ -471,6 +486,7 @@ extension/poppler/                    pdftoppm 高保真光栅
 extension/cairo/                      pdftocairo SVG
 extension/openjpeg/                   opj_decompress JPX
 extension/jbig2/                      jbig2dec JBIG2
+extension/g32d/                       纯 Go CCITT Group 3 2-D provider
 cmd/pdf/                              CLI
 internal/syntax/                      词法、对象、xref、重建
 internal/filter/                      过滤器与 Predictor

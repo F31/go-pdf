@@ -151,6 +151,7 @@ jobs:
           run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzParseEmbeddedCMap -fuzztime=20s -parallel=4
           run_fuzz go test ./internal/font -run=^$ -fuzz=FuzzSFNTRepair -fuzztime=20s -parallel=4
           run_fuzz go test ./internal/image -run=^$ -fuzz=FuzzImageDecode -fuzztime=20s -parallel=4
+          run_fuzz go test ./extension/g32d -run=^$ -fuzz=FuzzCCITTG32D -fuzztime=20s -parallel=4
           run_fuzz go test ./internal/function -run=^$ -fuzz=FuzzPostScript -fuzztime=20s -parallel=4
       - name: Upload fuzz corpus on failure
         if: failure()

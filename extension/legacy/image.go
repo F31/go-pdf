@@ -71,6 +71,13 @@ func (d imageDecoder) Decode(ctx context.Context, src io.ReaderAt, size int64, c
 		Decode:           append([]float64(nil), cfg.Decode...),
 		Interpolate:      cfg.Interpolate,
 	}
+	if cfg.CCITT != nil {
+		info.CCITT = &displaylist.CCITTParams{
+			K: cfg.CCITT.K, Columns: cfg.CCITT.Columns, Rows: cfg.CCITT.Rows,
+			BlackIsZero: cfg.CCITT.BlackIsZero, EncodedByteAlign: cfg.CCITT.EncodedByteAlign,
+			EndOfLine: cfg.CCITT.EndOfLine, EndOfBlock: cfg.CCITT.EndOfBlock, EndOfData: cfg.CCITT.EndOfData,
+		}
+	}
 	decoder, err := d.factory.NewDecoder(ctx, info)
 	if err != nil {
 		return nil, err

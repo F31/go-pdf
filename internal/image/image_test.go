@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/F31/go-pdf/displaylist"
+	"github.com/F31/go-pdf/internal/syntax"
 )
 
 func FuzzImageDecode(f *testing.F) {
@@ -93,5 +94,27 @@ func TestDecodeSourceSamples(t *testing.T) {
 	}
 	if len(s.Profile) != 3 {
 		t.Fatalf("profile = %v", s.Profile)
+	}
+}
+
+func TestImageInfoCCITTParams(t *testing.T) {
+	dict := syntax.Dict{
+		"Width":  syntax.Int(12),
+		"Height": syntax.Int(8),
+		"Filter": syntax.Name("CCITTFaxDecode"),
+		"DecodeParms": syntax.Dict{
+			"K": syntax.Int(2), "Columns": syntax.Int(12), "Rows": syntax.Int(8),
+			"BlackIsZero": syntax.Bool(true), "EncodedByteAlign": syntax.Bool(true),
+			"EndOfLine": syntax.Bool(true), "EndOfBlock": syntax.Bool(false), "EndOfData": syntax.Bool(true),
+		},
+	}
+	info, _, _, err := imageInfo(context.Background(), dict, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.CCITT == nil || info.CCITT.K != 2 || info.CCITT.Columns != 12 || info.CCITT.Rows != 8 ||
+		!info.CCITT.BlackIsZero || !info.CCITT.EncodedByteAlign || !info.CCITT.EndOfLine ||
+		info.CCITT.EndOfBlock || !info.CCITT.EndOfData {
+		t.Fatalf("ccitt = %#v", info.CCITT)
 	}
 }

@@ -124,6 +124,19 @@ const (
 
 type ImageEncoding string
 
+// CCITTParams carries CCITTFaxDecode parameters that are needed by external
+// G3/G4 providers. It is an add-only display-list field.
+type CCITTParams struct {
+	K                int
+	Columns          int
+	Rows             int
+	BlackIsZero      bool
+	EncodedByteAlign bool
+	EndOfLine        bool
+	EndOfBlock       bool
+	EndOfData        bool
+}
+
 type ImageInfo struct {
 	Width, Height    int
 	BitsPerComponent int
@@ -132,6 +145,7 @@ type ImageInfo struct {
 	Decode           []float64
 	Interpolate      bool
 	Inline           bool
+	CCITT            *CCITTParams
 }
 
 type ImageRef interface {

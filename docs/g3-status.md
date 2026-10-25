@@ -62,7 +62,7 @@
   - `Common.Sig` 按类型、样式与相对几何计算，可在不同位置识别重复元素
   - `Page.Scanned`：整页图像覆盖 ≥90% 且无可信 Unicode 文本时置位
   - `TextRun.ActualText`：标记内容 `/ActualText` 优先输出；与字形映射冲突写 `CNT-ACTUALTEXT-CONFLICT`
-  - `displaylist.Version` 升至 2.0（删除打印色彩/设备组字段；保留 `PaintState` 填充/描边 alpha、`TextSpan`、`TextRun.Line`、组 Backdrop、软蒙版 Backdrop、`Clip.Intersect`）
+  - `displaylist.Version` 当前为 2.1（2.0 删除打印色彩/设备组字段；2.1 增加 CCITT 参数；保留 `PaintState` 填充/描边 alpha、`TextSpan`、`TextRun.Line`、组 Backdrop、软蒙版 Backdrop、`Clip.Intersect`）
 - 文本绘制模式：
   - `TextRun` 新增 `Line`，保留文字描边线宽、端点、连接、斜接与虚线
   - `RenderMode 0/1/2` 分别执行填充、描边、填充+描边；`3` 不可见；`4–7` 裁剪模式仍显式跳过
@@ -179,7 +179,8 @@
 
 ## 未完成
 
-- CCITT Group 3 2-D（`K > 0`）与无 EOL 的 G3 变体核心尚未支持；`ImageCCITTG32D` provider 路径已验证可接管，需部署方注入实现。
+- CCITT Group 3 2-D（`K > 0`）通过可选纯 Go `extension/g32d` 接入；支持 1-D/2-D 混合行、EOL tag、EncodedByteAlign、BlackIsZero、ImageMask，并提供 Poppler 参考对比。未注册时仍返回 Unsupported。无 EOL 的异常变体仍需按样例评估。
+- `extension/g32d` 的 64×256 合成基准约 122 µs/op、9 allocs/op（本机，Intel Core Ultra 9 275HX）；基准用于趋势，不是跨机承诺。
 - JBIG2/JPX 核心不提供解码，仅支持 Factory Registry 注入；`extension/jbig2` 和 `extension/openjpeg` 提供可选进程 provider。
 - Form BBox 与父裁剪已按 clip Intersect 合成；knockout 已按元素 alpha 覆盖并处理非 Normal Blend 的 backdrop 合成；完整外部参考金样仍未建立。
 - 已新增 SMask Alpha/Luminosity 与 knockout 非隔离组的解析期望质量门禁（PSNR ≥45 dB、SSIM ≥0.999）；外部参考图金样与 G8 生产级并行光栅化尚未完成。
@@ -189,5 +190,5 @@
 ## 下一步
 
 1. knockout 透明组细节与 SMask PSNR 金样。
-2. 按语料需要补 CCITT G3 2-D/无 EOL 变体。
+2. 按语料需要评估无 EOL 的异常 G3 变体。
 3. G8 生产级并行整页光栅化与质量/性能门禁。
