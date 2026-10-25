@@ -69,4 +69,17 @@ staticcheck ./...
 - 本机安装 OpenJPEG 2.5 后，真实 JP2 round-trip 通过；CI 无工具时该测试跳过。
 - `jbig2dec` fake e2e 通过；真实 JBIG2 样本仍需部署方提供。
 
+P3 远端 CI：https://github.com/F31/go-pdf/actions/runs/40172626554（10/10 success）。
+
+## P3 验收
+
+- Registry feature 校验、排序和副本语义：通过。
+- 进程 adapter 超时、输出截断、文件/像素上限、临时目录清理：通过。
+- OpenJPEG fake e2e 与可选真实 JP2 round-trip：通过。
+- JBIG2 jbig2dec provider 与 G3 2-D Registry 契约：通过。
+- ColorEngine/FontEngine 可选路径：已有 contract 测试。
+- Poppler/Cairo 版本/许可/feature 与失败隔离：通过。
+- Core 不导入具体 provider，CI 检查：通过。
+- Linux/macOS/Windows、race、vet、staticcheck、fuzz、交叉编译：通过。
+
 P3 不改变 Core/Preview 默认行为，也不新增 Core 第三方依赖。
