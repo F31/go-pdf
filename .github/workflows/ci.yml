@@ -35,6 +35,28 @@ jobs:
           name: coverage-go${{ matrix.go }}
           path: coverage.out
 
+  test-os:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - name: Build (no cgo)
+        run: CGO_ENABLED=0 go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test (no cgo)
+        run: CGO_ENABLED=0 go test ./...
+
   staticcheck:
     name: Staticcheck
     runs-on: ubuntu-latest

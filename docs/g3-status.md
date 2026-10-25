@@ -76,13 +76,13 @@
   - `PatternType 1` 记录 BBox/XStep/YStep/Matrix/PaintType/TilingType、原始内容流与 uncolored 基色；图案内容已展开为 `Pattern.Items`，区域渲染支持彩色/未着色平铺并按 X/Y 步长双向重复
   - Pattern 内容继承当前 ExtGState，`/SMask` 对 tiling/shading pattern 均生效
   - `PatternType 2` 解析 `/Shading`，支持 axial/radial shading pattern；按路径 mask 合成。mesh/function shading pattern 记录诊断并按设计降级
-  - `ShadingType 1` 记录为 `ShadingFunction`，`4–7` 记录为 `ShadingMesh` 并保留原始码流
-  - 这些类型按设计 R/P 档处理，不做静默近似
+  - `ShadingType 1` 记录为 `ShadingFunction`；`4–7` 记录为 `ShadingMesh` 并保留原始码流
+  - 当前渲染支持 type 6/7 patch；type 4/5 尚未解码渲染，pattern 内 mesh/function 记录诊断，不静默近似
 - 渐变：
   - 支持 `ShadingType 2`（轴向）与 `3`（径向），输出 `displaylist.Shading`
   - 函数结果通过颜色空间转为 64 个色标，保留 `Extend` 与 CTM 变换
   - 非均匀缩放的径向渐变按圆近似并写 `CLR-SHADING-CTM`
-  - `ShadingType 1` 记录为 `ShadingFunction`；`4–7` 记录为 `ShadingMesh` 并透传原始码流
+  - `ShadingType 1` 记录为 `ShadingFunction`；`4–7` 记录为 `ShadingMesh` 并透传原始码流；渲染覆盖见上一节
 
 - 加密：
   - Standard R2–R6：RC4-40/128、AES-128、AES-256

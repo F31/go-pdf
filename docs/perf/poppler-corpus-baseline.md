@@ -1,6 +1,6 @@
 # Poppler corpus baseline (first-page sample)
 
-Date: 2026-10-24
+Date: 2026-10-25
 Host: Linux 6.6.87.2-microsoft-standard-WSL2 x86_64, 24 vCPU
 Go: 1.25.0 linux/amd64
 Poppler: 24.02.0
@@ -9,7 +9,8 @@ Poppler: 24.02.0
 
 - Private corpus: 57 PDFs under `docs/pdf/`.
 - One page per file (page 1), 72 DPI, white background.
-- Go render: `render.RenderPage`, `IncludeText=true` with the built-in Go sans/mono fallback, `MaxPixels=64 MiB`.
+- Go render: `render.RenderPage`, `IncludeText=true`, `MaxPixels=64 MiB`.
+- Fonts: the harness defaults to `render.BuiltinFonts()`. `POPPLER_CORPUS_FONT_DIR` pins explicit directories; `POPPLER_CORPUS_SYSTEM_FONTS=1` is for local host-dependent diagnostics only.
 - Poppler: `pdftoppm -f N -l N -r 72 -png -singlefile -cropbox -hide-annotations`.
 - Comparison: `internal/quality.Compare` (PSNR, SSIM, CIEDE2000).
 
@@ -27,8 +28,31 @@ Optional variables:
 - `POPPLER_CORPUS_MIN_SSIM` (default 0.85).
 - `POPPLER_CORPUS_GATE=1`: fail when fallback rate exceeds the limit.
 - `POPPLER_CORPUS_MAX_FALLBACK` (default 0.20).
+- `POPPLER_CORPUS_FONT_DIR=/path1:/path2`: explicit font directories for reproducible CJK runs.
+- `POPPLER_CORPUS_SYSTEM_FONTS=1`: use host fonts; reports are host-dependent.
 
-## Result
+## P0 reproducible sample (built-in fonts)
+
+This is the current fixed-font baseline. It is directly comparable only with runs that
+use the same built-in fonts, DPI, background, ICC and annotation policy.
+
+| Metric | Value |
+| --- | --- |
+| Files / pages | 57 / 57 |
+| Compared | 57 |
+| Open errors | 0 |
+| Go render errors | 0 |
+| Poppler errors | 0 |
+| Dimension mismatches | 0 |
+| PSNR p10 / p50 / p90 | 19.263 / 25.121 / 34.269 dB |
+| SSIM p10 / p50 / p90 | 0.611 / 0.900 / 0.985 |
+| Fallback (<20 dB or <0.85 SSIM) | 21/57 (36.8%) |
+
+Built-in fonts lack CJK outlines, so the SSIM p10 is lower than the historical
+system-font sample. Use `POPPLER_CORPUS_FONT_DIR` to pin a CJK-capable font
+directory when measuring CJK quality.
+
+## Historical system-font sample (pre-P0)
 
 | Metric | Value |
 | --- | --- |
@@ -42,12 +66,15 @@ Optional variables:
 | SSIM p10 / p50 / p90 | 0.820 / 0.903 / 0.985 |
 | Fallback (<20 dB or <0.85 SSIM) | 21/57 (36.8%) |
 
+This table is retained for historical comparison; it used host system fonts and
+is not directly comparable to the fixed-font P0 baseline.
+
 ## Corpus harness performance
 
 The full-corpus script now schedules page chunks across workers instead of
 sharding whole files, uses PPM references, and caches parsed ICC profiles.
 
-- 57-page sample, 8 workers: ~27 s (previously ~10 min with file sharding).
+- 57-page fixed-font sample, 8 workers: ~29 s (previously ~10 min with file sharding).
 - Full corpus, 16 workers, 128-page chunks: 13m26s for 10,866 pages, 0 errors.
 - Each job prefetches the next Poppler page batch while rendering the current one.
   At 16 workers the gain is small because the run is already CPU/IO bound.
@@ -63,7 +90,7 @@ Runs are reproducible with:
 POPPLER_CORPUS_SHARDS=16 ./scripts/corpus-poppler-full.sh
 ```
 
-## Full corpus result
+## Historical system-font full run (final8)
 
 - Pages: 10,866
 - Fallback (<20 dB or <0.85 SSIM): 6,850/10,866 (63.0%)
@@ -86,25 +113,23 @@ p26 image went from 15.02/0.764 to 25.74/0.979). The remaining top defects are
 mostly text-hinting differences in `灵雀云运维手册 p82` and tender documents,
 plus still-light construction hatching.
 
-## System-font default
+## Font policy
 
-`IncludeText` now uses installed system fonts by default, then the built-in Go
-fallback. System-font availability differs by host; set `PageOptions.Fonts`
-explicitly for host-independent output. The reproducible gate should pin an
-explicit font provider.
+The Preview product still uses installed system fonts by default for real
+documents, then the built-in Go fallback. That default is host-dependent.
+Reproducible quality gates use `render.BuiltinFonts()` or
+`POPPLER_CORPUS_FONT_DIR` with explicit font files. The fixed-font P0 baseline
+is documented in `docs/perf/p0-baseline.md`.
 
 ## Interpretation
 
-This is a Preview-profile baseline, not a G8 production-quality result. The
-built-in Go Regular fallback improved the sample from 44 to 41 fallback pages,
-with PSNR p90 rising from 27.22 to 29.21 dB and SSIM p50 from 0.786 to 0.812.
-The remaining gap is dominated by source-font shape/style differences,
-anti-aliasing, colour management and the absence of a unified production
-compositing path. The
-sample is useful as a regression floor and for tracking changes; it must not be
-used to claim Poppler parity.
+This is a Preview-profile baseline, not a production-quality or Poppler-parity
+result. The remaining gap is dominated by source-font shape/style differences,
+hinting, anti-aliasing, colour management and the absence of a unified
+production compositing path. The sample is useful as a regression floor and for
+tracking changes; it must not be used to claim Poppler parity.
 
-The run also exposed and closed three concrete issues:
+The run also exposed and closed a number of concrete issues:
 
 - indirect image `/ColorSpace` references were ignored;
 - indexed images were decoded as DeviceGray;

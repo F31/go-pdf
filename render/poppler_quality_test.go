@@ -77,7 +77,7 @@ func TestPopplerReferenceQuality(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white"})
+			got, err := RenderRegion(context.Background(), p, displaylist.Rect{X1: 100, Y1: 100}, PageOptions{DPI: 72, Background: "white", Fonts: BuiltinFonts()})
 			if err != nil {
 				t.Fatal(err)
 			}

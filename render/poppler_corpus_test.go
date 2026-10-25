@@ -284,8 +284,11 @@ func TestDecodePPM(t *testing.T) {
 // POPPLER_CORPUS_PATH selects one file; POPPLER_CORPUS_PAGE_START/PAGE_END
 // select a page range; POPPLER_CORPUS_FILES limits the number of files;
 // POPPLER_CORPUS_CHUNK controls the Poppler batch size;
-// POPPLER_CORPUS_FORMAT=ppm avoids PNG encode/decode; and
-// POPPLER_CORPUS_REF_CACHE caches Poppler references between runs.
+// POPPLER_CORPUS_FORMAT=ppm avoids PNG encode/decode;
+// POPPLER_CORPUS_REF_CACHE caches Poppler references between runs; and
+// POPPLER_CORPUS_FONT_DIR pins font directories for reproducible output.
+// By default the harness uses render.BuiltinFonts(); set
+// POPPLER_CORPUS_SYSTEM_FONTS=1 to opt into host fonts.
 func TestPopplerCorpusQuality(t *testing.T) {
 	if os.Getenv("POPPLER_CORPUS") == "" {
 		t.Skip("set POPPLER_CORPUS=1 to compare the local corpus")
@@ -391,8 +394,15 @@ func TestPopplerCorpusQuality(t *testing.T) {
 
 	dir := t.TempDir()
 	cacheRoot := os.Getenv("POPPLER_CORPUS_REF_CACHE")
-	var corpusFonts FontProvider
-	if os.Getenv("POPPLER_CORPUS_SYSTEM_FONTS") == "1" {
+	corpusFonts := FontProvider(BuiltinFonts())
+	if dir := os.Getenv("POPPLER_CORPUS_FONT_DIR"); dir != "" {
+		dirs := filepath.SplitList(dir)
+		sys, err := SystemFonts(dirs...)
+		if err != nil {
+			t.Fatalf("corpus font dir %q: %v", dir, err)
+		}
+		corpusFonts = ChainFonts(sys, BuiltinFonts())
+	} else if os.Getenv("POPPLER_CORPUS_SYSTEM_FONTS") == "1" {
 		if sys, err := SystemFonts(); err == nil {
 			corpusFonts = ChainFonts(sys, BuiltinFonts())
 		}

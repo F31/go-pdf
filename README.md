@@ -26,9 +26,9 @@
 - 颜色空间：CalGray/CalRGB/Lab、ICCBased matrix/TRC（RGB/Gray）、LUT8/LUT16/mAB CLUT（CMYK→Lab/XYZ）到 sRGB、Indexed、Separation/DeviceN；PDF Function 类型 0/2/3/4
 - 轴向/径向渐变：`ShadingType 2/3`、64 色标采样、`Extend`、CTM 变换与裁剪
 - 可选内容可见性：`/OCProperties` 的 `BaseState`/`ON`/`OFF`、`BDC /OC`、OCMD `/P`/`/VE` 与 `WithHiddenLayers`；OCG 名称写入 `Common.Layer`
-- Tiling 图案与 type 4/5 mesh 内容；type 6/7 mesh 原始码流透传
+- Tiling 图案；mesh shading 解析为 IR：type 6/7 支持 patch 渲染，type 4/5 目前保留原始码流并明确诊断，pattern 内 mesh/function 仍受限
 - `render.RenderPage` 按 CropBox、旋转和 UserUnit 后的页面空间整页渲染；`EncodePNG`/`EncodeJPEG` 输出图像
-- `render.RenderRegion` 区域渲染：路径填充/EvenOdd、虚线、butt/round/projecting 端点与 miter/bevel/round 连接、ImageMask 模板、彩色/未着色 Tiling 图案基础平铺、type 4–7 mesh、function shading、Alpha/Luminosity 软蒙版（含 /BC backdrop）、透明组离屏合成（保留 BlendColorSpace、Backdrop；隔离/非隔离组按 sRGB 扁平化，DeviceGray 混合空间仍可生效；knockout 组按元素独立合成，非隔离组元素以当前 backdrop 为初始背景）、图像与色键遮罩、裁剪、常量 alpha、16 种混合模式、轴向/径向渐变、嵌入字体轮廓文字；DPI 默认 220、上限 300；`IncludeText` 默认使用本机系统字体，再回退到内置 Go sans/mono bold/italic；也可通过 `render.FontProvider`/`render.ChainFonts` 显式指定以保证主机无关输出
+- `render.RenderRegion` 区域渲染：路径填充/EvenOdd、虚线、butt/round/projecting 端点与 miter/bevel/round 连接、ImageMask 模板、彩色/未着色 Tiling 图案基础平铺、type 6/7 mesh patch、function shading、Alpha/Luminosity 软蒙版（含 /BC backdrop）、透明组离屏合成（保留 BlendColorSpace、Backdrop；隔离/非隔离组按 sRGB 扁平化，DeviceGray 混合空间仍可生效；knockout 组按元素独立合成，非隔离组元素以当前 backdrop 为初始背景）、图像与色键遮罩、裁剪、常量 alpha、16 种混合模式、轴向/径向渐变、嵌入字体轮廓文字；DPI 默认 220、上限 300；`IncludeText` 默认使用本机系统字体，再回退到内置 Go sans/mono bold/italic；也可通过 `render.FontProvider`/`render.ChainFonts` 显式指定以保证主机无关输出
 - 图像解码失败（如未注册 JBIG2/JPX）在区域渲染中显式返回 `ErrUnsupported`，禁止静默缺图
 - ImageMask、色键 Mask、SMask 关联输出；`Page.Images` 与 `Page.Fonts` 清单
 - 显示列表 `Version 2.0`；`PaintState` 保留填充/描边 alpha，`TextSpan` 用字形区间映射 ActualText；路径形状提示、`Source` 操作符追溯、相对几何 `Sig` 与 `Page.Scanned`
@@ -157,6 +157,8 @@ Poppler 输出 PPM，合并为 `/tmp/poppler-corpus/poppler-corpus.csv`。
 - `POPPLER_CORPUS_CHUNK`：单次 pdftoppm 批量页数，默认 32。
 - `POPPLER_CORPUS_FORMAT=ppm|png`：默认 ppm。
 - `POPPLER_CORPUS_REF_CACHE=/path`：缓存 Poppler 参考图，供重复回归。
+- `POPPLER_CORPUS_FONT_DIR=/path1:/path2`：固定字体目录；默认使用 `render.BuiltinFonts()`。
+- `POPPLER_CORPUS_SYSTEM_FONTS=1`：使用主机字体，报告标记 host-dependent。
 - `POPPLER_CORPUS_SAMPLE_CHUNKS=N`：每 N 个页块抽 1 个。
 - `POPPLER_CORPUS_PAGE_START/PAGE_END`：限定页范围，便于单页排查。
 
@@ -164,7 +166,7 @@ Poppler 输出 PPM，合并为 `/tmp/poppler-corpus/poppler-corpus.csv`。
 `pdftoppm`，并分别由 `POPPLER_QUALITY=1`、`POPPLER_CORPUS=1` 显式启用；
 默认 CI 不依赖 Poppler。`POPPLER_CORPUS_PAGES=0` 表示全部页面，
 `POPPLER_CORPUS_REPORT` 输出逐页 CSV；报告可能包含本地文件名，不应提交。
-语料基线见 `docs/perf/poppler-corpus-baseline.md`。
+语料基线与指标分层见 `docs/perf/poppler-corpus-baseline.md`、`docs/perf/quality-layers.md`。
 
 依赖白名单检查：
 

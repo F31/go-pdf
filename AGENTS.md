@@ -11,11 +11,14 @@
 - Poppler full-corpus report: `POPPLER_CORPUS=1 POPPLER_CORPUS_PAGES=0 POPPLER_CORPUS_REPORT=/tmp/poppler-corpus.csv go test ./render -run TestPopplerCorpusQuality -v -timeout 24h`
 - Poppler full corpus: `POPPLER_CORPUS_SHARDS=16 ./scripts/corpus-poppler-full.sh` (page-chunk workers, PPM, writes `/tmp/poppler-corpus/poppler-corpus.csv`)
 - Poppler reference cache: add `POPPLER_CORPUS_REF_CACHE=/tmp/poppler-ref` (cached PNGs; reuses Poppler output between runs)
+- Preview quality fonts: default `render.BuiltinFonts()`; pin CJK fonts with `POPPLER_CORPUS_FONT_DIR=/path1:/path2`
+- Quality layers and report boundaries: `docs/perf/quality-layers.md`
 - Benchmarks: `go test ./... -run=^$ -bench=. -benchmem`
 - Dependency policy: `./scripts/check-deps.sh`
 
 ## Performance baseline
 
+- P0 capability/font baseline: `docs/perf/p0-baseline.md`.
 - Poppler 24.02 local baseline: `docs/perf/poppler-24.02-baseline.md`.
   Compare only on the same host, corpus, DPI, background and output format.
 
